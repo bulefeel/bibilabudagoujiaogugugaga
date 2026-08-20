@@ -1,0 +1,43 @@
+<!doctype html>
+<!--
+  Transcribed from the live zh_CN 申请转账 page on sellercentral.amazon.com.au,
+  2026-08-18 17:58, the run where Amazon refused a second payout within 24 hours.
+  Structure and wording are what the page really showed; the amount and the
+  account tail are redacted.
+
+  The two facts that matter here, and that no dashboard read can predict:
+    * the throttle notice appears only on THIS page, and
+    * the final 请求付款 control is present but disabled.
+-->
+<html lang="zh-CN">
+<head><meta name="merchant-id" content="SELLER_FIXTURE"></head>
+<body>
+  <main>
+    <h1>申请转账</h1>
+    <p>申请向您的银行账户或借记卡付款。 了解更多信息</p>
+
+    <kat-alert variant="info">
+      为了增强您账户的安全性，我们实施了新的会话超时功能。 如果5分钟内未检测到任何活动，您的会话将自动过期。
+      如果您的会话超时，您需要重新登录才能继续。 我们了解到，这可能需要您稍作适应。 我们将您的账户和信息安全放在首位，感谢您的理解。
+    </kat-alert>
+
+    <kat-alert variant="info">
+      目前，该账户不符合“按需付款”要求。
+      24 小时内仅限一次。 22 hrs 49 mins 后再次请求。
+    </kat-alert>
+
+    <table>
+      <tr><td>接收者：</td><td>标准付款（3 至 5 个工作日）</td></tr>
+      <tr><td>日期和时间：</td><td>Tue, 18 Aug 2026 09:58:26 GMT</td></tr>
+      <tr>
+        <td>当前结算金额：</td>
+        <td>AU$12.34<br>注意：转账金额可能不同于所显示的余额。 了解更多信息</td>
+      </tr>
+      <tr><td>转入以下尾号的账户：</td><td>493</td></tr>
+    </table>
+
+    <kat-button label="返回“账户一览”"></kat-button>
+    <kat-button label="请求付款" disabled></kat-button>
+  </main>
+</body>
+</html>

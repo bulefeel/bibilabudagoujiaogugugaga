@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="toolbar"><div><p class="lead">一个紫鸟账号，可对应多家独立店铺环境。统一建档成功后会自动绑定并确认卖家身份；身份冲突时才需要人工复核。</p></div><div class="toolbar-actions"><button class="button dark" data-action="detect-all-store-setups">一键自动建档全部店铺</button><button class="button primary" data-action="sync-stores">↻ 同步紫鸟店铺</button></div></div>
+<section class="bulk-setup-progress" data-bulk-store-setup-progress hidden aria-live="polite">
+  <div><span class="marketplace-autofill-kicker">批量建档队列</span><b data-bulk-store-setup-title>准备按店铺顺序检测</b><p data-bulk-store-setup-message>每次只打开一家紫鸟店铺，在同一窗口核验卖家身份与所选站点；上一家结束后才会继续。</p></div>
+  <div class="bulk-setup-counts"><span>身份已建档 <b data-bulk-store-setup-success>0</b></span><span>站点核验未通过 <b data-bulk-store-setup-site-incomplete>0</b></span><span>曾等待验证 <b data-bulk-store-setup-auth>0</b></span><span>身份失败或跳过 <b data-bulk-store-setup-failed>0</b></span></div>
+  <div class="bulk-setup-actions" data-bulk-store-setup-actions hidden><button class="button primary" type="button" data-action="continue-bulk-store-setup">再次尝试自动登录并继续</button><button class="button ghost" type="button" data-action="skip-bulk-store-setup">跳过此店并继续</button></div>
+</section>
+<div class="store-grid">
+{% for store in stores %}
+{% set store_data = namespace(marketplaces=[], enabled_codes=[]) %}
+{% for site in store.marketplaces %}
+  {% set store_data.marketplaces = store_data.marketplaces + [{"code":site.code,"enabled":site.enabled}] %}
+  {% if site.enabled %}{% set store_data.enabled_codes = store_data.enabled_codes + [site.code] %}{% endif %}
+{% endfor %}
+{% set identity_ready = true if store.expected_seller_id and store.identity_confirmed else false %}
+{% set setup_needed = true if not identity_ready or not store_data.enabled_codes else false %}
+<article class="store-card" data-store-card data-store-id="{{ store.id }}" data-store-name="{{ store.name }}" data-identity-state="{{ 'CONFIRMED' if identity_ready else ('UNCONFIRMED' if store.expected_seller_id else 'MISSING') }}" data-store-setup-needed="{{ 'true' if setup_needed else 'false' }}" data-store-setup-marketplaces='{{ store_data.enabled_codes|tojson }}' data-store-setup-defaulted="{{ 'true' if not store_data.enabled_codes else 'false' }}">
+  <header><span class="store-index">{{ '%02d'|format(loop.index) }}</span><div><h2>{{ store.name }}</h2><p>{{ store.selector_type|upper }} · {{ store.selector_value[-8:] }}</p></div><span class="switch-label {{ 'on' if store.enabled else '' }}">{{ '已启用' if store.enabled else '未启用' }}</span></header>
+  <div class="identity-block"><small>预期卖家身份</small><b>{{ store.expected_seller_id or '尚未绑定' }}</b><span class="verify-mark {{ 'ok' if store.identity_confirmed else '' }}">{{ '✓ 已确认' if store.identity_confirmed else ('待自动确认' if store.expected_seller_id else '待自动建档') }}</span></div>
+  <div class="market-list">
+    {% for site in store.marketplaces %}<div><i class="flag flag-{{ site.code|lower }}">{{ site.code }}</i><span><b>{{ site.domain }}</b><small>{{ site.currency }}</small></span><em class="{{ 'live' if site.enabled else '' }}">{{ '启用' if site.enabled else '关闭' }}</em></div>{% else %}<p class="empty-inline">还没有绑定 CA / UK / AU 站点</p>{% endfor %}
+  </div>
+  <footer><button type="button" class="button ghost" data-action="edit-store" data-store-id="{{ store.id }}" data-store='{{ {"id":store.id,"name":store.name,"expected_seller_id":store.expected_seller_id,"identity_confirmed":store.identity_confirmed,"enabled":store.enabled,"marketplaces":store_data.marketplaces}|tojson }}'>编辑建档</button><button type="button" class="button dark" data-action="new-run" data-store-id="{{ store.id }}" {{ 'disabled' if not store.enabled else '' }}>发起检查</button></footer>
+</article>
+{% else %}<div class="blank-slate"><span>空</span><h2>店铺账册还没有记录</h2><p>先启动紫鸟客户端，再点击“同步紫鸟店铺”。同步只读取环境，不会打开亚马逊或执行资金操作。</p></div>{% endfor %}
+</div>
+<dialog id="store-dialog" class="sheet-dialog">
+  <form data-store-form>
+    <button type="button" class="dialog-close" data-action="close-dialog">×</button>
+    <p class="eyebrow">STORE IDENTITY</p><h2>编辑店铺建档</h2>
+    <input name="id" type="hidden" value="">
+    <label>显示名称<input name="name" required></label>
+    <label>预期卖家 ID<input name="expected_seller_id" placeholder="由下方统一建档自动读取"></label>
+    <p class="identity-probe-result" data-store-setup-identity-result aria-live="polite">统一建档会在同一个紫鸟店铺窗口中读取卖家身份，并逐站核验域名；身份一致时自动绑定并确认，身份冲突时保留原建档并提示人工复核。</p>
+    <fieldset class="store-marketplace-editor" data-store-marketplaces>
+      <legend>站点建档</legend>
+      <p class="fieldset-help">先勾选至少一个要使用的站点，再点击一次统一建档。程序只打开一次对应紫鸟店铺，读取卖家 ID 并逐站核验域名与身份；身份一致时会自动确认，新建或补全身份时会自动启用店铺。</p>
+      <aside class="marketplace-autofill-card">
+        <div>
+          <span class="marketplace-autofill-kicker">卖家身份 + 站点核验</span>
+          <b>一次打开，一次完成核验</b>
+          <p>程序会读取卖家身份，并逐站打开付款控制面板核验域名与身份。<strong>全程不点击页面上的任何按钮。</strong></p>
+        </div>
+        <button class="button dark" type="button" data-action="detect-store-setup">自动获取卖家ID并核验站点</button>
+      </aside>
+      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选 CA、UK、AU 中需要的站点，再点击统一建档。卖家身份与各站点核验结果会直接保存到账册；只有卖家身份与原建档冲突才需要人工复核。</p>
+      {% for code, label, domain in [
+        ('CA', '加拿大', 'sellercentral.amazon.ca'),
+        ('UK', '英国', 'sellercentral.amazon.co.uk'),
+        ('AU', '澳大利亚', 'sellercentral.amazon.com.au')
+      ] %}
+      <div class="store-marketplace-row" data-store-marketplace="{{ code }}">
+        <label class="mini-check marketplace-enable"><input type="checkbox" data-marketplace-enabled> <span><b>{{ code }} {{ label }}</b><small>{{ domain }}</small></span></label>
+        <div class="marketplace-detection-state">
+          <span class="marketplace-status pending" data-marketplace-status>待检测</span>
+          <small data-marketplace-account-display>勾选后核验域名与卖家身份</small>
+        </div>
+      </div>
+      {% endfor %}
+      <section class="marketplace-setup-auth" data-store-setup-auth-panel hidden aria-live="polite">
+        <span class="identity-auth-badge" data-store-setup-auth-badge>自动登录未通过</span>
+        <h3>验证仍未完成，可再次自动尝试</h3>
+        <p data-store-setup-auth-message>程序会先等待紫鸟填充，再依次尝试邮箱 Continue、紫鸟托管 Passkey、已填密码登录和已填好的 6 位 OTP。每个页面动作最多自动点击 3 次，每个站点最多进行 3 轮完整验证；CA、UK、AU 分别计数。只有次数用尽，或出现未填内容、候选不唯一、CAPTCHA、非托管 Passkey 等不适合自动点击的情况，才会保留原紫鸟窗口并显示这里；不会换到普通 Chrome。</p>
+        <div class="identity-auth-actions">
+          <button class="button primary" type="button" data-action="continue-store-setup">再次尝试自动登录并继续</button>
+          <button class="button ghost" type="button" data-action="cancel-store-setup">取消并关闭该店铺窗口</button>
+        </div>
+      </section>
+      <p class="marketplace-setup-note">核验只打开付款控制面板并比对域名与卖家身份，<strong>全程不点击任何按钮，也不读取金额</strong>。某个站点核验未通过时，只标记该站点，不会改动店铺启用状态，也不会取消你勾选的站点；三种模式均可保存和运行。可提现金额与近 24 小时限流由提现任务在运行现场判断，不在建档阶段预先记录。</p>
+    </fieldset>
+    <label class="check-row"><input name="identity_confirmed" type="checkbox"><span><b>卖家身份已确认</b><small>统一建档成功后自动勾选；异常复核时也可手工调整</small></span></label>
+    <label class="check-row"><input name="enabled" type="checkbox"><span><b>启用这家店铺</b><small>新建或补全身份时自动启用；之后可按需要手工关闭</small></span></label>
+    <button class="button primary wide" type="submit">保存建档</button>
+    <button class="button ghost wide" type="button" data-action="reset-store-setup">删除 / 重置建档</button>
+    <p class="form-error" data-form-error></p>
+  </form>
+</dialog>
+<dialog id="run-dialog" class="sheet-dialog"><form data-run-form><button type="button" class="dialog-close" data-action="close-dialog">×</button><p class="eyebrow">NEW WORKFLOW RUN</p><h2>发起提现检查</h2><input name="store_id" type="hidden"><label>运行模式<select name="mode"><option value="dry_run">dry_run · 只读检查</option><option value="approval">approval · 生成计划后人工审核</option><option value="auto">auto · 规则通过后提交</option></select></label><aside class="security-note"><b>站点未核验也可运行</b><p>无付款数据或可提现为 0 时会正常跳过；提交资金前仍会核验卖家身份，且同一店铺同一站点每天最多只提交一次。</p></aside><button class="button primary wide" type="submit">加入串行队列</button><p class="form-error" data-form-error></p></form></dialog>
+{% endblock %}

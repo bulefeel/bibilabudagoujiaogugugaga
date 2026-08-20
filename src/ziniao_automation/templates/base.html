@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>{{ page_title }} · 紫鸟运营账台</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}?v=20260813-setup-status-semantics">
+  <script defer src="{{ url_for('static', path='/app.js') }}?v=20260819-skip-notice-and-reset"></script>
+</head>
+<body class="app-shell">
+  <div class="paper-noise" aria-hidden="true"></div>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">账</span>
+      <div><b>紫鸟运营账台</b><small>LOCAL OPERATIONS LEDGER</small></div>
+    </div>
+    <nav class="nav-list" aria-label="主导航">
+      <a href="/" class="{{ 'active' if active_path == '/' else '' }}"><span>01</span>今日总览</a>
+      <a href="/stores" class="{{ 'active' if active_path.startswith('/stores') else '' }}"><span>02</span>店铺账册</a>
+      <a href="/schedules" class="{{ 'active' if active_path.startswith('/schedules') else '' }}"><span>03</span>任务排期</a>
+      <a href="/approvals" class="{{ 'active' if active_path.startswith('/approvals') else '' }}"><span>04</span>资金审核台</a>
+      <a href="/runs" class="{{ 'active' if active_path.startswith('/runs') else '' }}"><span>05</span>运行流水</a>
+      <a href="/diagnostics" class="{{ 'active' if active_path.startswith('/diagnostics') else '' }}"><span>06</span>系统诊断</a>
+    </nav>
+    <div class="side-foot">
+      <div class="local-seal"><i></i><span>仅限本机<br>127.0.0.1</span></div>
+      <button class="text-button" data-action="logout">退出 {{ admin.username }}</button>
+    </div>
+  </aside>
+  <main class="main-panel">
+    <header class="topbar">
+      <button class="menu-button" data-action="toggle-menu" aria-label="打开菜单">☰</button>
+      <div class="page-heading">
+        <p>AMAZON · MULTI-STORE CONTROL</p>
+        <h1>{{ page_title }}</h1>
+      </div>
+      <div class="top-status"><span class="pulse"></span>后台运行中<small>数据源 · SQLite</small></div>
+    </header>
+    <div class="rule"><b></b><span>ZI NIAO / FINANCIAL OPERATIONS</span></div>
+    <section class="content reveal">
+      {% block content %}{% endblock %}
+    </section>
+  </main>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+  <dialog id="confirm-dialog" class="confirm-dialog">
+    <form method="dialog">
+      <span class="dialog-kicker">FINAL CHECK</span>
+      <h2 id="confirm-title">请再次确认</h2>
+      <p id="confirm-message"></p>
+      <div class="dialog-actions"><button value="cancel" class="button ghost">返回</button><button value="confirm" class="button danger">确认执行</button></div>
+    </form>
+  </dialog>
+</body>
+</html>

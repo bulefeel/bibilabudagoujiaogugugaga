@@ -1,0 +1,61 @@
+<!doctype html>
+<!--
+  Transcribed from the LIVE zh_CN all-statements page on 2026-08-18.
+
+  The older statements_zh_CA.html fixture used a hand-invented
+  ".disbursement-card" wrapper, so the row selector was only ever validated
+  against a fixture written to match it.  On the real page that class does not
+  exist at all and the matcher found zero candidates — every disbursement was
+  reported NOT_FOUND even while its amount was plainly rendered.
+
+  Class names and nesting below are the real ones.  Values are scrubbed:
+  fixture seller id, fixture settlement ids, fixture amounts.
+-->
+<html lang="zh-CN">
+<head><meta name="merchant-id" content="SELLER_FIXTURE"></head>
+<body>
+  <div class="settlement-groups-summary-search-results">
+
+    <div class="content settlement-groups-summary">
+      <div class="settlement-groups-summary-metadata settlement-groups-summary-column align-to-start small-column">
+        <div class="label-with-value">2026/8/7 – 2026/8/11</div>
+        <div class="label-with-value">标准订单</div>
+      </div>
+      <div class="funds-transfer-component settlement-groups-summary-column lg-column">
+        <div class="fund-transfer-box">
+          <div class="payout-info fund-transfer-box-information-column small-column">
+            <div class="label-with-value settlement-group-id bold-label">结算周期：90000000001</div>
+          </div>
+          <div class="payout-status fund-transfer-box-information-column small-column">
+            <div class="label-with-value status bold-label text-eastern">付款状态：<kat-statusindicator variant="information" label="已开始"></kat-statusindicator></div>
+            <div class="label-with-value payout bold-label">付款金额：CA$333.21</div>
+            <div class="estimated-funds-delivery-date"></div>
+          </div>
+        </div>
+      </div>
+      <div class="reporting-links settlement-groups-summary-column align-to-end small-column"></div>
+    </div>
+
+    <div class="content settlement-groups-summary">
+      <div class="settlement-groups-summary-metadata settlement-groups-summary-column align-to-start small-column">
+        <div class="label-with-value">2026/8/1 – 2026/8/7</div>
+        <div class="label-with-value">标准订单</div>
+      </div>
+      <div class="funds-transfer-component settlement-groups-summary-column lg-column">
+        <div class="fund-transfer-box">
+          <div class="payout-info fund-transfer-box-information-column small-column">
+            <div class="label-with-value settlement-group-id bold-label">结算周期：90000000002</div>
+          </div>
+          <div class="payout-status fund-transfer-box-information-column small-column">
+            <div class="label-with-value status bold-label text-eastern">付款状态：<kat-statusindicator variant="success" label="完成"></kat-statusindicator></div>
+            <div class="label-with-value payout bold-label">付款金额：CA$220.38</div>
+            <div class="estimated-funds-delivery-date"></div>
+          </div>
+        </div>
+      </div>
+      <div class="reporting-links settlement-groups-summary-column align-to-end small-column"></div>
+    </div>
+
+  </div>
+</body>
+</html>

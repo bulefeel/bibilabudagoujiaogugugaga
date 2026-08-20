@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta name="merchant-id" content="SELLER_COLUMNAR_FIXTURE"></head>
+<body>
+  <!-- Current Seller Central layout: labels, totals and available funds are
+       three sibling cards.  They form logical rows only by strict index. -->
+  <kat-card class="linkable-multi-row-card--account-groups">
+    <div class="linkable-multi-row-card-rows-container">
+      <div class="linkable-multi-row-card-row align-start">标准订单</div>
+      <div class="linkable-multi-row-card-row align-start">延迟交易</div>
+      <div class="linkable-multi-row-card-row align-start">所有账户</div>
+    </div>
+  </kat-card>
+
+  <kat-card class="linkable-multi-row-card">
+    <div class="linkable-multi-row-card-header total-balance-header"><h5>总余额</h5></div>
+    <div class="linkable-multi-row-card-rows-container">
+      <div class="linkable-multi-row-card-row align-end"><kat-label label="CA$158.05"></kat-label></div>
+      <div class="linkable-multi-row-card-row align-end"><kat-link label="CA$2,410.10"></kat-link></div>
+      <div class="linkable-multi-row-card-row align-end"><kat-label label="CA$2,568.15"></kat-label></div>
+    </div>
+  </kat-card>
+
+  <kat-card class="linkable-multi-row-card">
+    <kat-label class="linkable-multi-row-card-header" label="可用资金">可用资金</kat-label>
+    <div class="linkable-multi-row-card-rows-container">
+      <div class="linkable-multi-row-card-row align-start available-balance-row-with-children">
+        <kat-label label="CA$158.05"></kat-label>
+        <kat-button label="请求付款"></kat-button>
+      </div>
+      <div class="linkable-multi-row-card-row align-start available-balance-row-with-children">
+        <kat-label label="CA$0.00"></kat-label>
+        <kat-button label="请求付款" disabled></kat-button>
+      </div>
+      <div class="linkable-multi-row-card-row align-start total">
+        <kat-label label="CA$158.05"></kat-label>
+      </div>
+    </div>
+  </kat-card>
+
+  <!-- Must not be mistaken for one of the balance columns. -->
+  <kat-card class="linkable-multi-row-card">
+    <div class="linkable-multi-row-card-header"><h5>最近的支出</h5></div>
+    <div class="linkable-multi-row-card-rows-container">
+      <div class="linkable-multi-row-card-row">CA$999.99</div>
+    </div>
+  </kat-card>
+</body>
+</html>

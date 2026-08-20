@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>管理员登录 · 紫鸟运营账台</title><link rel="stylesheet" href="/static/app.css"><script defer src="/static/app.js"></script></head>
+<body class="auth-page">
+  <div class="auth-ledger" aria-hidden="true"><span>LOCAL</span><b>财务操作专用入口</b><small>所有数据只写入本机 SQLite</small></div>
+  <main class="auth-card reveal">
+    <div class="brand auth-brand"><span class="brand-mark">账</span><div><b>紫鸟运营账台</b><small>LOCAL OPERATIONS LEDGER</small></div></div>
+    <div class="auth-heading"><p>ADMINISTRATOR ACCESS</p><h1>管理员登录</h1><span>仅可从 127.0.0.1 访问</span></div>
+    <form class="stack-form" data-api-form="/auth/login" data-redirect="/">
+      <label>管理员账号<input name="username" autocomplete="username" required autofocus></label>
+      <label>登录密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <button class="button primary wide" type="submit">进入运营账台 <b>→</b></button>
+      <p class="form-error" data-form-error></p>
+    </form>
+    <footer><i></i>会话保存在服务器端，关闭操作请点击“退出”</footer>
+  </main>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+</body></html>

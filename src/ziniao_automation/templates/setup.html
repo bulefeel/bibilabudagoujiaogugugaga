@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>首次初始化 · 紫鸟运营账台</title><link rel="stylesheet" href="/static/app.css"><script defer src="/static/app.js"></script></head>
+<body class="auth-page setup-page">
+  <div class="auth-ledger" aria-hidden="true"><span>ONE TIME</span><b>一次性管理员建档</b><small>完成后此入口永久关闭</small></div>
+  <main class="auth-card setup-card reveal">
+    <div class="step-label">首次启动 · 01 / 01</div>
+    <div class="auth-heading"><p>SECURE LOCAL BOOTSTRAP</p><h1>建立唯一管理员</h1><span>系统没有默认密码，请在这里设置一次</span></div>
+    <form class="stack-form" data-api-form="/auth/bootstrap" data-redirect="/">
+      <label>管理员账号<input name="username" minlength="3" autocomplete="username" placeholder="例如：operator" required autofocus></label>
+      <label>新密码<input name="password" type="password" minlength="12" autocomplete="new-password" required><small>至少 12 位；大写、小写、数字、符号中至少三类</small></label>
+      <label>再次输入密码<input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required></label>
+      <button class="button primary wide" type="submit">建档并进入 <b>→</b></button>
+      <p class="form-error" data-form-error></p>
+    </form>
+    <aside class="security-note"><b>✅ 这一步只做一次</b><p>密码只保存为不可逆摘要；系统不会创建 admin/admin，也不会把密码写入日志。</p></aside>
+  </main>
+  <div id="toast-region" class="toast-region" aria-live="polite"></div>
+</body></html>

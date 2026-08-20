@@ -1,0 +1,41 @@
+# D-drive runtime and secrets
+.venv/
+data/
+logs/
+backups/
+evidence/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite*
+*.log
+*.jsonl
+
+# Python/build caches (kept on D: by the batch scripts)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.uv-cache/
+build/
+dist/
+*.egg-info/
+
+# Local process state
+run/
+*.pid
+*.tmp
+.env
+
+# Evidence and exported secrets must never be committed
+*.har
+*.zip
+credentials*.json
+
+# Vendored toolchain kept on D: by the batch scripts (111 MB, not source)
+.uv-python/
+uv.exe
+
+# Machine-local Claude Code permissions
+.claude/settings.local.json

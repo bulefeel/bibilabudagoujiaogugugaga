@@ -1,0 +1,178 @@
+{% extends "base.html" %}
+{% block content %}
+{% set mode_labels = {
+  'dry_run': '只读检查',
+  'approval': '人工审核',
+  'auto': '全自动'
+} %}
+{% set day_labels = {
+  'mon': '周一', 'tue': '周二', 'wed': '周三', 'thu': '周四',
+  'fri': '周五', 'sat': '周六', 'sun': '周日', '*': '每天'
+} %}
+
+<div class="toolbar">
+  <p class="lead">同时到期的任务会按计划时间持久排队，前面的任务完成后再逐家执行。任务一旦入队就不会因等待超时而丢失；即使轮到时已经跨日，也会继续执行。</p>
+  <button type="button" class="button primary" data-action="open-schedule">＋ 新建排期</button>
+</div>
+
+<div class="schedule-list">
+  {% for item in schedules %}
+  {% set enabled_codes = item.store.marketplaces|selectattr("enabled")|map(attribute="code")|list %}
+  {% set validity = namespace(invalid=[]) %}
+  {% for code in item.marketplace_codes %}
+    {% if code not in enabled_codes %}{% set validity.invalid = validity.invalid + [code] %}{% endif %}
+  {% endfor %}
+  <article class="schedule-row">
+    <div class="time-block">
+      <strong>{{ item.local_time }}</strong>
+      <small>北京时间（UTC+8）</small>
+    </div>
+    <div class="schedule-main">
+      <span class="mode-tag mode-{{ item.mode }}">{{ mode_labels.get(item.mode, item.mode) }}</span>
+      <h2>{{ item.name }}</h2>
+      <p>
+        {{ item.store.name }} ·
+        {% if item.marketplace_codes %}
+          {{ item.marketplace_codes|join(' / ') }}
+          {% if validity.invalid %}
+            <span class="schedule-warning">（{{ validity.invalid|join('、') }} 未在该店启用，请编辑修正）</span>
+          {% endif %}
+        {% else %}
+          <span class="schedule-warning">未选择站点，请编辑补选</span>
+        {% endif %}
+      </p>
+    </div>
+    <div class="weekdays" aria-label="运行日">
+      {% if item.days_of_week == '*' %}
+        每天
+      {% else %}
+        {% for day in item.days_of_week.split(',') %}{{ day_labels.get(day|trim, day|trim) }}{% if not loop.last %}、{% endif %}{% endfor %}
+      {% endif %}
+    </div>
+    <div class="schedule-state">
+      <span class="switch-label {{ 'on' if item.enabled else '' }}">{{ '已启用' if item.enabled else '已停用' }}</span>
+      <small class="next-run">{{ item.next_run_at|local_datetime('%Y-%m-%d %H:%M') if item.next_run_at else '尚未计算下次运行' }}</small>
+    </div>
+    <div class="schedule-actions">
+      <button
+        type="button"
+        class="button ghost compact-button"
+        data-action="edit-schedule"
+        data-schedule='{{ {
+          "id": item.id,
+          "store_id": item.store_id,
+          "name": item.name,
+          "mode": item.mode,
+          "local_time": item.local_time,
+          "days_of_week": item.days_of_week,
+          "timezone": item.timezone,
+          "marketplace_codes": item.marketplace_codes,
+          "enabled": item.enabled
+        }|tojson }}'
+      >编辑</button>
+      <button
+        type="button"
+        class="button dark compact-button"
+        data-action="run-schedule-now"
+        data-schedule-id="{{ item.id }}"
+        data-schedule-name="{{ item.name }}"
+        data-schedule-mode="{{ item.mode }}"
+        {{ 'disabled title="排期含未启用站点，请先编辑并保存修正"'|safe if validity.invalid else '' }}
+      >立即执行</button>
+      <button
+        type="button"
+        class="button compact-button delete-button"
+        data-action="delete-schedule"
+        data-schedule-id="{{ item.id }}"
+        data-schedule-name="{{ item.name }}"
+      >删除</button>
+    </div>
+  </article>
+  {% else %}
+  <div class="blank-slate compact">
+    <span>期</span>
+    <h2>尚未设置自动排期</h2>
+    <p>点击“新建排期”保存规则；保存后也可以用“立即执行”马上测试，不用等到第二天。</p>
+  </div>
+  {% endfor %}
+</div>
+
+<dialog id="schedule-dialog" class="sheet-dialog schedule-dialog">
+  <form data-schedule-form>
+    <button type="button" class="dialog-close" data-action="close-dialog" aria-label="关闭">×</button>
+    <p class="eyebrow">SCHEDULE ENTRY</p>
+    <h2 data-schedule-dialog-title>新建任务排期</h2>
+
+    <label>
+      店铺
+      <select name="store_id" required data-schedule-store>
+        {% for store in stores %}
+          <option value="{{ store.id }}" data-enabled-marketplaces='{{ store.marketplaces|selectattr("enabled")|map(attribute="code")|list|tojson }}'>{{ store.name }}</option>
+        {% endfor %}
+      </select>
+      <small data-store-edit-help hidden>已有排期不能更换店铺；如选错店铺，请删除后重新建立。</small>
+    </label>
+
+    <label>
+      排期名称
+      <input name="name" value="工作日只读检查" maxlength="160" required>
+      <small>只是方便你辨认任务的备注名称，不会决定是否提现；真正行为由“运行模式”决定。</small>
+    </label>
+
+    <div class="field-pair">
+      <label>
+        执行时间（UTC+8）
+        <input name="local_time" type="time" value="09:00" required>
+        <small>北京时间和新加坡时间相同，例如 09:00 就是上午 9 点。</small>
+      </label>
+      <label>
+        运行模式
+        <select name="mode" required data-schedule-mode>
+          <option value="dry_run">只读检查（dry_run）</option>
+          <option value="approval">人工审核（approval）</option>
+          <option value="auto">全自动（auto）</option>
+        </select>
+        <small data-mode-help>只读取并检查余额，不点击提现，适合测试。</small>
+      </label>
+    </div>
+
+    <div class="mode-guide" aria-label="三种运行模式说明">
+      <p><b>只读检查：</b>只检查身份、页面和可提现金额，不点击提现。</p>
+      <p><b>人工审核：</b>先生成金额清单，等你批准后再重新核对并提交。</p>
+      <p><b>全自动：</b>规则全部通过后直接提交；仅建议在审核模式连续成功后启用。</p>
+      <p><b>账户尾号待建档：</b>仍可保存并运行三种模式。无付款数据或可提现为 0 时会正常跳过；真正进入资金提交前仍会执行账户安全校验。</p>
+    </div>
+
+    <fieldset data-marketplace-group>
+      <legend>站点（至少选择一个）</legend>
+      <label class="mini-check"><input type="checkbox" name="marketplace_codes" value="CA"> <span>CA 加拿大</span></label>
+      <label class="mini-check"><input type="checkbox" name="marketplace_codes" value="UK"> <span>UK 英国</span></label>
+      <label class="mini-check"><input type="checkbox" name="marketplace_codes" value="AU"> <span>AU 澳大利亚</span></label>
+      <small class="fieldset-help" data-marketplace-help>先选择店铺；这里只能选择该店铺已经启用的站点。</small>
+      <p class="marketplace-selection-warning" data-marketplace-warning hidden role="alert"></p>
+    </fieldset>
+
+    <fieldset data-run-days-group>
+      <legend>每周运行日（至少选择一天）</legend>
+      <div class="weekday-checks">
+        <label class="mini-check"><input type="checkbox" name="run_days" value="mon" checked> 周一</label>
+        <label class="mini-check"><input type="checkbox" name="run_days" value="tue" checked> 周二</label>
+        <label class="mini-check"><input type="checkbox" name="run_days" value="wed" checked> 周三</label>
+        <label class="mini-check"><input type="checkbox" name="run_days" value="thu" checked> 周四</label>
+        <label class="mini-check"><input type="checkbox" name="run_days" value="fri" checked> 周五</label>
+        <label class="mini-check"><input type="checkbox" name="run_days" value="sat"> 周六</label>
+        <label class="mini-check"><input type="checkbox" name="run_days" value="sun"> 周日</label>
+      </div>
+      <small class="fieldset-help">例如勾选周一至周五，就是每个工作日到点运行。</small>
+    </fieldset>
+
+    <label class="check-row">
+      <input name="enabled" type="checkbox">
+      <span><b>保存后启用</b><small>不勾选时只保存规则，不会自动定时运行；仍可点击“立即执行”测试。</small></span>
+    </label>
+
+    <button class="button primary wide" type="submit" data-schedule-submit>保存排期</button>
+    <p class="form-error" data-form-error role="alert"></p>
+  </form>
+</dialog>
+{% endblock %}

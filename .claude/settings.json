@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "agent",
+            "prompt": "判断本次对话是否有值得长期记住的信息（用户新偏好、纠正过的错误、项目级决策、外部资源指引）。如果没有，直接结束不写文件。如果有：1) 写到 harness 自动注入的 auto memory 目录（即 system prompt 里 'auto memory' 段提到的那个全局路径，形如 ~/.claude/projects/<project-slug>/memory/），不要写到项目内 ./.claude/memory/；2) 每条记忆存为单独的 .md 文件，按 user_/feedback_/project_/reference_ 前缀分类；3) 维护 MEMORY.md 索引；4) 已有记忆过时就更新，不要新建重复文件。",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

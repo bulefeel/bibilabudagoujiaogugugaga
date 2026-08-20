@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="hero-grid">
+  <article class="hero-card ink-card">
+    <p class="eyebrow">OPERATIONS PULSE</p><h2>一眼看清，<br><em>今天钱走到哪一步。</em></h2>
+    <div class="hero-meta"><span><b>{{ summary.active_runs }}</b> 个任务进行中</span><span><b>{{ summary.pending_approvals }}</b> 笔等待审核</span></div>
+  </article>
+  <div class="metric-grid">
+    <article class="metric"><small>已建档店铺</small><strong>{{ summary.stores }}</strong><span>{{ summary.enabled_stores }} 家已启用</span></article>
+    <article class="metric {{ 'attention' if summary.pending_approvals else '' }}"><small>待审核计划</small><strong>{{ summary.pending_approvals }}</strong><span>提交前需再读页面</span></article>
+    <article class="metric {{ 'critical' if summary.uncertain else '' }}"><small>已提交待平台审核</small><strong>{{ summary.uncertain }}</strong><span>结果未回读前绝不重提</span></article>
+    <article class="metric"><small>系统模式</small><strong class="word">串行</strong><span>全局资金锁已启用</span></article>
+  </div>
+</div>
+{% if guards %}
+<section class="alert-strip"><span>⚠</span><div><b>有 {{ guards|length }} 笔资金操作需要回读核对</b><p>这些记录不会再次点击提交；请前往运行流水检查平台结果。</p></div><a href="/runs" class="button dark">立即核查</a></section>
+{% endif %}
+<section class="section-head"><div><p>RECENT RUNS</p><h2>最近运行流水</h2></div><a href="/runs" class="text-link">查看全部 →</a></section>
+<div class="table-wrap">
+<table><thead><tr><th>创建时间</th><th>店铺</th><th>模式</th><th>状态</th><th>任务编号</th><th></th></tr></thead>
+<tbody>{% for run in runs %}<tr><td class="mono">{{ run.created_at|local_datetime('%m-%d %H:%M') }}</td><td><b>{{ run.store.name }}</b></td><td><span class="mode-tag">{{ run.mode }}</span></td><td><span class="status status-{{ run.status|lower }}">{{ run.status|status_label }}</span></td><td class="mono muted">{{ run.id[:8] }}</td><td><a class="row-link" href="/runs/{{ run.id }}">打开 →</a></td></tr>{% else %}<tr><td colspan="6" class="empty">还没有运行记录。先在店铺账册完成身份建档，再发起 dry_run。</td></tr>{% endfor %}</tbody></table>
+</div>
+{% endblock %}
