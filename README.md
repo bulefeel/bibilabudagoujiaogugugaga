@@ -1,27 +1,40 @@
 # 紫鸟多店铺本地自动化管理器 V1
 
 本项目在 Windows 当前桌面会话中运行，管理后台仅监听
-`http://127.0.0.1:8765`。SQLite、日志、截图、虚拟环境和缓存均保存在
-`D:\Vibe Seller2\ziniao-automation`，不调用 AI 接口。
+`http://127.0.0.1:8765`。SQLite、日志、截图、虚拟环境和缓存都放在安装目录下，
+不调用 AI 接口。
 
-## 1. 首次安装
+## 1. 安装（给非技术同事看的版本）
 
-1. 双击 `Install.bat`。脚本优先使用项目内或 Vibe Seller 自带的 `uv.exe`。
-2. `uv` 会把 Python 3.12 安装到项目 `.uv-python`，并在 D 盘建立 `.venv`；
-   不依赖系统 `py` 或系统 Python。
-3. 安装过程**不会**执行 `playwright install`，自动化直接连接紫鸟 Chromium。
-4. 使用 `D:\Vibe Seller2\Ziniao-WebDriver.bat` 启动/切换紫鸟 WebDriver 模式。
+1. 双击 `ZiniaoAutomation-Setup-x.y.z.exe`。
+
+2. **会出现一个蓝色窗口「Windows 已保护你的电脑」——这是正常的。**
+   这个安装包没有购买代码签名证书，Windows 对所有没签名的程序都会这样提示，
+   不代表有病毒。点窗口里的 **「更多信息」**，再点下面出现的 **「仍要运行」**。
+
+3. 一路点「下一步」。默认会装到你自己的用户目录，**不需要管理员密码**。
+
+4. 装到「正在安装运行环境」那一步会**停留 2–5 分钟**（要联网下载 Python），
+   期间不要关窗口。
+
+5. 装完双击桌面上的 **「紫鸟提现自动化」**，浏览器会自动打开管理后台，
+   在页面上创建管理员账号。
+
+> 紫鸟浏览器需要你**自己另外安装**，本安装包不包含它。
 
 ## 2. 配置凭据
 
-在 PowerShell 或 CMD 中执行：
+管理员账号在网页上创建。紫鸟账号和飞书通知目前仍需命令行（后续会搬到网页）：
 
 ```bat
-cd /d "D:\Vibe Seller2\ziniao-automation"
-.venv\Scripts\ziniao-automation.exe configure admin
+cd /d "%LOCALAPPDATA%\ZiniaoAutomation\app"
 .venv\Scripts\ziniao-automation.exe configure ziniao
 .venv\Scripts\ziniao-automation.exe configure feishu
 ```
+
+> `configure admin` 也还在，但只作为**忘记密码时的救急后门**——正常情况下
+> 请在网页 `/setup` 页面创建管理员。两者写的是同一条记录，先用命令行建了，
+> 网页那条更友好的路就会提示"已初始化"。
 
 密码和 App Secret 使用隐藏输入。紫鸟密码、飞书 App Secret 存入 Windows
 Credential Manager；SQLite 仅保存 `credential_ref`、App ID、Chat ID 等元数据。

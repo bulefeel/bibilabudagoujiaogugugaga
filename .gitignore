@@ -39,3 +39,4 @@ uv.exe
 
 # Machine-local Claude Code permissions
 .claude/settings.local.json
+build/

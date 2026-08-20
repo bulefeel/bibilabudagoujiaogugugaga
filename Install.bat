@@ -23,6 +23,10 @@ set "PYTHONPYCACHEPREFIX=%ROOT%\data\pycache"
 set "PLAYWRIGHT_BROWSERS_PATH=%ROOT%\data\playwright-unused"
 set "PYTHONUSERBASE=%ROOT%\data\python-userbase"
 
+rem Pull wheels from a domestic mirror by default; pypi.org is often unusably
+rem slow here.  An operator who already has UV_DEFAULT_INDEX set keeps theirs.
+if not defined UV_DEFAULT_INDEX set "UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple"
+
 cd /d "%ROOT%"
 if not exist "%TMPROOT%" mkdir "%TMPROOT%"
 if not exist "%CACHE%" mkdir "%CACHE%"
@@ -40,12 +44,12 @@ for /f "delims=" %%U in ('where uv') do (
 :uv_ready
 if not exist "%UV%" goto :no_uv
 
-echo [1/4] 正在 D 盘准备 Python 3.12...
+echo [1/4] 正在准备 Python 3.12（首次安装需要联网下载）...
 "%UV%" python install 3.12
 if errorlevel 1 goto :failed
 
 if not exist "%VENV%\Scripts\python.exe" (
-  echo [2/4] 正在 D 盘创建虚拟环境...
+  echo [2/4] 正在创建运行环境...
   "%UV%" venv --python 3.12 "%VENV%"
   if errorlevel 1 goto :failed
 ) else (
@@ -60,16 +64,20 @@ echo [3/4] 正在安装项目依赖（不会下载 Playwright 浏览器）...
 "%UV%" pip install --python "%VENV%\Scripts\python.exe" -e "%ROOT%"
 if errorlevel 1 goto :failed
 
-echo [4/4] 正在初始化 D 盘目录和数据库...
+echo [4/4] 正在初始化数据目录和数据库...
 set "PYTHONPATH=%ROOT%\src"
 "%VENV%\Scripts\python.exe" -c "from ziniao_automation.config import Settings; from ziniao_automation.db import create_sqlite_engine,init_database; s=Settings.from_env(); s.ensure_directories(); e=create_sqlite_engine(s); init_database(e); e.dispose()"
 if errorlevel 1 goto :failed
 
 echo.
-echo [完成] 下一步依次配置：admin、ziniao、feishu
-echo   "%VENV%\Scripts\ziniao-automation.exe" configure admin
-echo   "%VENV%\Scripts\ziniao-automation.exe" configure ziniao
-echo   "%VENV%\Scripts\ziniao-automation.exe" configure feishu
+echo [完成] 安装成功。
+echo.
+echo   下一步：双击桌面上的“紫鸟提现自动化”图标，浏览器会自动打开管理后台，
+echo           在页面上创建管理员账号。
+echo.
+echo   紫鸟账号和飞书通知目前仍需命令行配置：
+echo     "%VENV%\Scripts\ziniao-automation.exe" configure ziniao
+echo     "%VENV%\Scripts\ziniao-automation.exe" configure feishu
 exit /b 0
 
 :no_uv
