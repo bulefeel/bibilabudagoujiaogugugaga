@@ -1,7 +1,10 @@
 ﻿@echo off
 setlocal EnableExtensions
 chcp 65001 >nul
-set "ROOT=D:\Vibe Seller2\ziniao-automation"
+rem Derive the install directory from this script, so the folder can be
+rem moved or installed anywhere without editing any file.
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "PYW=%ROOT%\.venv\Scripts\pythonw.exe"
 set "TASK=Ziniao Automation V1"
 

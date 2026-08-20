@@ -3,7 +3,10 @@ setlocal EnableExtensions
 chcp 65001 >nul
 title 紫鸟自动化 - 启动
 
-set "ROOT=D:\Vibe Seller2\ziniao-automation"
+rem Derive the install directory from this script, so the folder can be
+rem moved or installed anywhere without editing any file.
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "PYW=%ROOT%\.venv\Scripts\pythonw.exe"
 set "PY=%ROOT%\.venv\Scripts\python.exe"
 set "UV_CACHE_DIR=%ROOT%\.uv-cache"
@@ -44,7 +47,15 @@ for /L %%I in (1,1,30) do (
   if not errorlevel 1 goto :ready
   ping 127.0.0.1 -n 2 >nul
 )
-echo [错误] 后台 30 秒内未就绪，请查看 data\logs\ziniao-automation.jsonl
+echo [错误] 后台 30 秒内未就绪。
+set "REASON="
+for /f "usebackq delims=" %%E in (`"%PY%" -m ziniao_automation.runner --last-error 2^>nul`) do set "REASON=%%E"
+if defined REASON (
+  echo         最近一条错误：%REASON%
+) else (
+  echo         日志里没有留下错误，多半是启动被安全软件拦下了。
+)
+echo         完整日志：%ROOT%\data\logs\ziniao-automation.jsonl
 exit /b 1
 
 :ready

@@ -3,7 +3,10 @@ setlocal EnableExtensions
 chcp 65001 >nul
 title 修复飞书通知凭据
 
-set "ROOT=D:\Vibe Seller2\ziniao-automation"
+rem Derive the install directory from this script, so the folder can be
+rem moved or installed anywhere without editing any file.
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "CLI=%ROOT%\.venv\Scripts\ziniao-automation.exe"
 set "PY=%ROOT%\.venv\Scripts\python.exe"
 set "PYTHONPATH=%ROOT%\src"

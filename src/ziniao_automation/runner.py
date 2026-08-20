@@ -120,6 +120,43 @@ def stop() -> int:
     return 0
 
 
+def last_error(settings: Settings | None = None, *, tail_bytes: int = 64_000) -> str:
+    """The most recent ERROR from the log, phrased for a non-technical reader.
+
+    Start.bat and the desktop launcher both used to end at "请查看
+    data\\logs\\ziniao-automation.jsonl", which asks someone who has never seen
+    JSON to go read JSON.  The one line they actually need is already in that
+    file; this digs it out so the caller can put it on screen.
+
+    Returns an empty string when there is nothing to report — the caller decides
+    what to say instead, rather than being handed a misleading placeholder.
+    """
+
+    settings = settings or Settings.from_env()
+    path = settings.log_dir / "ziniao-automation.jsonl"
+    try:
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - tail_bytes))
+            # A mid-line seek can split a UTF-8 sequence; drop that partial line.
+            chunk = stream.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    for line in reversed(chunk.splitlines()[1:] or chunk.splitlines()):
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(record, dict) or record.get("level") != "ERROR":
+            continue
+        message = " ".join(str(record.get("message") or "").split())
+        kind = str(record.get("exception_type") or "").strip()
+        detail = str(record.get("exception_message") or "").strip()
+        parts = [part for part in (message, kind, detail) if part]
+        return " | ".join(parts)[:400]
+    return ""
+
+
 def serve() -> int:
     _clear_codex_parent_markers()
     settings = Settings.from_env()
@@ -179,7 +216,17 @@ def serve() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stop", action="store_true")
+    parser.add_argument(
+        "--last-error",
+        action="store_true",
+        help="打印日志里最近一条错误，供启动脚本显示给操作员",
+    )
     args = parser.parse_args()
+    if args.last_error:
+        reported = last_error()
+        if reported:
+            print(reported)
+        return 0
     return stop() if args.stop else serve()
 
 

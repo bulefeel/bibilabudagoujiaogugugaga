@@ -3,10 +3,12 @@ setlocal EnableExtensions
 chcp 65001 >nul
 title 紫鸟自动化 - 安装
 
-set "ROOT=D:\Vibe Seller2\ziniao-automation"
+rem Derive the install directory from this script, so the folder can be
+rem moved or installed anywhere without editing any file.
+set "ROOT=%~dp0"
+if "%ROOT:~-1%"=="\" set "ROOT=%ROOT:~0,-1%"
 set "VENV=%ROOT%\.venv"
 set "UV=%ROOT%\uv.exe"
-set "BUNDLED_UV=D:\Vibe Seller2\vibe-seller\VibeSeller\uv.exe"
 set "CACHE=%ROOT%\.uv-cache"
 set "TMPROOT=%ROOT%\data\tmp"
 set "UV_CACHE_DIR=%CACHE%"
@@ -25,11 +27,9 @@ cd /d "%ROOT%"
 if not exist "%TMPROOT%" mkdir "%TMPROOT%"
 if not exist "%CACHE%" mkdir "%CACHE%"
 
+rem uv.exe ships next to this script.  Only fall back to a PATH copy so a
+rem developer checkout without the binary can still install.
 if exist "%UV%" goto :uv_ready
-if exist "%BUNDLED_UV%" (
-  copy /Y "%BUNDLED_UV%" "%UV%" >nul
-  goto :uv_ready
-)
 where uv >nul 2>&1
 if errorlevel 1 goto :no_uv
 for /f "delims=" %%U in ('where uv') do (
@@ -73,7 +73,8 @@ echo   "%VENV%\Scripts\ziniao-automation.exe" configure feishu
 exit /b 0
 
 :no_uv
-echo [错误] 未找到 uv.exe。请保留 Vibe Seller 自带的 uv.exe 后再次运行。
+echo [错误] 安装目录里缺少 uv.exe。
+echo         它随安装包一起提供，请重新解压/重装，不要单独挪走这个文件。
 exit /b 1
 
 :failed
