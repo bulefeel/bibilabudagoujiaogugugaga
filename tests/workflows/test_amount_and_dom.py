@@ -4,11 +4,14 @@ from dataclasses import replace
 from decimal import Decimal
 import unittest
 
+import pytest
+
 from ziniao_automation.workflows.amazon_disbursement import (
     AmazonDomContract,
     AmazonPaymentsPage,
     parse_amount,
 )
+from ziniao_automation.workflows.amazon_login import AmazonLoginAdvancer
 from ziniao_automation.workflows.errors import DomContractError, HumanAuthRequired
 from ziniao_automation.workflows.types import (
     MarketplaceRef,
@@ -412,6 +415,129 @@ class AmountAndDomTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(DomContractError):
             await adapter.open_confirmation(page, run, marketplace, expected)
         self.assertEqual(adapter.verify_details_calls, 0)
+
+
+
+
+class _StepUpAfterPressPage(_LoginAnsweredPage):
+    """The dashboard press is answered with a step-up sign-in, asynchronously.
+
+    ``url`` still reads as the dashboard for the first look after the click and
+    only flips to ``/ap/signin`` on the next one.  That one-read gap is the
+    whole defect: ``_raise_if_auth`` samples the URL exactly once, with no
+    wait, so it saw "no login page" and the advancer was never started.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.url = "https://sellercentral.amazon.ca/payments/dashboard/index.html"
+        self._signin_pending = False
+
+    def commit_click(self) -> None:
+        """The press is away; Amazon's redirect has not landed yet."""
+
+        self._signin_pending = True
+
+    def observe(self) -> None:
+        """The next poll after the press is where the redirect shows up.
+
+        ``_raise_if_auth`` samples ``url`` before this ever runs — which is
+        exactly why it saw the dashboard and skipped the advancer.
+        """
+
+        if self._signin_pending:
+            self.url = (
+                "https://sellercentral.amazon.ca/ap/signin"
+                "?openid.pape.max_auth_age=300"
+            )
+            self._signin_pending = False
+
+
+class _StepUpAfterPressAdapter(_LoginAnsweredAdapter):
+    """Reaches details only if the advancer is given a turn on the sign-in page."""
+
+    def __init__(self, snapshot: MarketplaceSnapshot) -> None:
+        super().__init__(snapshot)
+        self.auth_calls: list[str] = []
+
+    async def _wait_for_nonfinal_confirmation_transition(self, page, marketplace):
+        del marketplace
+        page.commit_click()
+
+    async def _raise_if_auth(
+        self, page, marketplace=None, *, allow_payment_details_handoff=False
+    ):
+        del allow_payment_details_handoff
+        self.auth_calls.append(str(page.url))
+        if AmazonLoginAdvancer.is_supported_login_url(
+            str(page.url),
+            expected_host=marketplace.domain if marketplace else None,
+        ):
+            # Stands in for the advancer completing Ziniao's managed Passkey.
+            page.url = (
+                f"https://{marketplace.domain}/payments/disburse/details"
+                "?accountType=PAYABLE"
+            )
+        return page
+
+    async def _wait_for_post_auth_payment_details(self, page, marketplace):
+        del marketplace
+        page.observe()
+        return page
+
+
+@pytest.mark.asyncio
+async def test_step_up_triggered_by_the_press_is_advanced_not_handed_to_a_human() -> None:
+    """Field case 92c04dde: a site dropped while the Passkey prompt was on screen.
+
+    Pressing Request disbursement on CA landed on ``/ap/signin`` with
+    ``max_auth_age=300``.  ``_raise_if_auth`` had already sampled the URL one
+    moment too early, so it saw the dashboard and skipped the advancer; the
+    handoff poll then saw the sign-in route 1 ms later and the caller raised
+    ``native_passkey_or_challenge`` on the spot.  That whole run's log contains
+    no ``amazon_login`` line at all — nothing ever tried to log in, while
+    Ziniao's managed-Passkey chooser sat there waiting to be clicked.
+    """
+
+    marketplace, run, expected = _confirmation_fixture()
+    marketplace = replace(marketplace, code="CA", domain="sellercentral.amazon.ca")
+    adapter = _StepUpAfterPressAdapter(expected)
+    page = _StepUpAfterPressPage()
+
+    verified = await adapter.open_confirmation(page, run, marketplace, expected)
+
+    assert verified == expected
+    assert adapter.button.clicks == 1, "the dashboard control is pressed once"
+    # Two turns: the early one that legitimately saw no login page, and the
+    # second chance that actually resolved the step-up.
+    assert len(adapter.auth_calls) == 2
+    assert "/payments/dashboard/" in adapter.auth_calls[0]
+    assert "/ap/signin" in adapter.auth_calls[1]
+    assert adapter._is_expected_details_url(page.url, marketplace)
+
+
+@pytest.mark.asyncio
+async def test_a_press_that_lands_somewhere_unknown_still_reaches_a_human() -> None:
+    """Only a login route buys the retry; anything else still fails closed."""
+
+    marketplace, run, expected = _confirmation_fixture()
+    marketplace = replace(marketplace, code="CA", domain="sellercentral.amazon.ca")
+    adapter = _StepUpAfterPressAdapter(expected)
+    page = _StepUpAfterPressPage()
+
+    async def land_on_an_unknown_page(page_, marketplace_):
+        del marketplace_
+        page_.observe()
+        if "/ap/signin" in str(page_.url):
+            page_.url = "https://sellercentral.amazon.ca/help/hub/reference/G200"
+        return page_
+
+    adapter._wait_for_post_auth_payment_details = land_on_an_unknown_page
+
+    with pytest.raises(HumanAuthRequired) as raised:
+        await adapter.open_confirmation(page, run, marketplace, expected)
+
+    assert raised.value.kind == "native_passkey_or_challenge"
 
 
 if __name__ == "__main__":

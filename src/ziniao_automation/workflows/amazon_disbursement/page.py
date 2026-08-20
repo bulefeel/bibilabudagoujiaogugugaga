@@ -387,7 +387,7 @@ class AmazonPaymentsPage:
                 marketplace,
                 allow_payment_details_handoff=True,
             )
-            page = await self._wait_for_post_auth_payment_details(page, marketplace)
+            page = await self._settle_details_or_advance_login(page, marketplace)
             confirmation_key = (id(page), marketplace.code.upper())
             if answered_with_login and not self._is_expected_details_url(
                 str(page.url), marketplace
@@ -456,7 +456,7 @@ class AmazonPaymentsPage:
             marketplace,
             allow_payment_details_handoff=True,
         )
-        page = await self._wait_for_post_auth_payment_details(page, marketplace)
+        page = await self._settle_details_or_advance_login(page, marketplace)
         confirmation_key = (id(page), marketplace.code.upper())
         if not self._is_expected_details_url(str(page.url), marketplace):
             # A native Passkey/security-key window can be owned by Chromium or
@@ -474,6 +474,56 @@ class AmazonPaymentsPage:
         verified = await self._verify_details(page, marketplace, expected)
         self._confirmation_dispatched.discard(confirmation_key)
         return verified
+
+    async def _settle_details_or_advance_login(
+        self,
+        page: Any,
+        marketplace: MarketplaceRef,
+    ) -> Any:
+        """Wait for the details page, letting one step-up sign-in resolve first.
+
+        :meth:`_wait_for_post_auth_payment_details` returns the instant it sees
+        a sign-in route, and its own docstring says it "hands it straight back
+        to the caller" — but every caller only tested for the details URL and
+        raised.  A ``max_auth_age`` step-up triggered *by the dashboard press
+        itself* therefore ended the site without the login advancer ever being
+        given a turn.
+
+        The race is in :meth:`_raise_if_auth`: it reads ``page.url`` exactly
+        once, with no wait, so a navigation that has not committed yet looks
+        like "no login page here".  One millisecond later the handoff poll sees
+        ``/ap/signin``.
+
+        Field case ``92c04dde`` (2026-08-19, 正香-张刚CA / CA): the press landed
+        on ``/ap/signin?...max_auth_age=300`` and Ziniao's managed-Passkey
+        chooser was already painted on screen with its button waiting — while
+        the run had given up two seconds earlier.  That run's log contains **no
+        ``amazon_login`` line at all**: the advancer was never started.
+
+        This never presses the dashboard control.  ``_raise_if_auth`` only runs
+        the advancer, which clicks login controls alone, and a genuine
+        CAPTCHA/challenge still raises out of here unchanged.
+        """
+
+        page = await self._wait_for_post_auth_payment_details(page, marketplace)
+        current_url = str(getattr(page, "url", "") or "")
+        if self._is_expected_details_url(current_url, marketplace):
+            return page
+        if not AmazonLoginAdvancer.is_supported_login_url(
+            current_url, expected_host=marketplace.domain
+        ):
+            # Something other than a login page; the caller's own checks are
+            # the right authority for that.
+            return page
+        logger.info(
+            "Payment details press answered with a step-up sign-in: marketplace=%s",
+            marketplace.code,
+            extra={"marketplace": marketplace.code, "event": "details_step_up"},
+        )
+        page = await self._raise_if_auth(
+            page, marketplace, allow_payment_details_handoff=True
+        )
+        return await self._wait_for_post_auth_payment_details(page, marketplace)
 
     async def _retry_nonfinal_dispatch(
         self,
@@ -543,7 +593,7 @@ class AmazonPaymentsPage:
         page = await self._raise_if_auth(
             page, marketplace, allow_payment_details_handoff=True
         )
-        return await self._wait_for_post_auth_payment_details(page, marketplace)
+        return await self._settle_details_or_advance_login(page, marketplace)
 
     async def submit_once(
         self,
