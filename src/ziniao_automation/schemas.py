@@ -42,6 +42,24 @@ class MarketplaceSetupInput(ApiModel):
         return value
 
 
+class FeishuSettingsInput(ApiModel):
+    """What the console collects for Feishu; the secret is never echoed back.
+
+    ``max_length`` is not cosmetic: Windows Credential Manager rejects a blob
+    over roughly 2.5 KB, and the whole JSON payload shares that budget.
+    """
+
+    app_id: str = Field(min_length=1, max_length=200)
+    app_secret: str = Field(min_length=1, max_length=500)
+    chat_id: str = Field(min_length=1, max_length=200)
+
+
+class ZiniaoSettingsInput(ApiModel):
+    company: str = Field(min_length=1, max_length=200)
+    username: str = Field(min_length=1, max_length=200)
+    password: str = Field(min_length=1, max_length=500)
+
+
 class StoreCreate(ApiModel):
     name: str = Field(min_length=1, max_length=160)
     selector_type: Literal["oauth", "id"]

@@ -320,6 +320,57 @@ class AutomationService:
         if self._worker is not None:
             self._worker.notifications = deliveries
 
+    async def start_webdriver_mode(self) -> dict[str, Any]:
+        """Switch Ziniao into WebDriver mode, refusing while work is in flight.
+
+        Exposed here because this is the only object that can see both halves of
+        the safety question: the controller's live lock state, and the durable
+        guards in SQLite.  Killing the browser between ``arm_operation`` and the
+        irreversible click would strand a payout nobody can account for.
+        """
+
+        from ziniao_automation.ziniao.webdriver_mode import (
+            describe_blockers,
+            start_webdriver_mode,
+        )
+
+        controller = self.ziniao_controller
+        snapshot = None
+        locks = getattr(controller, "locks", None)
+        if locks is not None and hasattr(locks, "snapshot"):
+            snapshot = locks.snapshot()
+
+        pending: list[str] = []
+        if self.session_factory is not None:
+            from ziniao_automation.models import OperationGuard
+            from sqlalchemy import select as _select
+
+            with self.session_factory() as session:
+                pending = [
+                    f"{row.marketplace_code}（{row.state}）"
+                    for row in session.scalars(
+                        _select(OperationGuard).where(
+                            OperationGuard.state.in_(("ARMED", "SUBMITTED"))
+                        )
+                    )
+                ]
+
+        config = getattr(controller, "config", None)
+        client_config = getattr(getattr(controller, "client", None), "config", None)
+        report = await start_webdriver_mode(
+            Path(getattr(config, "client_path", "")),
+            host=str(getattr(client_config, "host", "127.0.0.1")),
+            port=int(getattr(client_config, "port", 16851)),
+            blockers=describe_blockers(snapshot, pending),
+        )
+        return {
+            "ok": report.ok,
+            "status": report.status,
+            "message": report.message,
+            "closed_processes": report.closed_processes,
+            "details": report.details,
+        }
+
     async def sync_ziniao(self) -> dict[str, Any]:
         """Read profiles only; the HTTP request owns the single DB transaction.
 

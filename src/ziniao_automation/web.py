@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import inspect
 import logging
 from pathlib import Path
+import re
 import socket
 from typing import Any, AsyncIterator, Protocol
 
@@ -44,6 +45,7 @@ from .repositories import (
 )
 from .schemas import (
     BootstrapInput,
+    FeishuSettingsInput,
     LoginInput,
     MarketplaceSetupInput,
     RunCreate,
@@ -55,8 +57,16 @@ from .schemas import (
     StorePatch,
     StoreSetupResetView,
     StoreView,
+    ZiniaoSettingsInput,
 )
-from .ziniao.credentials import credential_exists
+from .ziniao.credentials import (
+    DEFAULT_FEISHU_TARGET,
+    DEFAULT_ZINIAO_TARGET,
+    CredentialStoreError,
+    credential_exists,
+    read_generic_credential,
+    write_generic_credential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -559,6 +569,13 @@ def create_app(
                 feishu_ref and credential_exists(feishu_ref)
             ),
             "host": f"{settings.host}:{settings.port}",
+            # Non-secret fields only, so the forms can be pre-filled without a
+            # round trip.  Passwords and App Secret are never sent to the page —
+            # not even masked, since a mask still leaks the length.
+            "ziniao_company": (account.company or "") if account else "",
+            "ziniao_username": (account.username or "") if account else "",
+            "feishu_app_id": str(feishu_metadata.get("app_id", "") or ""),
+            "feishu_chat_id": str(feishu_metadata.get("chat_id", "") or ""),
         }
         return render(request, "diagnostics.html", {"diagnostics": diagnostics}, db=db, page_title="系统诊断")
 
@@ -581,6 +598,164 @@ def create_app(
         return FileResponse(path, filename=path.name)
 
     api = APIRouter(prefix="/api", dependencies=[Depends(current_admin)])
+
+    @api.post("/settings/feishu", status_code=200)
+    async def save_feishu_settings(
+        payload: FeishuSettingsInput,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        """Store the Feishu app the same way ``configure feishu`` does.
+
+        The secret goes to Windows Credential Manager and never to SQLite; only
+        the App ID, Chat ID and the credential's name are persisted here.  The
+        response deliberately carries no secret back — not even a masked one,
+        because a masked value still tells an attacker its length.
+        """
+
+        reference = DEFAULT_FEISHU_TARGET
+        try:
+            write_generic_credential(
+                reference,
+                {
+                    "app_id": payload.app_id,
+                    "app_secret": payload.app_secret,
+                    "chat_id": payload.chat_id,
+                },
+                username=payload.app_id,
+            )
+        except (CredentialStoreError, ValueError, OSError) as exc:
+            raise HTTPException(502, f"写入 Windows 凭据管理器失败：{exc}") from exc
+        # Read it straight back.  Security software has been observed silently
+        # dropping credential writes, and a write that did not stick would only
+        # surface much later as an unexplained notification failure.
+        if not credential_exists(reference):
+            raise HTTPException(
+                502,
+                "凭据写入后无法回读，请检查安全软件是否拦截了 Windows 凭据管理器。",
+            )
+        row = db.get(SystemSetting, "feishu")
+        metadata = {
+            "credential_ref": reference,
+            "app_id": payload.app_id,
+            "chat_id": payload.chat_id,
+            "enabled": True,
+        }
+        if row is None:
+            db.add(SystemSetting(key="feishu", value=metadata))
+        else:
+            row.value = metadata
+        db.commit()
+        return {"status": "saved", "app_id": payload.app_id, "chat_id": payload.chat_id}
+
+    @api.post("/settings/feishu/test", status_code=200)
+    async def test_feishu_settings(
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        """Send one real card, so a wrong Chat ID is found now rather than later.
+
+        Configuration that is only validated the next time a payout runs is
+        configuration nobody trusts.
+        """
+
+        row = db.get(SystemSetting, "feishu")
+        metadata = dict(row.value) if row is not None and row.value else {}
+        reference = str(metadata.get("credential_ref") or "").strip()
+        if not reference:
+            raise HTTPException(409, "尚未保存飞书配置")
+        from .notifications.dto import NotificationKind, SafeRunNotice
+        from .notifications.feishu import FeishuNotifier
+
+        notifier = FeishuNotifier(lambda: read_generic_credential(reference))
+        try:
+            await notifier.send(
+                SafeRunNotice(
+                    kind=NotificationKind.RUN_COMPLETED,
+                    title="紫鸟提现 · 配置测试",
+                    summary="这是一条测试消息，看到它说明飞书通知已经配好了。",
+                    run_short_id="TESTONLY",
+                    store_name="配置测试",
+                    next_action="无需操作。",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
+            raise HTTPException(502, f"发送失败：{_safe_probe_error(exc)}") from exc
+        return {"status": "sent"}
+
+    @api.post("/settings/ziniao", status_code=200)
+    async def save_ziniao_settings(
+        payload: ZiniaoSettingsInput,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        """Store the Ziniao login exactly as ``configure ziniao`` does."""
+
+        reference = DEFAULT_ZINIAO_TARGET
+        try:
+            write_generic_credential(
+                reference,
+                {
+                    "company": payload.company,
+                    "username": payload.username,
+                    "password": payload.password,
+                },
+                username=payload.username,
+            )
+        except (CredentialStoreError, ValueError, OSError) as exc:
+            raise HTTPException(502, f"写入 Windows 凭据管理器失败：{exc}") from exc
+        if not credential_exists(reference):
+            raise HTTPException(
+                502,
+                "凭据写入后无法回读，请检查安全软件是否拦截了 Windows 凭据管理器。",
+            )
+        account = db.scalar(select(ZiniaoAccount).limit(1))
+        if account is None:
+            db.add(
+                ZiniaoAccount(
+                    display_name="紫鸟主账号",
+                    company=payload.company,
+                    username=payload.username,
+                    credential_ref=reference,
+                )
+            )
+        else:
+            account.company = payload.company
+            account.username = payload.username
+            account.credential_ref = reference
+            account.enabled = True
+        db.commit()
+        return {"status": "saved", "company": payload.company, "username": payload.username}
+
+    @api.post("/ziniao/webdriver/start", status_code=200)
+    async def start_webdriver_mode(
+        request: Request,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        """Put Ziniao into WebDriver mode, which force-closes its open windows.
+
+        Refused outright while a run holds the browser or an ARMED/SUBMITTED
+        guard is outstanding — see ``webdriver_mode.describe_blockers``.  The
+        service answers 409 in that case and kills nothing.
+        """
+
+        starter = getattr(
+            request.app.state.automation_service, "start_webdriver_mode", None
+        )
+        if not callable(starter):
+            raise HTTPException(503, "紫鸟运行服务尚未配置")
+        _release_before_automation(db)
+        try:
+            result = await starter()
+        except RuntimeError as exc:
+            raise HTTPException(503, str(exc)) from exc
+        if not isinstance(result, dict):
+            raise HTTPException(502, "紫鸟模式切换返回了无效结构")
+        if not result.get("ok"):
+            status = 409 if result.get("status") == "busy" else 502
+            raise HTTPException(status, str(result.get("message") or "切换失败"))
+        return result
 
     @api.post("/ziniao/sync")
     async def sync_ziniao(
@@ -1230,6 +1405,19 @@ def create_app(
 
     app.include_router(api)
     return app
+
+
+def _safe_probe_error(exc: BaseException) -> str:
+    """One short line for the operator, with anything secret-shaped removed.
+
+    A failing Feishu call can carry the tenant token or the full request URL in
+    its message.  The console is loopback-only, but this text also lands in the
+    log, and the project's rule is that secrets never reach disk.
+    """
+
+    text = " ".join(str(exc).split())[:300]
+    text = re.sub(r"(?i)(token|secret|password|app_secret)[=:\s\"']+\S+", r"=***", text)
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 
 def _set_session_cookies(response: Response, token: str, csrf: str, settings: Settings) -> None:

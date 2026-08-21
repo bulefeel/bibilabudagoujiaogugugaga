@@ -246,4 +246,4 @@ def test_legacy_setup_routes_are_not_left_in_the_frontend_and_cache_is_bumped() 
         "detect-all-marketplace-setups",
     ):
         assert legacy not in combined
-    assert "20260819-skip-notice-and-reset" in base
+    assert "20260820-web-settings-and-webdriver" in base

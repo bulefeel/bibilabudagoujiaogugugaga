@@ -10,5 +10,35 @@
   <article><span class="diag-icon">WEB</span><div><small>后台监听</small><b>{{ diagnostics.host }}</b></div><em class="ok">仅限本机</em></article>
   <article><span class="diag-icon">CDP</span><div><small>店铺 CDP</small><b>启动店铺后动态检测</b></div><em class="warn">运行时检查</em></article>
 </div>
-<aside class="diagnostic-note"><b>检查顺序</b><ol><li>紫鸟客户端路径存在</li><li>紫鸟与飞书凭据均显示“可读取”</li><li>16851 端口响应后同步店铺</li><li>建档卖家身份，再运行 dry_run</li></ol><p>凭据显示“引用已失效”时，请重新运行对应的 <code>configure ziniao</code> 或 <code>configure feishu</code>。</p></aside>
+<section class="diagnostic-actions">
+  <header><p class="eyebrow">ONE CLICK</p><h3>紫鸟 WebDriver 模式</h3></header>
+  <p class="fieldset-help">自动化需要紫鸟运行在 WebDriver 模式下，本地控制端口 {{ diagnostics.control_port }} 才会响应。<strong>切换会关掉当前所有已打开的紫鸟店铺窗口</strong>；正在跑提现任务、或还有未收尾的资金记录时，程序会拒绝切换。</p>
+  <div class="diagnostic-actions-row">
+    <button class="button dark" type="button" data-action="start-webdriver" {{ 'disabled' if diagnostics.control_reachable else '' }}>{{ '端口已响应，无需切换' if diagnostics.control_reachable else '启动 WebDriver 模式' }}</button>
+    <span class="diagnostic-actions-state" data-webdriver-state aria-live="polite"></span>
+  </div>
+</section>
+
+<section class="diagnostic-settings">
+  <header><p class="eyebrow">CREDENTIALS</p><h3>凭据配置</h3></header>
+  <p class="fieldset-help">密码和 Secret 只写入 <b>Windows 凭据管理器</b>，不会保存在数据库或配置文件里，页面也不会回显。要修改就重新输入一次完整的值。</p>
+
+  <form class="settings-card" data-settings-form="ziniao">
+    <div class="settings-card-head"><b>紫鸟账号</b><span class="verify-mark {{ 'ok' if diagnostics.ziniao_credential_readable else '' }}">{{ '已配置' if diagnostics.ziniao_credential_readable else '未配置' }}</span></div>
+    <label>企业名称<input name="company" autocomplete="off" required value="{{ diagnostics.ziniao_company }}"></label>
+    <label>登录账号<input name="username" autocomplete="off" required value="{{ diagnostics.ziniao_username }}"></label>
+    <label>登录密码<input name="password" type="password" autocomplete="new-password" required placeholder="{{ '已配置，如需修改请重新输入' if diagnostics.ziniao_credential_readable else '' }}"></label>
+    <div class="settings-card-actions"><button class="button primary" type="submit">保存紫鸟账号</button><span class="form-error" data-form-error></span></div>
+  </form>
+
+  <form class="settings-card" data-settings-form="feishu">
+    <div class="settings-card-head"><b>飞书通知</b><span class="verify-mark {{ 'ok' if diagnostics.feishu_credential_readable else '' }}">{{ '已配置' if diagnostics.feishu_credential_readable else '未配置' }}</span></div>
+    <label>App ID<input name="app_id" autocomplete="off" required value="{{ diagnostics.feishu_app_id }}"></label>
+    <label>App Secret<input name="app_secret" type="password" autocomplete="new-password" required placeholder="{{ '已配置，如需修改请重新输入' if diagnostics.feishu_credential_readable else '' }}"></label>
+    <label>Chat ID<input name="chat_id" autocomplete="off" required placeholder="通常以 oc_ 开头" value="{{ diagnostics.feishu_chat_id }}"></label>
+    <div class="settings-card-actions"><button class="button primary" type="submit">保存飞书配置</button><button class="button ghost" type="button" data-action="test-feishu" {{ '' if diagnostics.feishu_credential_readable else 'disabled' }}>发送测试消息</button><span class="form-error" data-form-error></span></div>
+  </form>
+</section>
+
+<aside class="diagnostic-note"><b>检查顺序</b><ol><li>紫鸟客户端路径存在</li><li>紫鸟与飞书凭据均显示“可读取”</li><li>16851 端口响应后同步店铺</li><li>建档卖家身份，再运行 dry_run</li></ol><p>凭据显示“引用已失效”时，在上方重新填写并保存即可；也可以用命令行 <code>configure ziniao</code> / <code>configure feishu</code>。</p></aside>
 {% endblock %}

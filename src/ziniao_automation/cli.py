@@ -17,13 +17,12 @@ from .db import create_sqlite_engine, init_database, make_session_factory
 from .logging_config import purge_expired_artifacts
 from .models import AdminCredential, SystemSetting, ZiniaoAccount
 from .ziniao.credentials import (
+    DEFAULT_FEISHU_TARGET,
+    DEFAULT_ZINIAO_TARGET,
     credential_exists,
     delete_generic_credential,
     write_generic_credential,
 )
-
-DEFAULT_ZINIAO_TARGET = "ziniao-automation/ziniao/main"
-DEFAULT_FEISHU_TARGET = "ziniao-automation/feishu/main"
 
 
 def build_parser() -> argparse.ArgumentParser:

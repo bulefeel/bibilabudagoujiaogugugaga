@@ -19,6 +19,7 @@ from ziniao_automation.models import (
     RunQueueEntry,
     Schedule,
     StoreMarketplace,
+    SystemSetting,
 )
 from ziniao_automation.repositories import StoreRepository, WorkflowRepository
 from ziniao_automation.web import create_app
@@ -652,7 +653,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260819-skip-notice-and-reset" in page.text
+    assert "/static/app.js?v=20260820-web-settings-and-webdriver" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text
@@ -831,3 +832,176 @@ def test_production_sync_persists_each_new_profile_only_once(tmp_path: Path):
         assert [item["selector_value"] for item in stores] == [
             "oauth-production-one"
         ]
+
+
+def _settings_client(app_client, monkeypatch):
+    """Point the credential helpers at an in-memory store.
+
+    The real ones talk to Windows Credential Manager; a test that wrote there
+    would clobber the operator's actual Ziniao and Feishu logins.
+    """
+
+    from ziniao_automation import web as web_module
+
+    vault: dict[str, dict[str, str]] = {}
+    monkeypatch.setattr(
+        web_module,
+        "write_generic_credential",
+        lambda target, secret, username="": vault.__setitem__(target, dict(secret)),
+    )
+    monkeypatch.setattr(
+        web_module, "credential_exists", lambda target: target in vault
+    )
+    monkeypatch.setattr(
+        web_module, "read_generic_credential", lambda target: dict(vault[target])
+    )
+    return vault
+
+
+def test_saving_feishu_from_the_console_keeps_the_secret_out_of_sqlite(
+    app_client, monkeypatch
+):
+    """The whole point of Credential Manager is that the DB never sees the secret.
+
+    Moving configuration into the web console must not quietly become a reason
+    to persist it somewhere easier to read.
+    """
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    vault = _settings_client(app_client, monkeypatch)
+
+    response = client.post(
+        "/api/settings/feishu",
+        json={"app_id": "cli_app", "app_secret": "TOP_SECRET", "chat_id": "oc_room"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "TOP_SECRET" not in response.text, "响应体不得带回密钥"
+    assert vault["ziniao-automation/feishu/main"]["app_secret"] == "TOP_SECRET"
+    with app.state.sessions() as db:
+        stored = db.get(SystemSetting, "feishu").value
+    assert stored["app_id"] == "cli_app"
+    assert stored["chat_id"] == "oc_room"
+    assert "TOP_SECRET" not in json.dumps(stored, ensure_ascii=False)
+
+
+def test_a_credential_write_that_did_not_stick_is_reported_not_assumed(
+    app_client, monkeypatch
+):
+    """Security software has been seen silently dropping credential writes.
+
+    Without the read-back the operator would leave the page believing Feishu was
+    configured, and only find out when a payout failed to notify anyone.
+    """
+
+    _, client, _ = app_client
+    csrf = bootstrap(client)
+    _settings_client(app_client, monkeypatch)
+    from ziniao_automation import web as web_module
+
+    monkeypatch.setattr(web_module, "credential_exists", lambda target: False)
+
+    response = client.post(
+        "/api/settings/feishu",
+        json={"app_id": "cli_app", "app_secret": "s", "chat_id": "oc_room"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 502
+    assert "安全软件" in response.json()["detail"]
+
+
+def test_saving_ziniao_from_the_console_updates_the_account_row(app_client, monkeypatch):
+    _, client, _ = app_client
+    csrf = bootstrap(client)
+    vault = _settings_client(app_client, monkeypatch)
+
+    response = client.post(
+        "/api/settings/ziniao",
+        json={"company": "某公司", "username": "u1", "password": "PW"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 200, response.text
+    assert "PW" not in response.text
+    assert vault["ziniao-automation/ziniao/main"]["password"] == "PW"
+
+
+def test_the_diagnostics_page_never_renders_a_stored_secret(app_client, monkeypatch):
+    """Not even masked: a mask still tells the reader how long the value is."""
+
+    _, client, _ = app_client
+    csrf = bootstrap(client)
+    _settings_client(app_client, monkeypatch)
+    client.post(
+        "/api/settings/feishu",
+        json={"app_id": "cli_app", "app_secret": "TOP_SECRET", "chat_id": "oc_room"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    client.post(
+        "/api/settings/ziniao",
+        json={"company": "某公司", "username": "u1", "password": "TOP_PASSWORD"},
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    page = client.get("/diagnostics")
+
+    assert page.status_code == 200
+    assert "TOP_SECRET" not in page.text
+    assert "TOP_PASSWORD" not in page.text
+    # Non-secret fields are pre-filled so the operator does not retype them.
+    assert 'value="cli_app"' in page.text
+    assert 'value="oc_room"' in page.text
+    for field in ("password", "app_secret"):
+        tag = re.search(rf'<input name="{field}"[^>]*>', page.text)
+        assert tag and " value=" not in tag.group(0), f"{field} 不得带 value 属性"
+
+
+def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):
+    """Killing Ziniao mid-run could strand a payout between ARM and the click."""
+
+    _, client, fake = app_client
+    csrf = bootstrap(client)
+
+    async def busy() -> dict[str, object]:
+        return {
+            "ok": False,
+            "status": "busy",
+            "message": "现在切换会关掉正在使用的紫鸟窗口，因此已阻止：\n有提现任务正在执行（资金锁被占用）",
+            "closed_processes": 0,
+            "details": {},
+        }
+
+    fake.start_webdriver_mode = busy
+
+    response = client.post(
+        "/api/ziniao/webdriver/start", headers={"X-CSRF-Token": csrf}
+    )
+
+    assert response.status_code == 409
+    assert "资金锁" in response.json()["detail"]
+
+
+def test_webdriver_switch_reports_success_with_what_it_closed(app_client):
+    _, client, fake = app_client
+    csrf = bootstrap(client)
+
+    async def ready() -> dict[str, object]:
+        return {
+            "ok": True,
+            "status": "ready",
+            "message": "紫鸟 WebDriver 模式已就绪（127.0.0.1:16851）。",
+            "closed_processes": 2,
+            "details": {},
+        }
+
+    fake.start_webdriver_mode = ready
+
+    response = client.post(
+        "/api/ziniao/webdriver/start", headers={"X-CSRF-Token": csrf}
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["closed_processes"] == 2

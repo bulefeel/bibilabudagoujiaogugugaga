@@ -1106,4 +1106,97 @@
     restoreBulkStoreSetup();
     if (!bulkStoreSetup.queue.length) restoreBulkSetupCompletionSummary();
   }
+  // ---- 系统诊断页：WebDriver 切换与凭据配置 ----------------------------------
+  (function diagnosticsPage() {
+    const webdriverButton = $('[data-action="start-webdriver"]');
+    const webdriverState = $("[data-webdriver-state]");
+
+    function say(text, bad) {
+      if (!webdriverState) return;
+      webdriverState.textContent = text;
+      webdriverState.className = "diagnostic-actions-state" + (bad ? " bad" : "");
+    }
+
+    webdriverButton?.addEventListener("click", async () => {
+      // Naming the consequence beats a generic "确定执行此操作？": the operator
+      // may well have store windows open right now with work in them.
+      const agreed = await confirmAction(
+        "切换到 WebDriver 模式会强制关闭当前所有已打开的紫鸟店铺窗口。\n\n" +
+        "如果有店铺窗口里正在人工处理验证，请先处理完。确定继续吗？"
+      );
+      if (!agreed) return;
+      webdriverButton.disabled = true;
+      const original = webdriverButton.textContent;
+      webdriverButton.textContent = "正在切换…";
+      say("正在关闭旧窗口并启动 WebDriver 模式，最长等待 60 秒…");
+      try {
+        const data = await api("/api/ziniao/webdriver/start", {method:"POST", body:"{}"});
+        say(data.message || "已就绪");
+        toast("紫鸟 WebDriver 模式已就绪");
+        setTimeout(() => location.reload(), 1200);
+      } catch (exc) {
+        // The server's refusal text names which store or guard is in the way;
+        // replacing it with something generic would remove the only actionable
+        // part of the message.
+        say(exc.message, true);
+        toast(exc.message, true);
+        webdriverButton.disabled = false;
+        webdriverButton.textContent = original;
+      }
+    });
+
+    function bindSettings(kind, endpoint, successText) {
+      const form = $(`[data-settings-form="${kind}"]`);
+      if (!form) return;
+      form.addEventListener("submit", async event => {
+        event.preventDefault();
+        const error = $("[data-form-error]", form);
+        const submit = $('button[type="submit"]', form);
+        const payload = {};
+        $$("input[name]", form).forEach(input => { payload[input.name] = input.value.trim(); });
+        if (Object.values(payload).some(value => !value)) {
+          error.textContent = "所有字段都必须填写；密码类字段不会回显，修改时请重新输入完整值。";
+          return;
+        }
+        error.textContent = "";
+        submit.disabled = true;
+        const original = submit.textContent;
+        submit.textContent = "保存中…";
+        try {
+          await api(endpoint, {method:"POST", body:JSON.stringify(payload)});
+          toast(successText);
+          // Clear the secret from the DOM straight after a successful save so
+          // it does not sit in the page until the reload lands.
+          $$('input[type="password"]', form).forEach(input => { input.value = ""; });
+          setTimeout(() => location.reload(), 800);
+        } catch (exc) {
+          error.textContent = exc.message;
+          submit.disabled = false;
+          submit.textContent = original;
+        }
+      });
+    }
+
+    bindSettings("ziniao", "/api/settings/ziniao", "紫鸟账号已保存到 Windows 凭据管理器");
+    bindSettings("feishu", "/api/settings/feishu", "飞书配置已保存到 Windows 凭据管理器");
+
+    $('[data-action="test-feishu"]')?.addEventListener("click", async event => {
+      const button = event.currentTarget;
+      const error = $("[data-form-error]", button.closest("form"));
+      button.disabled = true;
+      const original = button.textContent;
+      button.textContent = "发送中…";
+      try {
+        await api("/api/settings/feishu/test", {method:"POST", body:"{}"});
+        error.textContent = "";
+        toast("测试消息已发出，请到飞书群里确认收到");
+      } catch (exc) {
+        error.textContent = exc.message;
+        toast(exc.message, true);
+      } finally {
+        button.disabled = false;
+        button.textContent = original;
+      }
+    });
+  })();
 })();

@@ -63,9 +63,13 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         root = Path(os.getenv("ZINIAO_PROJECT_ROOT", str(PROJECT_ROOT)))
-        executable = Path(
-            os.getenv("ZINIAO_EXECUTABLE", r"D:\紫鸟浏览器\ziniao\ziniao.exe")
-        )
+        # Probe for the real install instead of assuming Ziniao's default
+        # directory.  Imported here rather than at module scope so the probe
+        # runs only on this path — it touches the disk and the registry, and
+        # ``Settings()`` is constructed constantly in the test suite.
+        from .ziniao.locate import resolve_ziniao_executable
+
+        executable = resolve_ziniao_executable(os.getenv("ZINIAO_EXECUTABLE"))
         return cls(
             project_root=root,
             data_dir=Path(os.environ["ZINIAO_DATA_DIR"]) if os.getenv("ZINIAO_DATA_DIR") else None,

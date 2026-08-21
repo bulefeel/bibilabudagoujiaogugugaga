@@ -177,6 +177,20 @@ def serve() -> int:
             pass
 
     atexit.register(remove_pid)
+
+    # The notification-area icon is the only way back to the console once the
+    # operator closes the browser tab, since this process owns no window.  It
+    # runs on a daemon thread and swallows its own failures: a machine where
+    # the shell will not cooperate must still get a working scheduler.
+    from . import tray
+
+    icon = settings.project_root / "installer" / "app.ico"
+    tray.start(
+        f"http://{settings.host}:{settings.port}/",
+        icon_path=str(icon) if icon.is_file() else None,
+        on_quit=lambda: os.kill(os.getpid(), signal.SIGTERM),
+    )
+
     try:
         uvicorn.run(
             "ziniao_automation.main:app",

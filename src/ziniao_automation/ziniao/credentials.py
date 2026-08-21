@@ -14,6 +14,13 @@ class CredentialStoreError(ZiniaoError):
     """An opaque credential reference was not readable."""
 
 
+# The Credential Manager entry names.  They live here rather than in ``cli``
+# because the web console now writes the same two entries; keeping them next to
+# the reader/writer stops the two callers from drifting onto different names and
+# silently configuring nothing.
+DEFAULT_ZINIAO_TARGET = "ziniao-automation/ziniao/main"
+DEFAULT_FEISHU_TARGET = "ziniao-automation/feishu/main"
+
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
