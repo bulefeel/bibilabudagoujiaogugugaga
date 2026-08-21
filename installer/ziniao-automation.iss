@@ -19,7 +19,7 @@
 #define AppName "紫鸟提现自动化"
 #define AppId "ZiniaoAutomation"
 #define AppPublisher "本地部署"
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define StageDir "..\build\stage"
 
 [Setup]
