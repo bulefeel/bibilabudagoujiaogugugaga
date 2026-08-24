@@ -11,7 +11,22 @@ import pytest
 from ziniao_automation import tray
 
 
-@pytest.mark.skipif(os.name != "nt", reason="tray icon is Windows-only")
+HAS_INTERACTIVE_SHELL = os.name == "nt" and not any(
+    os.getenv(name)
+    for name in (
+        "CI",
+        "CODEX_SHELL",
+        "GITHUB_ACTIONS",
+        "JENKINS_URL",
+        "TEAMCITY_VERSION",
+    )
+)
+
+
+@pytest.mark.skipif(
+    not HAS_INTERACTIVE_SHELL,
+    reason="tray registration needs an interactive Windows Explorer shell",
+)
 def test_the_icon_registers_and_keeps_its_callback_alive() -> None:
     """The window procedure must outlive ``_build``.
 

@@ -494,7 +494,7 @@ class AmazonPaymentsPage:
         like "no login page here".  One millisecond later the handoff poll sees
         ``/ap/signin``.
 
-        Field case ``92c04dde`` (2026-08-19, 正香-张刚CA / CA): the press landed
+        Field case ``TEST_STORE_CA`` (2026-08-19, anonymised CA fixture): the press landed
         on ``/ap/signin?...max_auth_age=300`` and Ziniao's managed-Passkey
         chooser was already painted on screen with its button waiting — while
         the run had given up two seconds earlier.  That run's log contains **no

@@ -19,7 +19,9 @@
 #define AppName "紫鸟提现自动化"
 #define AppId "ZiniaoAutomation"
 #define AppPublisher "本地部署"
-#define AppVersion "0.2.1"
+#ifndef AppVersion
+  #error "AppVersion must be supplied by installer/build.ps1"
+#endif
 #define StageDir "..\build\stage"
 
 [Setup]
@@ -69,8 +71,6 @@ Name: "{group}\重新安装运行环境"; Filename: "{app}\app\Install.bat"; Wor
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\app\.venv\Scripts\pythonw.exe"; Parameters: "-m ziniao_automation.launcher"; WorkingDir: "{app}\app"; IconFilename: "{app}\app\installer\app.ico"; Tasks: desktopicon
 
 [Run]
-; 联网装 Python 3.12 与依赖。这一步最久，所以给它自己的进度提示。
-Filename: "{cmd}"; Parameters: "/c """"{app}\app\Install.bat"""""; WorkingDir: "{app}\app"; StatusMsg: "正在安装运行环境（需要联网，约 2-5 分钟，请勿关闭窗口）..."; Flags: waituntilterminated
 ; 登录自启：直接执行 pythonw，不经 cmd /c、不隐藏窗口、不用编码命令。
 ; 这个项目被杀软误报过一次，起因就是隐藏 PowerShell 启动链。
 Filename: "schtasks.exe"; Parameters: "/Create /F /SC ONLOGON /TN ""Ziniao Automation V1"" /TR ""\""{app}\app\.venv\Scripts\pythonw.exe\"" -m ziniao_automation.runner"""; Flags: runhidden waituntilterminated; Tasks: startup
@@ -82,6 +82,31 @@ Filename: "{app}\app\Stop.bat"; Flags: runhidden waituntilterminated; RunOnceId:
 Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""Ziniao Automation V1"""; Flags: runhidden waituntilterminated; RunOnceId: "DropStartupTask"
 
 [Code]
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  InstallScript: String;
+  ResultCode: Integer;
+  Started: Boolean;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+
+  { 不能把 Install.bat 留在 [Run]：Inno Setup 默认不会把非零退出码当成安装失败，
+    随后的计划任务和启动项仍会继续执行，最后还会显示“安装成功”。这里显式等待
+    并检查退出码；任何失败都会中止 post-install，[Run] 中的后续项不会启动。 }
+  WizardForm.StatusLabel.Caption :=
+    '正在安装运行环境（需要联网，约 2-5 分钟，请勿关闭窗口）...';
+  InstallScript := ExpandConstant('{app}\app\Install.bat');
+  ResultCode := -1;
+  Started := Exec(ExpandConstant('{cmd}'), '/c ""' + InstallScript + '""',
+                  ExpandConstant('{app}\app'), SW_SHOW,
+                  ewWaitUntilTerminated, ResultCode);
+  if (not Started) or (ResultCode <> 0) then
+    RaiseException(Format(
+      '运行环境安装失败（Install.bat 退出码 %d）。请查看安装窗口中的第一条错误。',
+      [ResultCode]));
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   StopScript: String;

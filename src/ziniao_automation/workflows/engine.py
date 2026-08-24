@@ -470,8 +470,8 @@ class WorkflowEngine:
                 # ``NEEDS_HUMAN_AUTH`` belongs here too.  In auto mode a site
                 # that wants a human is dropped rather than parked, so it
                 # matched neither branch and the run fell through to the
-                # default SUCCEEDED — run 9b4e3b0e reported 「任务检查已完成」
-                # while AU still held AUD 188.89 that nothing had attempted.
+                # default SUCCEEDED — RUN_EXAMPLE_B reported 「任务检查已完成」
+                # while its marketplace still had a balance that nothing attempted.
                 status = RunStatus.PARTIAL
         current = await self.repository.get_run_status(run.id)
         await self.repository.set_run_status(

@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from uuid import uuid4
 
 import httpx
 
-from .errors import ZiniaoApiError, ZiniaoConnectionError
+from .errors import ZiniaoApiError, ZiniaoConnectionError, ZiniaoCredentialError
 from .models import BrowserProfile, ProfileSelector
 
 logger = logging.getLogger(__name__)
@@ -59,8 +59,24 @@ class ZiniaoClient:
         config: ZiniaoClientConfig,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        credential_resolver: "Callable[[], Mapping[str, str]] | None" = None,
+        credential_resolver_authoritative: bool = False,
     ) -> None:
         self.config = config
+        # Resolved per call rather than captured at construction.  The account
+        # is configured from the console *after* the service is already up, so
+        # a value baked in at startup is empty on exactly the run that matters:
+        # Ziniao answers -10003 「参数不能为空（登录状态错误）」 and the operator
+        # is told to check a login that is in fact configured correctly.
+        # Observed 2026-08-24 right after the credentials page shipped.
+        self._credential_resolver = credential_resolver
+        # Generic/library callers keep the backwards-compatible per-field
+        # fallback.  Production opts into authoritative mode so replacing or
+        # disabling the database account can never combine its metadata with a
+        # password captured for the previous account at process startup.
+        self._credential_resolver_authoritative = bool(
+            credential_resolver_authoritative
+        )
         timeout = httpx.Timeout(
             config.request_timeout,
             connect=config.connect_timeout,
@@ -80,6 +96,8 @@ class ZiniaoClient:
         credential_ref: str,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        credential_resolver: "Callable[[], Mapping[str, str]] | None" = None,
+        credential_resolver_authoritative: bool = False,
     ) -> "ZiniaoClient":
         """Build a client while keeping the database free of secret values."""
         from .credentials import read_generic_credential
@@ -88,13 +106,23 @@ class ZiniaoClient:
         resolved = ZiniaoClientConfig(
             host=config.host,
             port=config.port,
-            company=secret.get("company", config.company),
-            username=secret.get("username", config.username),
-            password=secret.get("password", ""),
+            # Credential Manager records written by older builds may contain
+            # only a password (or only the account metadata).  Keep the
+            # caller's startup values for each field that is absent/empty;
+            # otherwise a partial record silently turns a valid request into
+            # Ziniao's -10003 "parameter cannot be empty" response.
+            company=_credential_value(secret, "company", config.company),
+            username=_credential_value(secret, "username", config.username),
+            password=_credential_value(secret, "password", config.password),
             connect_timeout=config.connect_timeout,
             request_timeout=config.request_timeout,
         )
-        return cls(resolved, transport=transport)
+        return cls(
+            resolved,
+            transport=transport,
+            credential_resolver=credential_resolver,
+            credential_resolver_authoritative=credential_resolver_authoritative,
+        )
 
     async def __aenter__(self) -> "ZiniaoClient":
         return self
@@ -108,11 +136,66 @@ class ZiniaoClient:
             await self._http.aclose()
 
     def _credentials(self) -> dict[str, str]:
-        return {
+        startup = {
             "company": self.config.company,
             "username": self.config.username,
             "password": self.config.password,
         }
+        if self._credential_resolver is not None:
+            try:
+                resolved = self._credential_resolver()
+            except Exception as exc:
+                if self._credential_resolver_authoritative:
+                    if isinstance(exc, ZiniaoCredentialError):
+                        raise
+                    raise ZiniaoCredentialError(
+                        "紫鸟凭据暂时不可读取，请在系统设置中重新保存后重试"
+                    ) from exc
+                # A resolver failure must not hide the static config, which is
+                # what a developer-supplied client and the tests rely on.
+                logger.warning(
+                    "Could not resolve Ziniao credentials; falling back to the "
+                    "values captured at startup (error=%s)",
+                    type(exc).__name__,
+                )
+                resolved = None
+            if isinstance(resolved, Mapping):
+                if self._credential_resolver_authoritative:
+                    snapshot = {
+                        "company": str(resolved.get("company") or "").strip(),
+                        "username": str(resolved.get("username") or "").strip(),
+                        # Passwords may legally start or end with whitespace.
+                        # Preserve the exact vault value sent by the operator.
+                        "password": str(resolved.get("password") or ""),
+                    }
+                    missing = [key for key, value in snapshot.items() if not value]
+                    if missing:
+                        raise ZiniaoCredentialError(
+                            "紫鸟凭据不完整，请在系统设置中重新保存公司、账号和密码"
+                        )
+                    return snapshot
+                # Merge field-by-field rather than treating the resolver's
+                # mapping as a replacement.  The web console stores metadata
+                # and the secret separately, and a read can legitimately
+                # return a partial mapping while one side is being updated.
+                return {
+                    key: _credential_value(resolved, key, startup[key])
+                    for key in startup
+                }
+            if resolved is not None:
+                if self._credential_resolver_authoritative:
+                    raise ZiniaoCredentialError(
+                        "紫鸟凭据读取结果无效，请在系统设置中重新保存后重试"
+                    )
+                logger.warning(
+                    "Ziniao credential resolver returned a non-mapping; "
+                    "falling back to startup values"
+                )
+        if self._credential_resolver_authoritative:
+            raise ZiniaoCredentialError(
+                "紫鸟账号尚未配置，请先在系统设置中保存紫鸟账号"
+            )
+        return startup
 
     async def call(
         self,
@@ -125,10 +208,14 @@ class ZiniaoClient:
     ) -> ZiniaoApiResponse:
         if self._closed:
             raise RuntimeError("ZiniaoClient has been closed")
+        # Resolve exactly once.  Besides avoiding an extra Credential Manager
+        # read, retaining this immutable snapshot ensures error sanitisation
+        # uses the same values that were sent in this request.
+        credentials = self._credentials()
         body: dict[str, Any] = {
             "action": action,
             "requestId": str(uuid4()),
-            **self._credentials(),
+            **credentials,
             **parameters,
         }
         safe_parameters = _redact(parameters)
@@ -157,7 +244,8 @@ class ZiniaoClient:
         if require_success and status_code != "0":
             message = _safe_api_message(
                 str(decoded.get("err") or decoded.get("message") or ""),
-                secrets=(
+                secrets=tuple(credentials.values())
+                + (
                     self.config.password,
                     self.config.username,
                     self.config.company,
@@ -264,6 +352,26 @@ def _first_string(record: Mapping[str, Any], *keys: str) -> str:
         if value is not None and str(value).strip():
             return str(value).strip()
     return ""
+
+
+def _credential_value(
+    values: Mapping[str, Any],
+    key: str,
+    fallback: str,
+) -> str:
+    """Return one credential field, falling back when it is absent/empty.
+
+    Credential records are assembled from two stores (SQLite metadata and
+    Windows Credential Manager), so a mapping can be valid while still
+    omitting one field.  Keeping this rule in one helper makes construction
+    from a reference and per-call live resolution behave identically.
+    """
+
+    value = values.get(key)
+    if value is None:
+        return str(fallback or "")
+    text = str(value)
+    return text if text else str(fallback or "")
 
 
 def _redact(value: Any) -> Any:

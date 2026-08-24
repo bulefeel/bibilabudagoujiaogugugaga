@@ -13,6 +13,7 @@ from .config import Settings
 from .models import ZiniaoAccount
 from .notifications import (
     CompositeNotifier,
+    DatabaseFeishuCredentialProvider,
     DatabaseNotificationAdapter,
     FeishuNotifier,
     LoggingNotifier,
@@ -32,6 +33,7 @@ from .workflows.amazon_disbursement import (
 )
 from .ziniao.factory import build_controller
 from .ziniao.credentials import read_generic_credential
+from .ziniao.errors import ZiniaoCredentialError
 
 logger = logging.getLogger(__name__)
 
@@ -159,60 +161,101 @@ def _build_controller_from_database(
         company = account.company if account else ""
         username = account.username if account else ""
         credential_ref = account.credential_ref if account else None
-    # No password is loaded into Settings, logs or SQLite. If Credential
-    # Manager was cleared after configuration, keep the console available and
-    # let sync return an actionable error instead of failing ASGI startup.
-    try:
-        return build_controller(
-            host=settings.ziniao_host,
-            port=settings.ziniao_port,
-            client_path=settings.ziniao_executable,
-            company=company or "",
-            username=username or "",
-            credential_ref=credential_ref,
-        )
-    except Exception as exc:
-        if type(exc).__name__ != "CredentialStoreError":
-            raise
-        logger.warning(
-            "Ziniao credential reference is missing; using signed-in desktop session metadata"
-        )
-        # Some Ziniao versions accept the already signed-in desktop session
-        # without replaying the account password.  Keep the non-secret account
-        # metadata so sync/startBrowser can still work after Credential Manager
-        # was cleared; the API response remains authoritative.
-        return build_controller(
-            host=settings.ziniao_host,
-            port=settings.ziniao_port,
-            client_path=settings.ziniao_executable,
-            company=company or "",
-            username=username or "",
-        )
+
+    def resolve_credentials() -> dict[str, str]:
+        """Read the account fresh on every Ziniao call.
+
+        The controller is built once when the process starts, but the operator
+        configures the account from the console afterwards — so anything
+        captured above is empty on precisely the first run they attempt.  Ziniao
+        then answers ``-10003 参数不能为空（登录状态错误）`` and the console blames
+        a login that is in fact correct.  Observed 2026-08-24, immediately after
+        the credentials page shipped; the same shape as the upgrade that served
+        new templates from an old process.
+
+        This resolver is authoritative.  An incomplete snapshot fails before
+        any HTTP request instead of mixing a newly selected database account
+        with a password captured for the previous account at startup.
+        """
+
+        with session_factory() as session:
+            row = session.scalar(
+                select(ZiniaoAccount)
+                .where(ZiniaoAccount.enabled.is_(True))
+                .order_by(ZiniaoAccount.id)
+                .limit(1)
+            )
+            if row is None:
+                raise ZiniaoCredentialError(
+                    "紫鸟账号尚未配置或已停用，请先在系统设置中保存紫鸟账号"
+                )
+            reference = str(row.credential_ref or "").strip()
+            company = str(row.company or "").strip()
+            username = str(row.username or "").strip()
+        if not reference:
+            raise ZiniaoCredentialError(
+                "紫鸟凭据引用缺失，请在系统设置中重新保存紫鸟账号"
+            )
+        try:
+            secret = read_generic_credential(reference)
+        except Exception as exc:
+            raise ZiniaoCredentialError(
+                "Windows 凭据中的紫鸟密码不可读取，请在系统设置中重新保存"
+            ) from exc
+
+        # Current SQLite metadata identifies the enabled account.  The vault
+        # must carry the same identity as well as the password.  Accepting a
+        # legacy password-only record here could combine a newly selected DB
+        # account with an old account's password; the operator must re-save it
+        # once instead of the service ever guessing.
+        secret_company = str(secret.get("company") or "").strip()
+        secret_username = str(secret.get("username") or "").strip()
+        if not secret_company or not secret_username:
+            raise ZiniaoCredentialError(
+                "Windows中的紫鸟凭据格式过旧或不完整，请在系统设置中重新保存"
+            )
+        if secret_company != company:
+            raise ZiniaoCredentialError(
+                "紫鸟账号元数据与Windows凭据不一致，请重新保存紫鸟账号"
+            )
+        if secret_username != username:
+            raise ZiniaoCredentialError(
+                "紫鸟账号元数据与Windows凭据不一致，请重新保存紫鸟账号"
+            )
+        password = str(secret.get("password") or "")
+        if not company or not username or not password:
+            raise ZiniaoCredentialError(
+                "紫鸟凭据不完整，请在系统设置中重新保存公司、账号和密码"
+            )
+        return {"company": company, "username": username, "password": password}
+
+    # No password is loaded into Settings, logs or SQLite.  The resolver is
+    # invoked only when an action is requested, so first-run ASGI startup still
+    # succeeds and a credential saved from the web console works immediately.
+    return build_controller(
+        host=settings.ziniao_host,
+        port=settings.ziniao_port,
+        client_path=settings.ziniao_executable,
+        company=company or "",
+        username=username or "",
+        credential_ref=credential_ref,
+        credential_resolver=resolve_credentials,
+        credential_resolver_authoritative=True,
+    )
 
 
 def _build_notifier(
     session_factory: sessionmaker[Session],
 ) -> tuple[Any, NotificationDeliveryService | None]:
-    """Build logging plus optional Feishu App notification channels."""
-    from .models import SystemSetting
+    """Build a persistent channel whose credentials are resolved per send.
 
-    with session_factory() as session:
-        row = session.get(SystemSetting, "feishu")
-        metadata = dict(row.value) if row and row.value else {}
-    credential_ref = str(metadata.get("credential_ref", "")).strip()
-    if not credential_ref or not metadata.get("enabled", False):
-        return LoggingNotifier(), None
+    First-run setup happens after this process-wide composition is created.
+    Keeping the delivery service alive even before Feishu is configured lets
+    the next real workflow notice use settings saved from the web console
+    without restarting the service.
+    """
 
-    def provider() -> dict[str, str] | None:
-        try:
-            secret = read_generic_credential(credential_ref)
-        except Exception:
-            logger.error("Feishu credential reference could not be resolved")
-            return None
-        secret.setdefault("app_id", str(metadata.get("app_id", "")))
-        secret.setdefault("chat_id", str(metadata.get("chat_id", "")))
-        return secret
-
+    provider = DatabaseFeishuCredentialProvider(session_factory)
     safe_sender = CompositeNotifier((LoggingNotifier(), FeishuNotifier(provider)))
     deliveries = NotificationDeliveryService(session_factory, safe_sender)
     return DatabaseNotificationAdapter(deliveries), deliveries

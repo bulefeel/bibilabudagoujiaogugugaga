@@ -24,7 +24,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from .auth import AuthService, AuthenticatedAdmin
 from .config import Settings
-from .db import create_sqlite_engine, init_database, make_session_factory
+from .db import create_sqlite_engine, database_revision, init_database, make_session_factory
 from .models import (
     ApprovalRequest,
     Evidence,
@@ -59,11 +59,13 @@ from .schemas import (
     StoreView,
     ZiniaoSettingsInput,
 )
+from .version import __version__, build_commit
 from .ziniao.credentials import (
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
     CredentialStoreError,
     credential_exists,
+    credential_matches,
     read_generic_credential,
     write_generic_credential,
 )
@@ -298,7 +300,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.create_schema_on_start:
-            init_database(engine)
+            init_database(engine, backup_dir=settings.backup_dir)
         runtime = None
         try:
             if runtime_factory is not None:
@@ -315,7 +317,7 @@ def create_app(
 
     app = FastAPI(
         title="紫鸟多店铺自动化管理器",
-        version="0.1.0",
+        version=__version__,
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
@@ -554,6 +556,9 @@ def create_app(
         )
         feishu_ref = str(feishu_metadata.get("credential_ref", "")).strip()
         diagnostics = {
+            "app_version": __version__,
+            "build_commit": build_commit(settings.project_root),
+            "migration_revision": database_revision(engine),
             "executable": str(settings.ziniao_executable),
             "executable_exists": settings.ziniao_executable.exists(),
             "control_port": settings.ziniao_port,
@@ -629,7 +634,12 @@ def create_app(
         # Read it straight back.  Security software has been observed silently
         # dropping credential writes, and a write that did not stick would only
         # surface much later as an unexplained notification failure.
-        if not credential_exists(reference):
+        expected = {
+            "app_id": payload.app_id,
+            "app_secret": payload.app_secret,
+            "chat_id": payload.chat_id,
+        }
+        if not credential_matches(reference, expected):
             raise HTTPException(
                 502,
                 "凭据写入后无法回读，请检查安全软件是否拦截了 Windows 凭据管理器。",
@@ -704,7 +714,12 @@ def create_app(
             )
         except (CredentialStoreError, ValueError, OSError) as exc:
             raise HTTPException(502, f"写入 Windows 凭据管理器失败：{exc}") from exc
-        if not credential_exists(reference):
+        expected = {
+            "company": payload.company,
+            "username": payload.username,
+            "password": payload.password,
+        }
+        if not credential_matches(reference, expected):
             raise HTTPException(
                 502,
                 "凭据写入后无法回读，请检查安全软件是否拦截了 Windows 凭据管理器。",
@@ -1415,8 +1430,27 @@ def _safe_probe_error(exc: BaseException) -> str:
     log, and the project's rule is that secrets never reach disk.
     """
 
-    text = " ".join(str(exc).split())[:300]
-    text = re.sub(r"(?i)(token|secret|password|app_secret)[=:\s\"']+\S+", r"=***", text)
+    text = " ".join(str(exc).split())
+    text = re.sub(
+        r'''(?ix)
+        (?<![\w])
+        ["']?(?P<name>app_secret|password|token|secret)["']?
+        (?:\s*[:=]\s*|\s+)
+        (?:
+            "(?:\\.|[^"\\])*"?
+            |'(?:\\.|[^'\\])*'?
+            |(?:(?!\s+(?:app_secret|password|token|secret)(?:\s*[:=]\s*|\s+)).)+?
+             (?=
+                \s+(?:app_secret|password|token|secret)(?:\s*[:=]\s*|\s+)
+                |[,;}\]]
+                |$
+             )
+        )
+        ''',
+        lambda match: f"{match.group('name')}=***",
+        text,
+    )
+    text = text[:300]
     return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
 
 

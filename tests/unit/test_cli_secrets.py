@@ -13,7 +13,7 @@ def test_configure_feishu_never_prints_secret(monkeypatch, capsys, tmp_path: Pat
     monkeypatch.setattr(cli, "_confirmed_secret", lambda *args, **kwargs: "APP_SECRET")
     written = {}
     monkeypatch.setattr(cli, "write_generic_credential", lambda target, secret, username: written.update(secret))
-    monkeypatch.setattr(cli, "credential_exists", lambda target: True)
+    monkeypatch.setattr(cli, "credential_matches", lambda target, expected: True)
     monkeypatch.setattr(cli, "_database", lambda _: (_Engine(), _Sessions()))
     assert cli._configure_feishu(settings, "credential/ref") == 0
     output = capsys.readouterr().out
@@ -49,7 +49,7 @@ def test_repair_feishu_reuses_non_secret_database_metadata(
             {"target": target, "secret": secret, "username": username}
         ),
     )
-    monkeypatch.setattr(cli, "credential_exists", lambda target: True)
+    monkeypatch.setattr(cli, "credential_matches", lambda target, expected: True)
     monkeypatch.setattr(cli, "_database", lambda _: (_Engine(), _Sessions()))
 
     assert cli._configure_feishu(

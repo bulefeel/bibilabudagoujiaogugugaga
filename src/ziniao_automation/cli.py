@@ -20,6 +20,7 @@ from .ziniao.credentials import (
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
     credential_exists,
+    credential_matches,
     delete_generic_credential,
     write_generic_credential,
 )
@@ -107,7 +108,10 @@ def _configure_ziniao(settings: Settings, credential_ref: str) -> int:
         {"company": company, "username": username, "password": password},
         username=username,
     )
-    if not credential_exists(credential_ref):
+    if not credential_matches(
+        credential_ref,
+        {"company": company, "username": username, "password": password},
+    ):
         raise RuntimeError("Windows 凭据写入后未能回读，请检查安全软件或凭据管理器")
     engine, sessions = _database(settings)
     try:
@@ -188,7 +192,10 @@ def _configure_feishu(
         {"app_id": app_id, "app_secret": app_secret, "chat_id": chat_id},
         username=app_id,
     )
-    if not credential_exists(credential_ref):
+    if not credential_matches(
+        credential_ref,
+        {"app_id": app_id, "app_secret": app_secret, "chat_id": chat_id},
+    ):
         raise RuntimeError("Windows 凭据写入后未能回读，请检查安全软件或凭据管理器")
     engine, sessions = _database(settings)
     try:

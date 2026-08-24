@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import logging
 import re
@@ -14,7 +15,10 @@ from time import monotonic
 from typing import Any, TYPE_CHECKING
 
 import httpx
+from sqlalchemy.orm import Session, sessionmaker
 
+from ..models import SystemSetting
+from ..ziniao.credentials import read_generic_credential
 from .dto import NotificationKind, SafeRunNotice, SafeSiteNotice
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -59,6 +63,51 @@ class FeishuCredentials:
         return result
 
 
+class DatabaseFeishuCredentialProvider:
+    """Resolve the currently enabled Feishu configuration for every send.
+
+    The process-wide notification service is constructed before an operator
+    may have completed first-run setup.  Reading both SQLite metadata and the
+    opaque Windows credential reference here means saving from the web console
+    affects the very next real workflow notification, without rebuilding the
+    runtime or retaining an App Secret in SQLite.
+    """
+
+    def __init__(
+        self,
+        session_factory: sessionmaker[Session],
+        credential_reader: Callable[[str], Mapping[str, str]] = read_generic_credential,
+    ) -> None:
+        self._session_factory = session_factory
+        self._credential_reader = credential_reader
+
+    def __call__(self) -> dict[str, str] | None:
+        with self._session_factory() as session:
+            row = session.get(SystemSetting, "feishu")
+            metadata = dict(row.value) if row is not None and row.value else {}
+
+        if not metadata.get("enabled", False):
+            return None
+        reference = str(metadata.get("credential_ref", "") or "").strip()
+        if not reference:
+            return None
+        try:
+            secret = self._credential_reader(reference)
+        except Exception:
+            # A delivery failure is persisted by NotificationDeliveryService
+            # and can be retried after Credential Manager becomes readable.
+            # Keep the exception and reference out of logs because either may
+            # contain local identifiers.
+            logger.error("Feishu credential reference could not be resolved")
+            return None
+
+        return {
+            "app_id": str(secret.get("app_id") or metadata.get("app_id") or ""),
+            "app_secret": str(secret.get("app_secret") or ""),
+            "chat_id": str(secret.get("chat_id") or metadata.get("chat_id") or ""),
+        }
+
+
 class FeishuNotifier:
     """Send a safe workflow card through Feishu OpenAPI.
 
@@ -82,6 +131,7 @@ class FeishuNotifier:
         self._api_root = api_root.rstrip("/")
         self._token: str | None = None
         self._token_deadline = 0.0
+        self._token_credential_key: bytes | None = None
         self._token_lock = asyncio.Lock()
 
     async def send(self, notice: SafeRunNotice | "WorkflowReport") -> None:
@@ -120,10 +170,19 @@ class FeishuNotifier:
             raise RuntimeError("飞书通知返回失败状态")
 
     async def _tenant_token(self, credentials: FeishuCredentials) -> str:
-        if self._token and monotonic() < self._token_deadline:
+        credential_key = _token_credential_key(credentials)
+        if (
+            self._token
+            and self._token_credential_key == credential_key
+            and monotonic() < self._token_deadline
+        ):
             return self._token
         async with self._token_lock:
-            if self._token and monotonic() < self._token_deadline:
+            if (
+                self._token
+                and self._token_credential_key == credential_key
+                and monotonic() < self._token_deadline
+            ):
                 return self._token
             try:
                 async with self._client() as client:
@@ -145,6 +204,7 @@ class FeishuNotifier:
             ):
                 raise RuntimeError("飞书访问令牌返回失败状态")
             self._token = str(decoded["tenant_access_token"])
+            self._token_credential_key = credential_key
             lifetime = max(60, int(decoded.get("expire", 7200)))
             self._token_deadline = monotonic() + max(30, lifetime - 300)
             return self._token
@@ -155,6 +215,16 @@ class FeishuNotifier:
             trust_env=False,
             transport=self._transport,
         )
+
+
+def _token_credential_key(credentials: FeishuCredentials) -> bytes:
+    """Key the token cache without retaining the App Secret itself."""
+
+    digest = hashlib.sha256()
+    digest.update(credentials.app_id.encode("utf-8"))
+    digest.update(b"\0")
+    digest.update(credentials.app_secret.encode("utf-8"))
+    return digest.digest()
 
 
 def _as_safe_notice(

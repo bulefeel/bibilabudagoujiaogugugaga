@@ -46,8 +46,8 @@ _LOGIN_PATHS = frozenset({"/ap/signin", "/ap/mfa"})
 # complete the OTP successfully, watch the browser land on the statements page,
 # and still never recognise it as a destination — so it burned its whole budget
 # and reported "需要人工验证" against a page that was already correct.
-# Field-observed 2026-08-19 on run 4be7a970: the OTP succeeded within 5 s and
-# the CA$4.11 record was visible on the first row, yet the run parked 38 s later.
+# In an anonymised field fixture, OTP succeeded and a payment record was already
+# visible on the first row, yet the run still parked shortly afterwards.
 #
 # It is safe to whitelist unconditionally, unlike ``/payments/disburse/details``
 # below: the statements page is a read-only list of past payments and carries no
@@ -898,7 +898,7 @@ class AmazonLoginAdvancer:
         Field measurement (2026-08-19) says that verdict was simply premature.
         Amazon's managed-Passkey to OTP hop took **7.1 s and 8.2 s** on the two
         runs that succeeded, while the caller gave up 3.0 s after dispatch — so
-        a site holding AUD 188.89 was dropped for "验证超时" on a login that was
+        a site with an available balance was dropped for "验证超时" on a login that was
         merely still painting.  The operator's account of it is exact: the click
         happened, the page had not finished loading, and the automation had
         already moved to the next marketplace.

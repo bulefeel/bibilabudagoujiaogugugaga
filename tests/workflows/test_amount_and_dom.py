@@ -488,7 +488,7 @@ class _StepUpAfterPressAdapter(_LoginAnsweredAdapter):
 
 @pytest.mark.asyncio
 async def test_step_up_triggered_by_the_press_is_advanced_not_handed_to_a_human() -> None:
-    """Field case 92c04dde: a site dropped while the Passkey prompt was on screen.
+    """Field case TEST_STORE_CA: a site dropped while Passkey was on screen.
 
     Pressing Request disbursement on CA landed on ``/ap/signin`` with
     ``max_auth_age=300``.  ``_raise_if_auth`` had already sampled the URL one

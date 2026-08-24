@@ -5,6 +5,7 @@ from .controller import ZiniaoController, ZiniaoControllerConfig
 from .credentials import (
     CredentialStoreError,
     credential_exists,
+    credential_matches,
     delete_generic_credential,
     read_generic_credential,
     write_generic_credential,
@@ -16,6 +17,7 @@ from .errors import (
     CdpHealthError,
     ZiniaoApiError,
     ZiniaoConnectionError,
+    ZiniaoCredentialError,
     ZiniaoError,
     ZiniaoLaunchError,
 )
@@ -44,6 +46,7 @@ __all__ = [
     "ZiniaoClient",
     "ZiniaoClientConfig",
     "ZiniaoConnectionError",
+    "ZiniaoCredentialError",
     "ZiniaoController",
     "ZiniaoControllerConfig",
     "ZiniaoDoctor",
@@ -51,6 +54,7 @@ __all__ = [
     "ZiniaoLaunchError",
     "ZiniaoLaunchProof",
     "credential_exists",
+    "credential_matches",
     "delete_generic_credential",
     "read_generic_credential",
     "write_generic_credential",

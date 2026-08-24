@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "python_version": "3.12.8",
+  "uv": {
+    "version": "0.5.18",
+    "url": "https://github.com/astral-sh/uv/releases/download/0.5.18/uv-x86_64-pc-windows-msvc.zip",
+    "sha256": "1DDE041D07139CF92ABB0074BFC4E725C5568EEE31E9A4DDA53350605D0EB1AA"
+  }
+}

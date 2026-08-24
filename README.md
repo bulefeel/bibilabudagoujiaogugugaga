@@ -24,7 +24,15 @@
 
 ## 2. 配置凭据
 
-管理员账号在网页上创建。紫鸟账号和飞书通知目前仍需命令行（后续会搬到网页）：
+管理员账号在网页上创建。登录后打开 **「系统诊断」**，在页面的「凭据配置」区域填写：
+
+- 紫鸟企业名称、登录账号和登录密码；
+- 飞书 App ID、App Secret 和 Chat ID。
+
+点击保存后，下一次同步或通知会直接读取新值，**不需要重启后台**。密码和 App Secret
+不会回显；修改时重新输入完整值即可。
+
+命令行仅保留为网页进不去时的维护手段：
 
 ```bat
 cd /d "%LOCALAPPDATA%\ZiniaoAutomation\app"
@@ -36,7 +44,7 @@ cd /d "%LOCALAPPDATA%\ZiniaoAutomation\app"
 > 请在网页 `/setup` 页面创建管理员。两者写的是同一条记录，先用命令行建了，
 > 网页那条更友好的路就会提示"已初始化"。
 
-密码和 App Secret 使用隐藏输入。紫鸟密码、飞书 App Secret 存入 Windows
+网页中的密码和 App Secret 使用隐藏输入。紫鸟密码、飞书 App Secret 存入 Windows
 Credential Manager；SQLite 仅保存 `credential_ref`、App ID、Chat ID 等元数据。
 命令和日志均不打印 Secret。
 
@@ -95,6 +103,8 @@ Passkey、已填密码登录和已填 6 位 OTP 执行自动点击；每个页�
 ⚠️ **启动窗口闪退**：打开 `data\logs\ziniao-automation.jsonl`，查看最后一行的
 `message`，不要复制 Cookie 或浏览器页面内容。
 
-⚠️ **飞书不通知**：重新执行 `configure feishu`，确认机器人已进入目标群并有发消息权限。
+⚠️ **飞书不通知**：打开「系统诊断」，确认飞书凭据显示「可读取」，再点击「发送测试
+消息」；同时确认机器人已进入目标群并有发消息权限。网页仍无法保存时，才使用
+`configure feishu` 维护命令。
 
 💡 **完整流程说明**：见 `README-ZINIAO.md` 和 `WORKFLOW.md`。

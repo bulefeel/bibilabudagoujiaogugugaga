@@ -586,8 +586,8 @@ async def test_a_site_dropped_for_auth_makes_the_run_partial_not_completed() -> 
     Auto mode drops a site that wants a human instead of parking the whole run,
     leaving it ``NEEDS_HUMAN_AUTH`` — which matched neither the all-skipped
     branch nor the any-failed branch, so the run fell through to the default
-    SUCCEEDED.  Run 9b4e3b0e therefore announced 「任务检查已完成（非提现确认）」
-    while AU still held AUD 188.89 that nothing had even attempted.
+    SUCCEEDED.  RUN_EXAMPLE_B therefore announced 「任务检查已完成（非提现确认）」
+    while the marketplace still held a balance that nothing had even attempted.
     """
 
     repo = InMemoryWorkflowRepository()

@@ -2,6 +2,8 @@
 {% block content %}
 <div class="diagnostic-head"><div><p class="eyebrow">LOCAL SYSTEM CHECK</p><h2>先看地基，<br>再跑自动化。</h2></div><p>红色项目先修复。诊断页只检测本机文件与端口，不读取密码、Cookie 或 Token。</p></div>
 <div class="diagnostic-grid">
+  <article><span class="diag-icon">VER</span><div><small>应用版本 / 构建</small><b>{{ diagnostics.app_version }} · {{ diagnostics.build_commit }}</b></div><em class="ok">已载入</em></article>
+  <article><span class="diag-icon">MIG</span><div><small>数据库迁移版本</small><b>{{ diagnostics.migration_revision }}</b></div><em class="ok">已升级</em></article>
   <article><span class="diag-icon">APP</span><div><small>紫鸟客户端</small><b>{{ diagnostics.executable }}</b></div><em class="{{ 'ok' if diagnostics.executable_exists else 'bad' }}">{{ '路径正常' if diagnostics.executable_exists else '未找到' }}</em></article>
   <article><span class="diag-icon">API</span><div><small>本地控制端口</small><b>127.0.0.1:{{ diagnostics.control_port }}</b></div><em class="{{ 'ok' if diagnostics.control_reachable else 'bad' }}">{{ '可连接' if diagnostics.control_reachable else '未响应' }}</em></article>
   <article><span class="diag-icon">DB</span><div><small>SQLite 唯一数据源</small><b>{{ diagnostics.database }}</b></div><em class="ok">已配置</em></article>

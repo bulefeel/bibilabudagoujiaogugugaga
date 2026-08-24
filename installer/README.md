@@ -5,7 +5,15 @@ winget install --id JRSoftware.InnoSetup      # 只需一次
 powershell -ExecutionPolicy Bypass -File installer\build.ps1
 ```
 
-产物：`build\ZiniaoAutomation-Setup-<版本>.exe`（约 12 MB）。
+发布构建要求 Git 工作区干净，并产出：
+
+- `build\ZiniaoAutomation-Setup-<版本>.exe`；
+- 同名 `.sha256` 校验文件；
+- `build\release-<版本>.json`（版本、Git 提交和依赖锁哈希）。
+
+版本只在 `src\ziniao_automation\version.py` 中维护；构建脚本将同一个版本传给
+Inno Setup。旧的 `0.2.1` 测试包若仍位于 `build\`，会移动到 `build\archive\`
+保留，不会覆盖或删除。
 
 ## 为什么是这个形状
 
@@ -23,7 +31,9 @@ powershell -ExecutionPolicy Bypass -File installer\build.ps1
 大得多，交给网络。`Install.bat` 默认走清华 pypi 镜像，已设 `UV_DEFAULT_INDEX`
 的机器保留自己的设置。
 
-**装完执行 `uv pip install -e`（可编辑安装）。**
+**装完执行 `uv sync --locked`（锁定依赖、可编辑安装）。** `uv.lock` 固定每个依赖
+的版本和哈希，开发机和测试机不会因为安装日期不同而拿到不同版本；Playwright 仍只
+安装 Python 包，不下载额外浏览器。
 `PROJECT_ROOT = Path(__file__).resolve().parents[2]` —— 一旦改成普通安装，
 `parents[2]` 会落进 `site-packages`，数据目录整个跑偏。这条不能改。
 
@@ -54,7 +64,7 @@ powershell -File installer\build.ps1 -CertificatePath cert.pfx -CertificatePassw
 ## 静默安装（批量部署 / 自动化验证）
 
 ```powershell
-.\ZiniaoAutomation-Setup-0.1.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
+.\ZiniaoAutomation-Setup-0.2.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
     /DIR="C:\某个目录" /LOG=install.log
 ```
 

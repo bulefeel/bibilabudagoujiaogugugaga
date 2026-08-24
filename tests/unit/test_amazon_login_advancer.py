@@ -3887,7 +3887,7 @@ def _slow_paint_after_passkey_fixture(
 
 @pytest.mark.asyncio
 async def test_a_login_page_still_painting_is_waited_for_not_handed_to_a_human() -> None:
-    """Field case 9b4e3b0e: a site with AUD 188.89 dropped for "验证超时".
+    """Field case RUN_EXAMPLE_B: a funded site dropped for "验证超时".
 
     Pressing Request disbursement on AU landed on Amazon's step-up sign-in.
     The advancer dispatched the managed-Passkey click and, 3.0 s later, decided
@@ -3941,9 +3941,9 @@ def test_the_statements_page_counts_as_a_login_destination() -> None:
     platform's record of a payout, and Amazon's ``max_auth_age`` step-up
     interrupts exactly that navigation.  With the statements page missing from
     the whitelist the advancer could complete the OTP, watch the browser land
-    there, and still never recognise a destination — run 4be7a970 parked for
+    there, and still never recognise a destination — RUN_EXAMPLE_C parked for
     「需要人工验证」 38 s after a login that had already succeeded, with the
-    CA$4.11 record visible on the first row the whole time.
+    payment record visible on the first row the whole time.
     """
 
     host = "sellercentral.amazon.ca"

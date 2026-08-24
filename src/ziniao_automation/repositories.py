@@ -63,7 +63,7 @@ class StoreRepository:
     # and both already stamp ``finished_at``.  Blocking on them made every such
     # run a permanent veto on re-enrolling the store, which is the one action an
     # operator needs precisely when a site got stuck.  Observed in the field:
-    # run 739a06f9 sat in UNCERTAIN_FINANCIAL after its only guard had already
+    # run RUN_EXAMPLE_A sat in UNCERTAIN_FINANCIAL after its only guard had already
     # reached CONFIRMED, and no sequence of operator actions could clear it.
     SETUP_RESET_BLOCKING_RUN_STATUSES = frozenset(
         {

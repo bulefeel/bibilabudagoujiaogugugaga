@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+import hmac
 import json
 import os
-from collections.abc import Mapping
 from typing import Any
 
 from .errors import ZiniaoError
@@ -197,6 +198,29 @@ def credential_exists(target: str) -> bool:
         return bool(resolved.get("password") or resolved.get("app_secret"))
     except (CredentialStoreError, ValueError):
         return False
+
+
+def credential_matches(target: str, expected: Mapping[str, str]) -> bool:
+    """Confirm that a just-written credential contains every expected value.
+
+    Some endpoint-security products have been observed returning success from
+    ``CredWriteW`` while leaving the previous record untouched.  Checking only
+    that a password exists therefore produces a false success, especially when
+    the operator changes just the password.  This helper compares in memory
+    and never returns or logs either side.
+    """
+
+    try:
+        actual = read_generic_credential(target)
+    except (CredentialStoreError, ValueError, OSError):
+        return False
+    for key, value in expected.items():
+        actual_value = actual.get(str(key))
+        if actual_value is None or not hmac.compare_digest(
+            str(actual_value).encode("utf-8"), str(value).encode("utf-8")
+        ):
+            return False
+    return True
 
 
 def _decode_blob(blob: bytes) -> str:

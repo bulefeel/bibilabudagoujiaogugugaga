@@ -13,6 +13,10 @@ class ZiniaoConnectionError(ZiniaoError):
     """The local WebDriver HTTP service could not be reached."""
 
 
+class ZiniaoCredentialError(ZiniaoError):
+    """The current production credential snapshot is incomplete or unreadable."""
+
+
 class ZiniaoApiError(ZiniaoError):
     """Ziniao returned a non-success status code."""
 

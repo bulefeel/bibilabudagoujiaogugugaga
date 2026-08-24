@@ -8,13 +8,14 @@ from .database import (
     notification_dedupe_key,
 )
 from .dto import NotificationKind, SafeRunNotice, SafeSiteNotice
-from .feishu import FeishuNotifier
+from .feishu import DatabaseFeishuCredentialProvider, FeishuNotifier
 
 __all__ = [
     "CompositeNotifier",
     "CompositeEngineNotifier",
     "DatabaseNotificationAdapter",
     "DatabaseNoticeBuilder",
+    "DatabaseFeishuCredentialProvider",
     "FeishuNotifier",
     "LoggingNotifier",
     "NotificationKind",

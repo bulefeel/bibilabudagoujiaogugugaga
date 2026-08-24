@@ -20,6 +20,7 @@ from ziniao_automation.models import (
     Schedule,
     StoreMarketplace,
     SystemSetting,
+    ZiniaoAccount,
 )
 from ziniao_automation.repositories import StoreRepository, WorkflowRepository
 from ziniao_automation.web import create_app
@@ -853,6 +854,12 @@ def _settings_client(app_client, monkeypatch):
         web_module, "credential_exists", lambda target: target in vault
     )
     monkeypatch.setattr(
+        web_module,
+        "credential_matches",
+        lambda target, expected: target in vault
+        and vault[target] == {str(key): str(value) for key, value in expected.items()},
+    )
+    monkeypatch.setattr(
         web_module, "read_generic_credential", lambda target: dict(vault[target])
     )
     return vault
@@ -901,7 +908,7 @@ def test_a_credential_write_that_did_not_stick_is_reported_not_assumed(
     _settings_client(app_client, monkeypatch)
     from ziniao_automation import web as web_module
 
-    monkeypatch.setattr(web_module, "credential_exists", lambda target: False)
+    monkeypatch.setattr(web_module, "credential_matches", lambda target, expected: False)
 
     response = client.post(
         "/api/settings/feishu",
@@ -911,6 +918,43 @@ def test_a_credential_write_that_did_not_stick_is_reported_not_assumed(
 
     assert response.status_code == 502
     assert "安全软件" in response.json()["detail"]
+
+
+def test_an_existing_old_credential_is_not_mistaken_for_a_successful_overwrite(
+    app_client, monkeypatch
+):
+    """A silent write block must not validate merely because the old record exists."""
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    vault = _settings_client(app_client, monkeypatch)
+    target = "ziniao-automation/ziniao/main"
+    vault[target] = {
+        "company": "same-company",
+        "username": "same-user",
+        "password": "OLD_PASSWORD",
+    }
+    from ziniao_automation import web as web_module
+
+    # Simulate endpoint security reporting a successful CredWriteW call while
+    # preserving the old record.
+    monkeypatch.setattr(
+        web_module, "write_generic_credential", lambda *args, **kwargs: None
+    )
+    response = client.post(
+        "/api/settings/ziniao",
+        json={
+            "company": "same-company",
+            "username": "same-user",
+            "password": "NEW_PASSWORD",
+        },
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 502
+    assert vault[target]["password"] == "OLD_PASSWORD"
+    with app.state.sessions() as db:
+        assert db.scalar(select(ZiniaoAccount)) is None
 
 
 def test_saving_ziniao_from_the_console_updates_the_account_row(app_client, monkeypatch):
@@ -957,6 +1001,19 @@ def test_the_diagnostics_page_never_renders_a_stored_secret(app_client, monkeypa
     for field in ("password", "app_secret"):
         tag = re.search(rf'<input name="{field}"[^>]*>', page.text)
         assert tag and " value=" not in tag.group(0), f"{field} 不得带 value 属性"
+
+
+def test_diagnostics_identifies_the_release_and_database_revision(app_client):
+    _, client, _ = app_client
+    bootstrap(client)
+
+    page = client.get("/diagnostics")
+
+    assert page.status_code == 200
+    assert "应用版本 / 构建" in page.text
+    assert "0.2.0" in page.text
+    assert "数据库迁移版本" in page.text
+    assert "0005" in page.text
 
 
 def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):
