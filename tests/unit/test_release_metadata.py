@@ -67,9 +67,13 @@ def test_release_builder_emits_traceability_files_and_uses_the_lock() -> None:
         "ZINIAO_RELEASE_STAGE_SRC",
         "actual.is_relative_to(expected)",
         "release-test-venv",
+        "release-test-tmp",
+        "release-test-cache",
         "sync --locked --extra dev --no-install-project",
         "python install ([string]$Toolchain.python_version)",
         "-m pytest",
+        "--basetemp $releaseTestTemp",
+        'cache_dir={0}',
         "暂存源码完整测试失败",
     ):
         assert required in builder

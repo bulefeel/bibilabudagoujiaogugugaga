@@ -299,8 +299,16 @@ Write-Host ("      共 {0:N0} 个文件，{1:N1} MB" -f `
 
 Write-Host '[3/7] 使用暂存源码运行完整测试...'
 $releaseTestVenv = Assert-ChildPath (Join-Path $BuildDir 'release-test-venv') $BuildDir
+$releaseTestTemp = Assert-ChildPath (Join-Path $BuildDir 'release-test-tmp') $BuildDir
+$releaseTestCache = Assert-ChildPath (Join-Path $BuildDir 'release-test-cache') $BuildDir
 if (Test-Path -LiteralPath $releaseTestVenv) {
     Remove-Item -LiteralPath $releaseTestVenv -Recurse -Force
+}
+foreach ($testDirectory in @($releaseTestTemp, $releaseTestCache)) {
+    if (Test-Path -LiteralPath $testDirectory) {
+        Remove-Item -LiteralPath $testDirectory -Recurse -Force
+    }
+    New-Item -ItemType Directory -Path $testDirectory -Force | Out-Null
 }
 $oldPythonPath = $env:PYTHONPATH
 $oldProjectEnvironment = $env:UV_PROJECT_ENVIRONMENT
@@ -308,10 +316,14 @@ $oldPythonInstallDir = $env:UV_PYTHON_INSTALL_DIR
 $oldPythonPreference = $env:UV_PYTHON_PREFERENCE
 $oldTestCache = $env:UV_CACHE_DIR
 $oldStageSource = $env:ZINIAO_RELEASE_STAGE_SRC
+$oldTemp = $env:TEMP
+$oldTmp = $env:TMP
 $env:UV_PROJECT_ENVIRONMENT = $releaseTestVenv
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $ProjectRoot '.uv-python'
 $env:UV_PYTHON_PREFERENCE = 'only-managed'
 $env:UV_CACHE_DIR = Join-Path $ProjectRoot '.uv-cache'
+$env:TEMP = $releaseTestTemp
+$env:TMP = $releaseTestTemp
 Push-Location $ProjectRoot
 try {
     & $uv python install ([string]$Toolchain.python_version)
@@ -339,7 +351,8 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw '独立发布测试环境没有从 build\stage\src 导入业务代码。'
     }
-    & $testPython -m pytest (Join-Path $ProjectRoot 'tests')
+    & $testPython -m pytest (Join-Path $ProjectRoot 'tests') `
+        --basetemp $releaseTestTemp -o ("cache_dir={0}" -f $releaseTestCache)
     if ($LASTEXITCODE -ne 0) { throw "暂存源码完整测试失败，退出码 $LASTEXITCODE。" }
 } finally {
     Pop-Location
@@ -349,6 +362,8 @@ try {
     $env:UV_PYTHON_PREFERENCE = $oldPythonPreference
     $env:UV_CACHE_DIR = $oldTestCache
     $env:ZINIAO_RELEASE_STAGE_SRC = $oldStageSource
+    $env:TEMP = $oldTemp
+    $env:TMP = $oldTmp
 }
 
 Write-Host '[4/7] 归档旧的 0.2.1 测试包...'
