@@ -95,6 +95,23 @@ function Remove-StageGeneratedCaches([string]$Root) {
     }
 }
 
+function Assert-StageSafe([string]$Root) {
+    $safeRoot = Assert-ChildPath $Root $BuildDir
+    foreach ($forbidden in @('data', '.venv', '.uv-python', '.uv-cache', 'tests')) {
+        $leaked = Join-Path $safeRoot $forbidden
+        if (Test-Path -LiteralPath $leaked) {
+            throw "暂存目录里出现了 $forbidden，安装包可能包含运行数据，已中止。"
+        }
+    }
+    # -Include with -LiteralPath does not filter reliably, so compare suffixes.
+    $risky = @('.db', '.db-wal', '.db-shm', '.sqlite', '.jsonl', '.log', '.png', '.har', '.zip')
+    $secrets = Get-ChildItem -LiteralPath $safeRoot -Recurse -File |
+        Where-Object { $risky -contains $_.Extension.ToLowerInvariant() }
+    if ($secrets) {
+        throw "暂存目录里出现了数据库/日志/截图文件：$($secrets.FullName -join ', ')"
+    }
+}
+
 function Read-ToolchainDefinition {
     if (-not (Test-Path -LiteralPath $ToolchainFile -PathType Leaf)) {
         throw '缺少 installer\toolchain.json，无法确定发布工具链。'
@@ -284,19 +301,7 @@ Remove-StageGeneratedCaches $StageDir
 
 # 兜底断言：这几样绝不能出现在暂存目录里。白名单已经保证了，但这份数据
 # 一旦泄漏就无法收回，值得再确认一次。
-foreach ($forbidden in @('data', '.venv', '.uv-python', '.uv-cache', 'tests')) {
-    $leaked = Join-Path $StageDir $forbidden
-    if (Test-Path -LiteralPath $leaked) {
-        throw "暂存目录里出现了 $forbidden，安装包可能包含运行数据，已中止。"
-    }
-}
-# 注意：-Include 配 -LiteralPath 不按预期过滤（会匹配全部），必须自己筛扩展名。
-$risky = @('.db', '.db-wal', '.db-shm', '.sqlite', '.jsonl', '.log', '.png', '.har', '.zip')
-$secrets = Get-ChildItem -LiteralPath $StageDir -Recurse -File |
-    Where-Object { $risky -contains $_.Extension.ToLowerInvariant() }
-if ($secrets) {
-    throw "暂存目录里出现了数据库/日志/截图文件：$($secrets.FullName -join ', ')"
-}
+Assert-StageSafe $StageDir
 
 $stageSize = (Get-ChildItem -LiteralPath $StageDir -Recurse -File | Measure-Object -Property Length -Sum).Sum
 Write-Host ("      共 {0:N0} 个文件，{1:N1} MB" -f `
@@ -374,6 +379,15 @@ try {
 # them a second time so the files tested are the files packaged, without local
 # interpreter artefacts mixed into the installer.
 Remove-StageGeneratedCaches $StageDir
+$testCreatedData = Join-Path $StageDir 'data'
+if (Test-Path -LiteralPath $testCreatedData) {
+    $testDataEntries = @(Get-ChildItem -LiteralPath $testCreatedData -Force -Recurse)
+    if ($testDataEntries.Count -gt 0) {
+        throw "暂存源码测试在 stage\data 中生成了运行数据，安装包构建已中止。"
+    }
+    Remove-Item -LiteralPath $testCreatedData -Recurse -Force
+}
+Assert-StageSafe $StageDir
 
 Write-Host '[4/7] 归档旧的 0.2.1 测试包...'
 $legacyPackage = Join-Path $BuildDir 'ZiniaoAutomation-Setup-0.2.1.exe'
