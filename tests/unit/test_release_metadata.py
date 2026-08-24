@@ -77,6 +77,7 @@ def test_release_builder_emits_traceability_files_and_uses_the_lock() -> None:
         "暂存源码完整测试失败",
     ):
         assert required in builder
+    assert builder.count("Remove-StageGeneratedCaches $StageDir") == 2
     assert builder_path.read_bytes().startswith(b"\xef\xbb\xbf")
     assert (ROOT / "uv.lock").is_file()
 

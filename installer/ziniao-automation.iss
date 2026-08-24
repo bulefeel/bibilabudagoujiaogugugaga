@@ -102,9 +102,7 @@ begin
                   ExpandConstant('{app}\app'), SW_SHOW,
                   ewWaitUntilTerminated, ResultCode);
   if (not Started) or (ResultCode <> 0) then
-    RaiseException(Format(
-      '运行环境安装失败（Install.bat 退出码 %d）。请查看安装窗口中的第一条错误。',
-      [ResultCode]));
+    RaiseException(Format('运行环境安装失败（Install.bat 退出码 %d）。请查看安装窗口中的第一条错误。', [ResultCode]));
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

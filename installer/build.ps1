@@ -86,6 +86,15 @@ function Assert-ChildPath([string]$Path, [string]$Parent) {
     return $fullPath
 }
 
+function Remove-StageGeneratedCaches([string]$Root) {
+    $safeRoot = Assert-ChildPath $Root $BuildDir
+    foreach ($pattern in @('__pycache__', '*.egg-info')) {
+        Get-ChildItem -LiteralPath $safeRoot -Recurse -Directory -Filter $pattern |
+            Sort-Object -Property FullName -Descending |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
+    }
+}
+
 function Read-ToolchainDefinition {
     if (-not (Test-Path -LiteralPath $ToolchainFile -PathType Leaf)) {
         throw '缺少 installer\toolchain.json，无法确定发布工具链。'
@@ -271,11 +280,7 @@ Write-Utf8NoBom (Join-Path $StageDir 'build-info.json') `
 
 # __pycache__ 只会让包变大；*.egg-info 是可编辑安装的产物，装的时候会重新生成，
 # 带上旧的反而可能和新版本对不上。
-foreach ($pattern in @('__pycache__', '*.egg-info')) {
-    Get-ChildItem -LiteralPath $StageDir -Recurse -Directory -Filter $pattern |
-        Sort-Object -Property FullName -Descending |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force }
-}
+Remove-StageGeneratedCaches $StageDir
 
 # 兜底断言：这几样绝不能出现在暂存目录里。白名单已经保证了，但这份数据
 # 一旦泄漏就无法收回，值得再确认一次。
@@ -365,6 +370,10 @@ try {
     $env:TEMP = $oldTemp
     $env:TMP = $oldTmp
 }
+# Importing the staged tree during pytest recreates bytecode caches.  Purge
+# them a second time so the files tested are the files packaged, without local
+# interpreter artefacts mixed into the installer.
+Remove-StageGeneratedCaches $StageDir
 
 Write-Host '[4/7] 归档旧的 0.2.1 测试包...'
 $legacyPackage = Join-Path $BuildDir 'ZiniaoAutomation-Setup-0.2.1.exe'
