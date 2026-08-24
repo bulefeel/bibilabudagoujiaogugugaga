@@ -19,7 +19,7 @@
 #define AppName "紫鸟提现自动化"
 #define AppId "ZiniaoAutomation"
 #define AppPublisher "本地部署"
-#define AppVersion "0.2.0"
+#define AppVersion "0.2.1"
 #define StageDir "..\build\stage"
 
 [Setup]
@@ -82,12 +82,32 @@ Filename: "{app}\app\Stop.bat"; Flags: runhidden waituntilterminated; RunOnceId:
 Filename: "schtasks.exe"; Parameters: "/Delete /F /TN ""Ziniao Automation V1"""; Flags: runhidden waituntilterminated; RunOnceId: "DropStartupTask"
 
 [Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  RemoveDataPage: TInputOptionWizardPage;
-
-procedure InitializeWizard();
+  StopScript: String;
+  ResultCode: Integer;
 begin
-  { 只在卸载时问；安装向导里不需要这一页。 }
+  Result := '';
+  NeedsRestart := False;
+
+  { 升级前必须先停掉正在运行的服务。
+
+    不停会造成一种非常难查的故障：Jinja2 每次请求都从磁盘读模板，所以新界面
+    立刻生效；而 Python 的路由定义在旧进程的内存里，新接口一律 404。用户看到
+    的是"新按钮点了显示 Not Found"，而磁盘上的代码明明是对的。
+
+    顺带也解决 .venv\Scripts\pythonw.exe 被占用导致文件替换失败的问题。
+
+    这里用 Stop.bat 而不是直接 taskkill：它会核对 PID 文件对应的进程确实是本
+    项目的 Python，不会误杀同名进程。首次安装时该文件不存在，跳过即可。 }
+  StopScript := ExpandConstant('{app}\app\Stop.bat');
+  if FileExists(StopScript) then
+  begin
+    Exec(ExpandConstant('{cmd}'), '/c ""' + StopScript + '""', '',
+         SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    { 给端口和文件句柄一点释放时间；失败不阻断安装，后面的文件替换会自己报错。 }
+    Sleep(2000);
+  end;
 end;
 
 function InitializeUninstall(): Boolean;

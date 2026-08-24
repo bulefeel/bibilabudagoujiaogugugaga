@@ -653,7 +653,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260820-web-settings-and-webdriver" in page.text
+    assert "/static/app.js?v=20260821-diagnostics-styles" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text
@@ -1005,3 +1005,60 @@ def test_webdriver_switch_reports_success_with_what_it_closed(app_client):
 
     assert response.status_code == 200, response.text
     assert response.json()["closed_processes"] == 2
+
+
+def test_every_console_api_the_diagnostics_page_calls_actually_exists(app_client):
+    """Guard against the page shipping buttons that hit 404.
+
+    Found the hard way on the test machine: an upgrade replaced the templates
+    on disk while the old service kept serving from memory, so the new UI
+    appeared but every new endpoint answered "Not Found".  Inspecting
+    ``app.routes`` does not catch this either — this FastAPI version stores an
+    ``_IncludedRouter`` placeholder rather than copying the sub-routes, so the
+    list looks empty even when routing works.  Only a real request proves it.
+    """
+
+    _, client, _ = app_client
+    csrf = bootstrap(client)
+    page = client.get("/diagnostics")
+    assert page.status_code == 200
+
+    # Every endpoint app.js posts to from this page.
+    endpoints = [
+        "/api/settings/ziniao",
+        "/api/settings/feishu",
+        "/api/settings/feishu/test",
+        "/api/ziniao/webdriver/start",
+    ]
+    for endpoint in endpoints:
+        assert endpoint in _diagnostics_script(), f"{endpoint} 不在前端代码里"
+        response = client.post(endpoint, json={}, headers={"X-CSRF-Token": csrf})
+        # 422 (bad body) / 409 / 502 / 503 all prove the route is mounted.
+        # 404 means the button is wired to nothing.
+        assert response.status_code != 404, f"{endpoint} 返回 404"
+
+
+def _diagnostics_script() -> str:
+    return (
+        Path(__file__).resolve().parents[1]
+        / "src/ziniao_automation/static/app.js"
+    ).read_text(encoding="utf-8")
+
+
+def test_the_new_diagnostics_sections_have_styles(app_client):
+    """A class the stylesheet never heard of renders as an unstyled form.
+
+    That is exactly how the credential cards first shipped.
+    """
+
+    root = Path(__file__).resolve().parents[1] / "src/ziniao_automation"
+    css = (root / "static/app.css").read_text(encoding="utf-8")
+    for klass in (
+        "diagnostic-actions",
+        "diagnostic-actions-state",
+        "diagnostic-settings",
+        "settings-card",
+        "settings-card-head",
+        "settings-card-actions",
+    ):
+        assert f".{klass}" in css, f"{klass} 没有样式"

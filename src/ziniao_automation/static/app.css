@@ -96,3 +96,20 @@
 .marketplace-selection-warning{margin:12px 0 0;padding:10px 12px;background:#f0d9d2;border-left:3px solid var(--red);color:#75483f;font-size:10px;line-height:1.6}
 @media(max-width:1000px){.bulk-setup-progress{grid-template-columns:1fr}.bulk-setup-actions{justify-content:flex-start}.store-marketplace-row{grid-template-columns:140px 1fr}.marketplace-manual-override{grid-column:1/-1}}
 @media(max-width:620px){.toolbar-actions{width:100%}.toolbar-actions .button{flex:1}.marketplace-autofill-card{grid-template-columns:1fr}.store-marketplace-row{grid-template-columns:1fr}.store-marketplace-row .marketplace-account{margin-top:4px!important}.marketplace-manual-override{grid-column:auto}.bulk-setup-counts{align-items:stretch}.bulk-setup-counts span{min-width:0;flex:1}}
+
+/* 系统诊断页：WebDriver 切换与凭据配置 */
+.diagnostic-actions,.diagnostic-settings{margin-top:20px;border:1px solid var(--line);background:rgba(251,250,245,.66);padding:24px 26px}
+.diagnostic-actions header,.diagnostic-settings header{margin-bottom:6px}
+.diagnostic-actions h3,.diagnostic-settings h3{font:22px var(--serif);margin:0}
+.diagnostic-actions-row{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:16px}
+.diagnostic-actions-state{font-size:11px;color:var(--muted);line-height:1.7;white-space:pre-line;flex:1;min-width:200px}
+.diagnostic-actions-state.bad{color:var(--red)}
+.settings-card{border:1px solid var(--line);background:var(--white);padding:20px 22px;margin-top:16px}
+.settings-card-head{display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:16px}
+.settings-card-head b{font:15px var(--serif)}
+.settings-card label{display:block;font-size:11px;font-weight:700;margin-bottom:14px}
+.settings-card input{width:100%;border:1px solid #aca697;background:#f8f5ec;padding:11px 12px;margin-top:7px;outline:none}
+.settings-card input:focus{border-color:var(--red);box-shadow:0 0 0 2px rgba(180,60,47,.1)}
+.settings-card-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
+.settings-card-actions .form-error{flex:1;min-width:160px;margin:0}
+@media(max-width:760px){.diagnostic-actions,.diagnostic-settings{padding:18px 16px}.settings-card{padding:16px}}
