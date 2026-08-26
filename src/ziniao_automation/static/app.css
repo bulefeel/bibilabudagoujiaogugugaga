@@ -24,6 +24,41 @@
 .identity-auth-actions .button{min-height:44px;padding:9px 10px}
 @media(max-width:620px){.identity-auth-actions{grid-template-columns:1fr}}
 
+/* Batch schedule dialog.  The picker is intentionally plain and keyboard
+   friendly: every store remains an independent schedule after creation. */
+.schedule-step-indicator{display:flex;align-items:center;gap:10px;margin:-8px 0 22px;padding-bottom:13px;border-bottom:1px solid var(--line);font:10px var(--mono);color:var(--muted)}
+.schedule-step-indicator span.active{color:var(--red);font-weight:700}
+.schedule-step-indicator i{font-style:normal;color:#aaa294}
+.schedule-step[hidden],.schedule-step-indicator[hidden]{display:none}
+.schedule-step-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:20px}
+.workflow-config{margin:0 0 17px}
+.workflow-config[hidden]{display:none}
+.store-picker-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:-3px 0 11px}
+.store-picker-actions>span{margin-left:auto;color:var(--muted);font:10px var(--mono)}
+.store-picker{display:grid;gap:7px;max-height:260px;overflow:auto;padding-right:3px}
+.store-target{display:flex!important;align-items:center;gap:10px;margin:0!important;padding:11px 12px;border:1px solid var(--line);background:#f8f5ec;cursor:pointer}
+.store-target:hover{border-color:#a99c82;background:#f5efe2}
+.store-target>input{width:auto!important;margin:0!important}
+.store-target-copy{flex:1;min-width:0}
+.store-target-copy b,.store-target-copy small{display:block}
+.store-target-copy b{font-size:12px}
+.store-target-copy small{margin-top:4px;color:var(--muted);font-size:10px}
+.store-target-state{font:10px var(--mono);color:var(--muted);white-space:nowrap}
+.store-target-state.ok{color:var(--green);font-weight:700}
+.store-target-state.bad{color:var(--red);font-weight:700}
+.batch-preview{margin:14px 0 0;padding:13px 14px;border:1px solid var(--line);background:#eee8da}
+.batch-preview[hidden]{display:none}
+.batch-preview-head{display:flex;justify-content:space-between;font-size:11px}
+.batch-preview-head span{color:var(--muted);font:10px var(--mono)}
+.batch-preview>p{margin:7px 0 10px;color:var(--muted);font-size:10px;line-height:1.6}
+.batch-preview-row{display:flex;gap:10px;justify-content:space-between;padding:7px 0;border-top:1px dashed #cec6b7;font-size:10px}
+.batch-preview-row span{color:var(--muted);text-align:right}
+.batch-preview-row.ok span{color:var(--green)}
+.batch-preview-row.bad span{color:var(--red)}
+.batch-chip{display:inline-block;margin-left:8px;padding:2px 6px;border:1px solid var(--line);background:#eee8da;color:var(--muted);font:9px var(--mono)}
+.step-summary{margin:0 0 14px;padding:11px 13px;background:#e4e8dc;border-left:3px solid var(--green);color:var(--muted);font-size:10px;line-height:1.6}
+@media(max-width:620px){.store-picker-actions>span{margin-left:0;width:100%}.schedule-step-actions{flex-direction:column}.schedule-step-actions .button{width:100%}}
+
 /* Schedule management: keep destructive and immediate actions visually distinct. */
 .schedule-row{grid-template-columns:130px minmax(250px,1.5fr) minmax(145px,.7fr) 150px auto;gap:18px}
 .schedule-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}

@@ -14,7 +14,13 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from ziniao_automation.db import utc_now as database_utc_now
-from ziniao_automation.models import OperationGuard, Run, Store, StoreMarketplace
+from ziniao_automation.models import (
+    OperationGuard,
+    Run,
+    RunQueueEntry,
+    Store,
+    StoreMarketplace,
+)
 from ziniao_automation.queue import (
     DurableRunQueue,
     PersistentQueueWorker,
@@ -27,7 +33,7 @@ from ziniao_automation.ziniao.errors import AuthWaitCancelled, AuthWaitExpired
 from .engine import WorkflowEngine
 from .amazon_disbursement import AmazonPaymentsPage
 from .amazon_disbursement.config import ALLOWED_MARKETPLACES
-from .errors import HumanAuthRequired, PreflightRejected
+from .errors import HumanAuthRequired, PreflightRejected, WorkflowNotRegistered
 from .types import (
     MarketplaceRef,
     RunMode,
@@ -108,6 +114,13 @@ class StartupRecoveryPlan:
     """Disjoint run groups reconstructed from durable SQLite state."""
 
     financial: tuple[WorkflowRun, ...] = ()
+    # Includes every run protected by an active guard, even when an old or
+    # malformed row could not be converted into today's WorkflowRun object.
+    # The queue uses this complete set to ensure no guarded item can ever be
+    # restored as an ordinary START action.
+    financial_guarded_ids: tuple[str, ...] = ()
+    financial_failed_ids: tuple[str, ...] = ()
+    reconciling_ids: tuple[str, ...] = ()
     queued_ids: tuple[str, ...] = ()
     running_ids: tuple[str, ...] = ()
     waiting_auth_ids: tuple[str, ...] = ()
@@ -121,9 +134,11 @@ class DatabaseRunLoader:
         session_factory: sessionmaker[Session] | Any,
         *,
         artifact_root: Path | None = None,
+        workflow_registry: Any | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.artifact_root = artifact_root
+        self.workflow_registry = workflow_registry
 
     async def __call__(self, run_id: str) -> WorkflowRun:
         with self.session_factory() as session:
@@ -134,6 +149,40 @@ class DatabaseRunLoader:
             )
             if row is None:
                 raise LookupError(f"任务 {run_id} 不存在")
+            if self.workflow_registry is not None:
+                try:
+                    definition = self.workflow_registry.definition(row.workflow)
+                except WorkflowNotRegistered as exc:
+                    raise ValueError("任务工作流不在当前版本的代码白名单中") from exc
+                expected_version = int(definition.config_version)
+                if int(row.workflow_config_version) != expected_version:
+                    raise ValueError("任务工作流配置版本与当前代码不兼容")
+                try:
+                    workflow_config = dict(
+                        self.workflow_registry.validate_config(
+                            row.workflow, dict(row.workflow_config or {})
+                        )
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("任务工作流参数不符合当前版本定义") from exc
+                requires_marketplaces = bool(
+                    definition.requires_marketplace_targets
+                )
+            else:
+                if row.workflow != "amazon_disbursement":
+                    raise ValueError("任务工作流不在当前版本的代码白名单中")
+                expected_version = 1
+                workflow_config = dict(row.workflow_config or {})
+                requires_marketplaces = True
+            if (
+                row.workflow == "amazon_disbursement"
+                and not workflow_config.get("marketplace_codes")
+            ):
+                legacy_codes = list(
+                    (row.result_summary or {}).get("requested_marketplaces") or ()
+                )
+                if legacy_codes:
+                    workflow_config = {"marketplace_codes": legacy_codes}
             store = row.store
             if not store.selector_type or not store.selector_value:
                 raise ValueError("店铺缺少明确的紫鸟环境选择器")
@@ -146,9 +195,7 @@ class DatabaseRunLoader:
                 enabled=bool(store.enabled),
                 identity_confirmed=bool(store.identity_confirmed),
             )
-            requested_codes = set(
-                (row.result_summary or {}).get("requested_marketplaces") or ()
-            )
+            requested_codes = set(workflow_config.get("marketplace_codes") or ())
             enabled = tuple(
                 MarketplaceRef(
                     id=str(market.id),
@@ -159,9 +206,10 @@ class DatabaseRunLoader:
                 )
                 for market in sorted(store.marketplaces, key=lambda item: item.code)
                 if market.enabled
+                and requires_marketplaces
                 and (not requested_codes or market.code in requested_codes)
             )
-            if not enabled:
+            if requires_marketplaces and not enabled:
                 raise ValueError("任务店铺没有启用的 CA/UK/AU 站点")
             return WorkflowRun(
                 id=row.id,
@@ -169,53 +217,93 @@ class DatabaseRunLoader:
                 mode=RunMode(row.mode),
                 store=store_ref,
                 marketplaces=enabled,
+                workflow_config=workflow_config,
+                workflow_config_version=expected_version,
                 requested_by=row.requested_by,
                 artifact_dir=self.artifact_root,
             )
 
     async def recovery_runs(self) -> tuple[WorkflowRun, ...]:
-        with self.session_factory() as session:
-            run_ids = tuple(
-                session.scalars(
-                    select(OperationGuard.run_id)
-                    .where(
-                        OperationGuard.state.in_(
-                            ("ARMED", "SUBMITTED", "UNCERTAIN")
-                        )
+        guarded = self._financial_guard_snapshot()
+        loaded: list[WorkflowRun] = []
+        for run_id in sorted(guarded):
+            try:
+                loaded.append(
+                    await self._load_financial_recovery_run(
+                        run_id, guarded[run_id]
                     )
-                    .distinct()
                 )
-            )
-        return tuple([await self(run_id) for run_id in run_ids])
+            except Exception as exc:
+                self._mark_financial_recovery_unloadable(run_id, exc)
+                logger.exception(
+                    "financial_recovery_snapshot_invalid run_id=%s", run_id[:8]
+                )
+        return tuple(loaded)
+
+    async def load_financial_recovery(self, run_id: str) -> WorkflowRun:
+        """Load one guarded run for a queued/manual RECONCILE action."""
+
+        guarded = self._financial_guard_snapshot()
+        codes = guarded.get(run_id)
+        if codes is None:
+            with self.session_factory() as session:
+                historical = tuple(
+                    dict.fromkeys(
+                        str(value).strip().upper()
+                        for value in session.scalars(
+                            select(OperationGuard.marketplace_code)
+                            .where(OperationGuard.run_id == run_id)
+                            .order_by(OperationGuard.marketplace_code)
+                        )
+                        if str(value or "").strip()
+                    )
+                )
+            if not historical:
+                raise ValueError("任务没有可回读的资金保护记录")
+            codes = historical
+        try:
+            return await self._load_financial_recovery_run(run_id, codes)
+        except Exception as exc:
+            self._mark_financial_recovery_unloadable(run_id, exc)
+            raise
 
     async def startup_recovery_plan(self) -> StartupRecoveryPlan:
         """Classify crash leftovers without allowing financial re-execution."""
 
+        guarded = self._financial_guard_snapshot()
+        financial_ids = set(guarded)
         with self.session_factory() as session:
-            financial_ids = set(
-                session.scalars(
-                    select(OperationGuard.run_id)
-                    .where(
-                        OperationGuard.state.in_(
-                            ("ARMED", "SUBMITTED", "UNCERTAIN")
-                        )
-                    )
-                    .distinct()
-                )
+            historical_guard_ids = set(
+                session.scalars(select(OperationGuard.run_id).distinct())
             )
             ordinary = session.execute(
                 select(Run.id, Run.status).where(
-                    Run.status.in_(("QUEUED", "RUNNING", "WAITING_AUTH"))
+                    Run.status.in_(
+                        (
+                            "QUEUED",
+                            "RUNNING",
+                            "WAITING_APPROVAL",
+                            "WAITING_AUTH",
+                            "NEEDS_HUMAN_AUTH",
+                            "RECONCILING",
+                            "UNCERTAIN_FINANCIAL",
+                        )
+                    )
                 )
             ).all()
         # Sets make the groups disjoint even if malformed legacy rows contain
-        # more than one operation guard.  WAITING_APPROVAL is intentionally
-        # absent and therefore remains untouched.
+        # more than one operation guard.  Any historical financial guard is
+        # authoritative: the process may have crashed after its final guard
+        # became CONFIRMED but before the parent run reached a terminal state.
         queued: list[str] = []
         running: list[str] = []
         waiting_auth: list[str] = []
+        reconciling: list[str] = []
         for run_id, status in ordinary:
             if run_id in financial_ids:
+                continue
+            if run_id in historical_guard_ids:
+                reconciling.append(run_id)
                 continue
             if status == "QUEUED":
                 queued.append(run_id)
@@ -223,13 +311,198 @@ class DatabaseRunLoader:
                 running.append(run_id)
             elif status == "WAITING_AUTH":
                 waiting_auth.append(run_id)
-        financial = tuple([await self(run_id) for run_id in sorted(financial_ids)])
+            elif status == "RECONCILING":
+                reconciling.append(run_id)
+        financial: list[WorkflowRun] = []
+        failed: list[str] = []
+        for run_id in sorted(financial_ids):
+            try:
+                financial.append(
+                    await self._load_financial_recovery_run(run_id, guarded[run_id])
+                )
+            except Exception as exc:
+                failed.append(run_id)
+                self._mark_financial_recovery_unloadable(run_id, exc)
+                logger.exception(
+                    "financial_recovery_snapshot_invalid run_id=%s", run_id[:8]
+                )
         return StartupRecoveryPlan(
-            financial=financial,
+            financial=tuple(financial),
+            financial_guarded_ids=tuple(sorted(financial_ids)),
+            financial_failed_ids=tuple(failed),
+            reconciling_ids=tuple(sorted(reconciling)),
             queued_ids=tuple(sorted(queued)),
             running_ids=tuple(sorted(running)),
             waiting_auth_ids=tuple(sorted(waiting_auth)),
         )
+
+    def _financial_guard_snapshot(self) -> dict[str, tuple[str, ...]]:
+        """Return active guard site codes without trusting mutable run config."""
+
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(OperationGuard.run_id, OperationGuard.marketplace_code)
+                .where(
+                    OperationGuard.state.in_(("ARMED", "SUBMITTED", "UNCERTAIN"))
+                )
+                .order_by(OperationGuard.run_id, OperationGuard.marketplace_code)
+            ).all()
+        grouped: dict[str, list[str]] = {}
+        for run_id, code in rows:
+            normalized = str(code or "").strip().upper()
+            bucket = grouped.setdefault(run_id, [])
+            if normalized and normalized not in bucket:
+                bucket.append(normalized)
+        return {run_id: tuple(codes) for run_id, codes in grouped.items()}
+
+    async def _load_financial_recovery_run(
+        self, run_id: str, guard_marketplace_codes: Sequence[str]
+    ) -> WorkflowRun:
+        """Build the minimum safe read-back snapshot for an active guard.
+
+        Recovery deliberately does not validate an old run against the latest
+        workflow config model.  The irreversible action already happened (or
+        may have happened), so the guard rows are the authoritative targets.
+        Normal START/APPROVE paths still use ``__call__`` and its strict current
+        version/schema checks.
+        """
+
+        codes = tuple(dict.fromkeys(str(code).upper() for code in guard_marketplace_codes))
+        if not codes:
+            raise ValueError("active financial guard has no marketplace code")
+        with self.session_factory() as session:
+            row = session.scalar(
+                select(Run)
+                .where(Run.id == run_id)
+                .options(selectinload(Run.store).selectinload(Store.marketplaces))
+            )
+            if row is None:
+                raise LookupError(f"任务 {run_id} 不存在")
+
+            # An active guard is more authoritative than a contradictory run
+            # terminal state.  Without this repair, engine.reconcile() treats
+            # SUCCEEDED/PARTIAL/FAILED as already settled and returns without
+            # reading the platform, leaving ARMED/SUBMITTED stranded forever.
+            reconcilable_statuses = {
+                "RUNNING",
+                "WAITING_APPROVAL",
+                "WAITING_AUTH",
+                "NEEDS_HUMAN_AUTH",
+                "UNCERTAIN_FINANCIAL",
+                "RECONCILING",
+            }
+            if row.status not in reconcilable_statuses:
+                previous_status = row.status
+                row.status = "UNCERTAIN_FINANCIAL"
+                row.error = (
+                    "检测到资金保护记录与任务状态不一致，已强制进入资金回读"
+                )
+                from ziniao_automation.models import RunEvent
+
+                session.add(
+                    RunEvent(
+                        run_id=run_id,
+                        event_type="FINANCIAL_GUARD_STATUS_REPAIRED",
+                        from_status=previous_status,
+                        to_status="UNCERTAIN_FINANCIAL",
+                        message=row.error,
+                    )
+                )
+                session.commit()
+
+            if self.workflow_registry is not None:
+                try:
+                    definition = self.workflow_registry.definition(row.workflow)
+                except WorkflowNotRegistered as exc:
+                    raise ValueError("资金任务工作流已不在代码白名单中") from exc
+                if not bool(getattr(definition, "requires_financial_lock", False)):
+                    raise ValueError("受资金保护的任务未注册为资金安全工作流")
+            elif row.workflow != "amazon_disbursement":
+                raise ValueError("资金任务工作流已不在代码白名单中")
+
+            # V1 has one financial workflow.  Ignore its legacy/extra config
+            # fields and reconstruct only the site target list from guards.
+            if row.workflow != "amazon_disbursement":
+                raise ValueError("当前版本没有该资金工作流的兼容回读适配器")
+            workflow_config = {"marketplace_codes": list(codes)}
+
+            store = row.store
+            if store is None or not store.selector_type or not store.selector_value:
+                raise ValueError("店铺缺少明确的紫鸟环境选择器")
+            store_ref = StoreRef(
+                id=str(store.id),
+                name=store.name,
+                selector_type=store.selector_type,
+                selector_value=store.selector_value,
+                expected_seller_id=store.expected_seller_id or "",
+                enabled=bool(store.enabled),
+                identity_confirmed=bool(store.identity_confirmed),
+            )
+            wanted = set(codes)
+            marketplaces = tuple(
+                MarketplaceRef(
+                    id=str(market.id),
+                    code=market.code,
+                    domain=market.domain,
+                    currency=market.currency,
+                    # A later operator edit must not suppress read-back of an
+                    # already armed/submitted operation.
+                    enabled=True,
+                )
+                for market in sorted(store.marketplaces, key=lambda item: item.code)
+                if market.code in wanted
+            )
+            return WorkflowRun(
+                id=row.id,
+                workflow=row.workflow,
+                mode=RunMode(row.mode),
+                store=store_ref,
+                marketplaces=marketplaces,
+                workflow_config=workflow_config,
+                workflow_config_version=int(row.workflow_config_version or 1),
+                requested_by=row.requested_by,
+                artifact_dir=self.artifact_root,
+            )
+
+    def _mark_financial_recovery_unloadable(
+        self, run_id: str, exc: Exception
+    ) -> None:
+        """Quarantine one malformed guarded run without blocking its peers."""
+
+        message = (
+            "启动资金回读准备失败，已保持资金结果不明确；"
+            f"请人工核查（{type(exc).__name__}）"
+        )
+        with self.session_factory() as session:
+            row = session.get(Run, run_id)
+            if row is None:
+                return
+            previous = row.status
+            row.status = "UNCERTAIN_FINANCIAL"
+            row.error = message
+            row.finished_at = database_utc_now()
+            from ziniao_automation.models import RunEvent, SiteRun
+
+            session.add(
+                RunEvent(
+                    run_id=run_id,
+                    event_type="FINANCIAL_RECOVERY_LOAD_FAILED",
+                    from_status=previous,
+                    to_status="UNCERTAIN_FINANCIAL",
+                    message=message,
+                )
+            )
+            for site in session.scalars(
+                select(SiteRun).where(
+                    SiteRun.run_id == run_id,
+                    SiteRun.status.in_(
+                        ("ARMED", "SUBMITTED", "RECONCILING", "WAITING_AUTH")
+                    ),
+                )
+            ):
+                site.status = "UNCERTAIN_FINANCIAL"
+                site.error = message
+            session.commit()
 
     async def mark_waiting_auth_after_restart(self, run_id: str) -> bool:
         """Persist the lost auth lease without requiring browser configuration.
@@ -287,7 +560,20 @@ class AutomationService:
         self.recovery_loader = recovery_loader
         self.profile_sink = profile_sink
         self.session_factory = session_factory
-        self._queue = DurableRunQueue(session_factory) if session_factory is not None else None
+        registry = getattr(engine, "registry", None)
+        priority_resolver = (
+            (lambda workflow: int(registry.definition(workflow).business_priority))
+            if registry is not None and hasattr(registry, "definition")
+            else None
+        )
+        self._queue = (
+            DurableRunQueue(
+                session_factory,
+                business_priority_resolver=priority_resolver,
+            )
+            if session_factory is not None
+            else None
+        )
         self._worker = (
             PersistentQueueWorker(
                 self._queue,
@@ -833,6 +1119,17 @@ class AutomationService:
             if identity_probe is not None and not identity_probe.task.done():
                 raise RuntimeError("该店铺正在单独检测卖家身份，请完成或取消后再统一建档")
 
+            # Validate the *current* database/vault reference before creating
+            # a background task or changing any site row.  This is a local,
+            # no-network check: a global credentials problem must reach the
+            # HTTP caller immediately instead of becoming four launch retries
+            # for every store in the browser-side batch queue.
+            credential_preflight = getattr(
+                self.ziniao_controller, "preflight_credentials", None
+            )
+            if callable(credential_preflight):
+                credential_preflight()
+
             # Persist explicit site selection only after proving this request
             # will create a new probe. Reattaching to an existing probe must be
             # a strictly read-only operation with no hidden configuration edit.
@@ -1126,7 +1423,12 @@ class AutomationService:
         way for enrolment to consume a run.
         """
 
-        del selector, store_id
+        # Only ``selector`` is genuinely unused here — the payments dashboard is
+        # reached through the handle this method is given.  ``store_id`` is still
+        # needed by the terminal payload below; deleting it too made every unified
+        # setup that got as far as the return raise UnboundLocalError and finish
+        # FAILED, so setup could never report success.
+        del selector
         for code in marketplace_codes:
             domain, currency = ALLOWED_MARKETPLACES[code]
             marketplace = MarketplaceRef(
@@ -1703,6 +2005,33 @@ class AutomationService:
         await self._require_unified_store_setup_probe(store_id, probe_id)
         return await self.get_marketplace_setup_probe(store_id, probe_id)
 
+    async def get_active_store_setup_probe(
+        self, store_id: int
+    ) -> dict[str, Any] | None:
+        """The unified setup probe still holding this store, if any.
+
+        The browser is the wrong place to keep the only copy of ``probe_id``:
+        reloading the page, reopening the editor or closing the tab all lose it,
+        while this registry stays authoritative for the whole window.  Losing it
+        left the operator facing a reset that always 409s and a cancel control
+        that is never rendered, with nothing on screen naming a way out.  The
+        console asks this on every editor open so the running probe — and its
+        cancel button — are always found again.
+        """
+
+        async with self._marketplace_setup_guard:
+            probe_id = self._marketplace_setup_store_probes.get(int(store_id))
+            probe = self._marketplace_setup_probes.get(probe_id or "")
+            if probe is None or not probe.unified:
+                return None
+            if probe.task.done():
+                # Same settle-then-report as the read-by-id path above: keep the
+                # terminal snapshot consistent, but report no live probe, since
+                # a finished task no longer blocks reset.
+                self._finalize_marketplace_setup_probe_locked(probe, probe.task)
+                return None
+            return self._marketplace_setup_payload_locked(probe)
+
     def _marketplace_setup_payload_locked(
         self, probe: _MarketplaceSetupProbe
     ) -> dict[str, Any]:
@@ -1815,6 +2144,28 @@ class AutomationService:
     async def enqueue_run(self, run_id: str) -> None:
         await self._enqueue(run_id, action="START")
 
+    async def enqueue_runs(self, run_ids: Sequence[str]) -> None:
+        """Enqueue one same-occurrence batch and wake the worker once.
+
+        The scheduler creates one independent run per store, but a batch is a
+        single ordering unit.  ``DurableRunQueue.enqueue_many`` writes all
+        entries in one transaction with a shared immutable enqueue timestamp;
+        starting/waking the worker only after that commit prevents it from
+        claiming child 1 while child 2 is still being persisted.
+        """
+
+        normalized = list(dict.fromkeys(str(value) for value in run_ids))
+        if not normalized:
+            return
+        if self._queue is None or self._worker is None:
+            # Compatibility path for isolated in-memory tests.
+            for run_id in normalized:
+                await self._spawn(run_id, lambda run: self.engine.start(run))
+            return
+        self._queue.enqueue_many(normalized, action="START")
+        await self._worker.start()
+        self._worker.wake()
+
     async def approve_run(
         self,
         run_id: str,
@@ -1870,17 +2221,92 @@ class AutomationService:
             await self._spawn(run_id, lambda run: self.engine.continue_auth(run))
 
     async def cancel_run(self, run_id: str) -> None:
+        if self.session_factory is not None:
+            with self.session_factory() as session:
+                active_guard = session.scalar(
+                    select(OperationGuard.id)
+                    .where(
+                        OperationGuard.run_id == run_id,
+                        OperationGuard.state.in_(
+                            ("ARMED", "SUBMITTED", "UNCERTAIN")
+                        ),
+                    )
+                        .limit(1)
+                    )
+                # A durable RECONCILE item is itself a financial safety marker.
+                # It may survive a restart after all guard rows have reached a
+                # terminal state, so checking only active guard states above is
+                # insufficient. Keep both reads in this managed session before
+                # any cancellation signal or ``cancel_ready`` call; otherwise
+                # cancellation could erase the only recovery action and strand
+                # the run in a reconcile state.
+                recovery_entry = session.scalar(
+                    select(RunQueueEntry.action)
+                    .where(
+                        RunQueueEntry.run_id == run_id,
+                        RunQueueEntry.state.in_(("READY", "CLAIMED")),
+                        RunQueueEntry.action == "RECONCILE",
+                    )
+                    .limit(1)
+                )
+            if active_guard is not None:
+                raise RuntimeError(
+                    "任务已进入资金保护阶段，只能执行付款结果回读，不能取消"
+                )
+            if recovery_entry is not None:
+                raise RuntimeError(
+                    "任务已进入资金回读队列，只能先完成资金结果回读，不能取消"
+                )
         signal = getattr(self.ziniao_controller, "cancel_auth", None)
         if callable(signal) and await signal(run_id):
             return
         if self._queue is not None and self._queue.cancel_ready(run_id):
             run = await self.run_loader(run_id)
-            await self.engine.cancel(run)
+            cancelled = await self.engine.cancel(run)
+            await self._raise_if_cancel_was_unsafe(run_id, cancelled)
             if self._worker is not None:
                 self._worker.wake()
             return
         run = await self.run_loader(run_id)
-        await self.engine.cancel(run)
+        cancelled = await self.engine.cancel(run)
+        await self._raise_if_cancel_was_unsafe(run_id, cancelled)
+
+    async def _raise_if_cancel_was_unsafe(
+        self, run_id: str, cancelled: Any
+    ) -> None:
+        """Reject a cancellation that did not acquire a safe state boundary.
+
+        ``CLAIMED`` only means the durable worker owns the queue row; it does
+        not stop the already-running coroutine.  Writing CANCELLED while that
+        coroutine is between its last page check and ``arm_operation`` would
+        therefore be cosmetic rather than cancellation.  The engine now
+        returns ``False`` at that boundary and this service surfaces a 409
+        instead of claiming that the funds task stopped.
+
+        ``is False`` intentionally preserves compatibility with tiny injected
+        test doubles whose legacy ``cancel`` method returns ``None``.
+        """
+
+        if cancelled is not False:
+            return
+        status = await self.engine.repository.get_run_status(run_id)
+        if status in {
+            RunStatus.SUCCEEDED,
+            RunStatus.PARTIAL,
+            RunStatus.FAILED,
+            RunStatus.CANCELLED,
+            RunStatus.SKIPPED,
+        }:
+            return
+        if await self.engine.repository.list_operations(run_id):
+            raise RuntimeError(
+                "任务已进入资金保护阶段，只能执行付款结果回读，不能取消"
+            )
+        if status in {RunStatus.RUNNING, RunStatus.RECONCILING}:
+            raise RuntimeError(
+                "任务正在执行，当前尚未到可安全取消的等待点；本次未写入取消状态"
+            )
+        raise RuntimeError("任务状态已变化，当前不能取消，请刷新后重试")
 
     async def reconcile_run(self, run_id: str) -> None:
         if self._queue is not None:
@@ -1918,7 +2344,43 @@ class AutomationService:
         self._worker.wake()
 
     async def _execute_queue_entry(self, entry: Any) -> None:
-        run = await self.run_loader(entry.run_id)
+        durable_status: str | None = None
+        has_active_guard = False
+        has_any_guard = False
+        if self.session_factory is not None:
+            with self.session_factory() as session:
+                durable_status = session.scalar(
+                    select(Run.status).where(Run.id == entry.run_id)
+                )
+                guard_states = tuple(
+                    session.scalars(
+                        select(OperationGuard.state).where(
+                            OperationGuard.run_id == entry.run_id
+                        )
+                    )
+                )
+                has_any_guard = bool(guard_states)
+                has_active_guard = any(
+                    state in {"ARMED", "SUBMITTED", "UNCERTAIN"}
+                    for state in guard_states
+                )
+        # The guard, not a stale queue action, decides what is safe. An
+        # ARMED/SUBMITTED/UNCERTAIN run can only enter the read-back path.
+        effective_action = "RECONCILE" if has_active_guard else entry.action
+        try:
+            recovery_loader = getattr(
+                self.run_loader, "load_financial_recovery", None
+            )
+            if (
+                (has_active_guard or (entry.action == "RECONCILE" and has_any_guard))
+                and callable(recovery_loader)
+            ):
+                run = await recovery_loader(entry.run_id)
+            else:
+                run = await self.run_loader(entry.run_id)
+        except (LookupError, TypeError, ValueError, WorkflowNotRegistered) as exc:
+            self._mark_unloadable_queue_run(entry.run_id, exc)
+            return
         # A user can cancel between claim and actual execution. Never ask the
         # engine to revive a terminal run.
         if self.session_factory is not None:
@@ -1933,22 +2395,67 @@ class AutomationService:
                 "CANCELLED",
                 "SKIPPED",
                 "NEEDS_HUMAN_AUTH",
+                "UNCERTAIN_FINANCIAL",
+                "RECONCILING",
             }:
-                return
-        if entry.action == "START":
+                if effective_action != "RECONCILE":
+                    return
+        if effective_action == "START":
             await self.engine.start(run)
-        elif entry.action == "APPROVE":
+        elif effective_action == "APPROVE":
             execute = getattr(self.engine, "execute_approved", None)
             if callable(execute):
                 await execute(run)
             else:
                 await self.engine.approve(run)
-        elif entry.action == "CONTINUE_AUTH":
+        elif effective_action == "CONTINUE_AUTH":
             await self.engine.continue_auth(run)
-        elif entry.action == "RECONCILE":
+        elif effective_action == "RECONCILE":
             await self.engine.reconcile(run)
         else:  # database check constraint is defence in depth
             raise RuntimeError(f"unknown queue action: {entry.action}")
+
+    def _mark_unloadable_queue_run(self, run_id: str, exc: Exception) -> None:
+        """Move a rejected immutable snapshot to an auditable terminal state."""
+
+        if self.session_factory is None:
+            return
+        with self.session_factory() as session:
+            row = session.get(Run, run_id)
+            if row is None:
+                return
+            previous = row.status
+            # A guarded recovery loader already wrote UNCERTAIN_FINANCIAL; it
+            # must never be weakened to an ordinary FAILED/SKIPPED state.
+            guarded = session.scalar(
+                select(OperationGuard.id)
+                .where(
+                    OperationGuard.run_id == run_id,
+                    OperationGuard.state.in_(("ARMED", "SUBMITTED", "UNCERTAIN")),
+                )
+                .limit(1)
+            )
+            if guarded is not None:
+                target = "UNCERTAIN_FINANCIAL"
+                message = "资金任务快照无法加载，已保持资金结果不明确，请人工核查"
+            else:
+                target = "SKIPPED" if row.trigger == "schedule" else "FAILED"
+                message = f"任务配置无法加载：{type(exc).__name__}"
+            row.status = target
+            row.error = message
+            row.finished_at = database_utc_now()
+            from ziniao_automation.models import RunEvent
+
+            session.add(
+                RunEvent(
+                    run_id=run_id,
+                    event_type="QUEUE_SNAPSHOT_REJECTED",
+                    from_status=previous,
+                    to_status=target,
+                    message=message,
+                )
+            )
+            session.commit()
 
     async def recover_startup(self) -> None:
         startup_plan_loader = getattr(self.run_loader, "startup_recovery_plan", None)
@@ -1961,9 +2468,31 @@ class AutomationService:
 
         if self._queue is not None:
             financial_ids = {run.id for run in plan.financial}
-            self._queue.restore_claimed(financial_ids)
+            guarded_ids = set(plan.financial_guarded_ids) or financial_ids
+            # Every guarded run is restored as RECONCILE first.  Invalid
+            # legacy snapshots are then cancelled below, so none can fall
+            # through to an ordinary START action while healthy peers recover.
+            reconcile_ids = guarded_ids | set(plan.reconciling_ids)
+            self._queue.restore_claimed(reconcile_ids)
             for run in plan.financial:
                 self._queue.ensure_financial_recovery(run.id)
+            for run_id in plan.reconciling_ids:
+                self._queue.ensure_financial_recovery(run_id)
+            for run_id in plan.financial_failed_ids:
+                self._queue.cancel_ready(run_id)
+            deliveries = getattr(self._worker, "notifications", None)
+            notify_uncertain = getattr(
+                deliveries, "notify_uncertain_financial", None
+            )
+            if callable(notify_uncertain):
+                for run_id in plan.financial_failed_ids:
+                    try:
+                        await notify_uncertain(run_id)
+                    except Exception:
+                        logger.exception(
+                            "financial_recovery_failure_notice_failed run_id=%s",
+                            run_id[:8],
+                        )
         else:
             # Isolated non-database consumers retain the legacy serial path.
             for run in plan.financial:
@@ -1976,7 +2505,11 @@ class AutomationService:
         # pre-submit step.  CAS it back to QUEUED before spawning so the engine
         # can claim QUEUED -> RUNNING normally.  A failed CAS means another
         # actor already changed it, so it is not enqueued.
-        recovered_ids: set[str] = {run.id for run in plan.financial}
+        recovered_ids: set[str] = (
+            set(plan.financial_guarded_ids)
+            or {run.id for run in plan.financial}
+        )
+        recovered_ids.update(plan.reconciling_ids)
         for run_id in plan.running_ids:
             if run_id in recovered_ids:
                 continue

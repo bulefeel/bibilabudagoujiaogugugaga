@@ -140,6 +140,11 @@ class SqlAlchemyRepositoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submitted.receipt_id, "receipt")
 
     async def _armed_guard(self, guard_key: str) -> OperationIntent:
+        # ARMED is a financial execution boundary, so fixtures must model the
+        # same QUEUED -> RUNNING lease that the worker acquires in production.
+        await self.repo.set_run_status(
+            "sql-run", RunStatus.RUNNING, allowed_from=(RunStatus.QUEUED,)
+        )
         await self.repo.set_site_status("sql-run", "CA", SiteStatus.PREFLIGHT)
         intent = OperationIntent(
             guard_key=guard_key,

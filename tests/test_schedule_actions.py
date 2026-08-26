@@ -250,4 +250,8 @@ def test_schedule_action_http_contract(database):
             db.commit()
         deleted = client.delete(f"/api/schedules/{schedule_id}", headers=headers)
         assert deleted.status_code == 200, deleted.text
-        assert deleted.json() == {"status": "deleted", "schedule_id": schedule_id}
+        assert deleted.json() == {
+            "status": "deleted",
+            "schedule_id": schedule_id,
+            "scheduler_refreshed": True,
+        }

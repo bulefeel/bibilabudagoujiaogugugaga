@@ -11,7 +11,14 @@ class InvalidTransition(WorkflowError):
     code = "invalid_transition"
 
 
-class WorkflowNotRegistered(WorkflowError):
+class WorkflowNotRegistered(WorkflowError, LookupError):
+    """A code allow-list lookup miss.
+
+    It remains a WorkflowError for engine callers and is also a LookupError so
+    repository/scheduler boundaries can normalize it without importing the
+    eager ``workflows`` package (which would create a circular import).
+    """
+
     code = "workflow_not_registered"
 
 

@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from hashlib import sha256
 import json
-from typing import Any, Iterable, Sequence
+from types import SimpleNamespace
+from typing import Any, Iterable, Mapping, Sequence
 
 from sqlalchemy import Select, and_, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -126,8 +127,10 @@ class StoreRepository:
             browser_id=browser_id,
             account_id=account_id,
             expected_seller_id=expected_seller_id,
-            # Merely typing an expected ID is not confirmation.  A human must
-            # explicitly check it before the database allows enabled=True.
+            # Merely typing an expected ID is not confirmation.  Financial
+            # workflows enforce their own confirmed-identity requirement;
+            # store availability itself remains usable by workflows that do
+            # not require a Seller Central identity.
             identity_confirmed=False,
             enabled=False,
         )
@@ -169,10 +172,9 @@ class StoreRepository:
                 # confirmation (or sending False) still revokes both flags.
                 explicitly_confirmed = changes.get("identity_confirmed") is True
                 changes["identity_confirmed"] = explicitly_confirmed
-                # Do not silently carry an old enabled=True across an identity
-                # change.  Re-enabling in the same PATCH must also be explicit.
-                if not (explicitly_confirmed and changes.get("enabled") is True):
-                    changes["enabled"] = False
+                # Store availability is independent from Seller Central
+                # identity. Workflows that require a confirmed seller remain
+                # blocked by their own registry contract and schedule checks.
         future_selector = (
             str(changes.get("selector_type", store.selector_type)),
             str(changes.get("selector_value", store.selector_value)).strip(),
@@ -185,11 +187,8 @@ class StoreRepository:
             changes["enabled"] = False
         future_identity = changes.get("identity_confirmed", store.identity_confirmed)
         future_seller = changes.get("expected_seller_id", store.expected_seller_id)
-        future_enabled = changes.get("enabled", store.enabled)
         if future_identity and not future_seller:
             raise ValueError("确认身份前必须填写预期卖家 ID")
-        if future_enabled and not future_identity:
-            raise ValueError("未确认卖家身份的店铺不可启用")
         if changes.get("selector_type", store.selector_type) not in {"oauth", "id"}:
             raise ValueError("selector_type 只能是 oauth 或 id")
         for key, value in changes.items():
@@ -366,9 +365,43 @@ class ScheduleRepository:
     ACTIVE_RUN_STATUSES = frozenset(
         {"QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_AUTH", "RECONCILING"}
     )
+    BLOCKING_NEW_RUN_STATUSES = frozenset(
+        {"NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL"}
+    )
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, workflow_registry: Any | None = None) -> None:
         self.session = session
+        self.workflow_registry = workflow_registry
+
+    def _definition(self, workflow: str) -> Any:
+        if self.workflow_registry is not None:
+            try:
+                return self.workflow_registry.definition(workflow)
+            except LookupError as exc:
+                raise ValueError("工作流不在当前版本的代码白名单中") from exc
+        if workflow != "amazon_disbursement":
+            raise ValueError("工作流不在当前版本的代码白名单中")
+        return SimpleNamespace(
+            key="amazon_disbursement",
+            supported_modes=("dry_run", "approval", "auto"),
+            config_version=1,
+            requires_marketplace_targets=True,
+            requires_confirmed_identity=True,
+        )
+
+    def _normalise_config(
+        self, definition: Any, workflow: str, config: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        if self.workflow_registry is not None:
+            try:
+                return dict(self.workflow_registry.validate_config(workflow, config))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("工作流参数不符合当前版本的固定定义") from exc
+        unknown = set(config) - {"marketplace_codes"}
+        if unknown:
+            raise ValueError("工作流参数包含未注册字段")
+        del definition
+        return dict(config)
 
     def list(self) -> list[Schedule]:
         return list(
@@ -387,7 +420,24 @@ class ScheduleRepository:
         store = self.session.get(Store, values["store_id"])
         if store is None:
             raise NotFoundError("店铺不存在")
-        if values.get("mode") == "auto" and values.get("enabled", False):
+        workflow = str(values.get("workflow") or "amazon_disbursement")
+        definition = self._definition(workflow)
+        mode = str(values.get("mode") or "dry_run")
+        if mode not in {str(item) for item in definition.supported_modes}:
+            raise ValueError(f"工作流不支持运行模式：{mode}")
+        if values.get("enabled", False):
+            if bool(getattr(definition, "requires_confirmed_identity", False)) and (
+                not store.identity_confirmed
+                or not str(store.expected_seller_id or "").strip()
+            ):
+                raise ValueError("未确认身份或未绑定卖家身份，不能启用该排期")
+            if not store.enabled:
+                raise ValueError("店铺尚未启用，不能启用该排期")
+        if (
+            mode == "auto"
+            and values.get("enabled", False)
+            and bool(getattr(definition, "requires_confirmed_identity", False))
+        ):
             if not store.identity_confirmed:
                 raise ValueError("未确认身份的店铺不可设置自动模式")
             # The "two consecutive approval-mode successes" prerequisite was
@@ -396,13 +446,38 @@ class ScheduleRepository:
             # per-run guard (ARMED barrier, DOM contract, plan/snapshot hash,
             # payout-account baseline) is unchanged and still fail-closed.
 
-        codes = values.get("marketplace_codes") or []
-        self._validate_marketplace_codes(
-            store.id,
-            codes,
-            require_payment_account=False,
+        config = self._normalise_config(
+            definition, workflow, dict(values.get("workflow_config") or {})
         )
-        values["marketplace_codes"] = list(dict.fromkeys(str(code).upper() for code in codes))
+        config_codes = config.get("marketplace_codes")
+        legacy_codes = values.get("marketplace_codes")
+        if (
+            bool(getattr(definition, "requires_marketplace_targets", False))
+            and not config_codes
+            and legacy_codes
+        ):
+            config_codes = _normalized_codes(legacy_codes)
+            config["marketplace_codes"] = config_codes
+        if config_codes is not None and legacy_codes is not None:
+            if _normalized_codes(config_codes) != _normalized_codes(legacy_codes):
+                raise ValueError("workflow_config 与 marketplace_codes 不一致")
+        codes = config_codes if config_codes is not None else (legacy_codes or [])
+        normalized_codes = _normalized_codes(codes)
+        if bool(getattr(definition, "requires_marketplace_targets", False)):
+            self._validate_marketplace_codes(
+                store.id,
+                normalized_codes,
+                require_payment_account=False,
+            )
+
+            config["marketplace_codes"] = normalized_codes
+        values["marketplace_codes"] = normalized_codes
+        values["workflow_config"] = config
+        expected_version = int(getattr(definition, "config_version", 1))
+        supplied_version = int(values.get("workflow_config_version", expected_version))
+        if supplied_version != expected_version:
+            raise ValueError("工作流配置版本与当前代码不兼容")
+        values["workflow_config_version"] = expected_version
         schedule = Schedule(**values)
         self.session.add(schedule)
         self.session.flush()
@@ -410,25 +485,93 @@ class ScheduleRepository:
 
     def update(self, schedule_id: int, **changes: Any) -> Schedule:
         schedule = self.get(schedule_id)
+        definition = self._definition(schedule.workflow)
         allowed = {
             "name", "mode", "local_time", "days_of_week", "timezone",
-            "marketplace_codes", "enabled",
+            "marketplace_codes", "workflow_config", "workflow_config_version", "enabled",
         }
         if set(changes) - allowed:
             raise ValueError("包含不允许修改的计划字段")
-        future_codes = changes.get("marketplace_codes", schedule.marketplace_codes)
-        future_mode = changes.get("mode", schedule.mode)
-        self._validate_marketplace_codes(
-            schedule.store_id,
-            future_codes,
-            require_payment_account=False,
+        expected_version = int(getattr(definition, "config_version", 1))
+        config_was_changed = "workflow_config" in changes
+        legacy_codes_were_changed = "marketplace_codes" in changes
+        saved_version_is_current = (
+            int(schedule.workflow_config_version) == expected_version
         )
-        if "marketplace_codes" in changes:
-            changes["marketplace_codes"] = list(
-                dict.fromkeys(str(code).upper() for code in future_codes)
+        disable_only = set(changes) == {"enabled"} and changes["enabled"] is False
+        # A stale schedule must always remain stoppable.  Disabling it is a
+        # pure safety action, so do not force its old snapshot through the new
+        # schema first.  Every other edit is an explicit migration and must
+        # carry the complete current workflow_config; the legacy site list is
+        # not a versioned configuration contract.
+        if not saved_version_is_current and disable_only:
+            schedule.enabled = False
+            self.session.flush()
+            return schedule
+        if not saved_version_is_current and not config_was_changed:
+            raise ValueError(
+                "排期的工作流配置版本与当前代码不兼容，请重新保存流程参数（需完整配置）"
+            )
+        if (
+            "workflow_config_version" in changes
+            and int(changes["workflow_config_version"]) != expected_version
+        ):
+            raise ValueError("工作流配置版本与当前代码不兼容")
+        future_config = self._normalise_config(
+            definition,
+            schedule.workflow,
+            dict(changes.get("workflow_config", schedule.workflow_config) or {}),
+        )
+        config_codes = (
+            future_config.get("marketplace_codes") if config_was_changed else None
+        )
+        changed_codes = changes.get("marketplace_codes")
+        if config_was_changed and legacy_codes_were_changed:
+            if _normalized_codes(config_codes) != _normalized_codes(changed_codes):
+                raise ValueError("workflow_config 与 marketplace_codes 不一致")
+        future_codes = (
+            config_codes
+            if config_was_changed
+            else (
+                changed_codes
+                if legacy_codes_were_changed
+                else future_config.get(
+                    "marketplace_codes", schedule.marketplace_codes
+                )
+            )
+        )
+        future_mode = changes.get("mode", schedule.mode)
+        if str(future_mode) not in {str(item) for item in definition.supported_modes}:
+            raise ValueError(f"工作流不支持运行模式：{future_mode}")
+        normalized_codes = _normalized_codes(future_codes)
+        if bool(getattr(definition, "requires_marketplace_targets", False)):
+            self._validate_marketplace_codes(
+                schedule.store_id,
+                normalized_codes,
+                require_payment_account=False,
+            )
+            future_config["marketplace_codes"] = normalized_codes
+        if "marketplace_codes" in changes or "workflow_config" in changes:
+            changes["marketplace_codes"] = normalized_codes
+            changes["workflow_config"] = future_config
+            changes["workflow_config_version"] = int(
+                getattr(definition, "config_version", 1)
             )
         future_enabled = changes.get("enabled", schedule.enabled)
-        if future_mode == "auto" and future_enabled:
+        if future_enabled:
+            store = self.session.get(Store, schedule.store_id)
+            if not store or not store.enabled:
+                raise ValueError("店铺尚未启用，不能启用该排期")
+            if bool(getattr(definition, "requires_confirmed_identity", False)) and (
+                not store.identity_confirmed
+                or not str(store.expected_seller_id or "").strip()
+            ):
+                raise ValueError("卖家身份尚未绑定并确认，不能启用该排期")
+        if (
+            future_mode == "auto"
+            and future_enabled
+            and bool(getattr(definition, "requires_confirmed_identity", False))
+        ):
             store = self.session.get(Store, schedule.store_id)
             if not store or not store.identity_confirmed:
                 raise ValueError("未确认身份的店铺不可设置自动模式")
@@ -549,19 +692,46 @@ class ScheduleRepository:
         store = self.session.get(Store, schedule.store_id)
         if store is None:
             raise NotFoundError("排期绑定的店铺不存在")
-        requested_codes = set(schedule.marketplace_codes or ())
-        if not requested_codes:
+        definition = self._definition(schedule.workflow)
+        expected_version = int(getattr(definition, "config_version", 1))
+        if int(schedule.workflow_config_version) != expected_version:
+            raise ValueError("排期的工作流配置版本与当前代码不兼容")
+        run_config = self._normalise_config(
+            definition,
+            schedule.workflow,
+            dict(schedule.workflow_config or {}),
+        )
+        requested_codes = set(
+            run_config.get("marketplace_codes") or schedule.marketplace_codes or ()
+        )
+        if bool(getattr(definition, "requires_marketplace_targets", False)) and not requested_codes:
             raise ValueError("排期没有明确选择站点，暂时不能运行")
         # Revalidate at trigger time as well as create/update time. This blocks
         # legacy schedules and rows changed outside the repository from
         # reaching a browser with a disabled or account-less site.
-        self._validate_marketplace_codes(
-            store.id,
-            tuple(requested_codes),
-            require_payment_account=False,
-        )
+        if bool(getattr(definition, "requires_marketplace_targets", False)):
+            self._validate_marketplace_codes(
+                store.id,
+                tuple(requested_codes),
+                require_payment_account=False,
+            )
 
-        run = WorkflowRepository(self.session).create_run(
+        unresolved = self.session.execute(
+            select(Run.id, Run.status)
+            .where(
+                Run.schedule_id == schedule.id,
+                Run.status.in_(self.BLOCKING_NEW_RUN_STATUSES),
+            )
+            .order_by(Run.created_at.desc())
+            .limit(1)
+        ).first()
+        if unresolved is not None:
+            raise ConflictError(
+                "该排期仍有需要人工处理的任务，禁止创建新实例："
+                f"{unresolved.id}（{unresolved.status}）"
+            )
+
+        run = WorkflowRepository(self.session, self.workflow_registry).create_run(
             store_id=schedule.store_id,
             schedule_id=schedule.id,
             workflow=schedule.workflow,
@@ -569,12 +739,23 @@ class ScheduleRepository:
             trigger=trigger,
             requested_by=requested_by,
             scheduled_for_at=scheduled_for_at,
+            workflow_config=run_config,
+            workflow_config_version=schedule.workflow_config_version,
         )
         run.result_summary = {
             "requested_marketplaces": sorted(requested_codes),
             "schedule_id": schedule.id,
             "schedule_name": schedule.name,
             "schedule_trigger": "run_now" if trigger == "manual" else "scheduled",
+            # Queue recovery must not depend on a mutable/deleted Schedule
+            # relationship. These are non-business routing snapshots only.
+            "schedule_batch_id": schedule.batch_id,
+            "schedule_batch_order": schedule.batch_order,
+            "schedule_batch_created_at": (
+                schedule.batch.created_at.isoformat()
+                if schedule.batch is not None and schedule.batch.created_at is not None
+                else None
+            ),
         }
         schedule.last_run_at = utc_now()
         self.session.flush()
@@ -586,8 +767,23 @@ class WorkflowRepository:
 
     FINANCIAL_STATES = frozenset({"ARMED", "SUBMITTED", "CONFIRMED", "UNCERTAIN"})
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, workflow_registry: Any | None = None) -> None:
         self.session = session
+        self.workflow_registry = workflow_registry
+
+    def _definition(self, workflow: str) -> Any:
+        if self.workflow_registry is not None:
+            try:
+                return self.workflow_registry.definition(workflow)
+            except LookupError as exc:
+                raise ValueError("工作流不在当前版本的代码白名单中") from exc
+        if workflow != "amazon_disbursement":
+            raise ValueError("工作流不在当前版本的代码白名单中")
+        return SimpleNamespace(
+            supported_modes=("dry_run", "approval", "auto"),
+            config_version=1,
+            requires_confirmed_identity=True,
+        )
 
     def create_run(
         self,
@@ -599,14 +795,29 @@ class WorkflowRepository:
         trigger: str = "manual",
         requested_by: str = "admin",
         scheduled_for_at: datetime | None = None,
+        workflow_config: Mapping[str, Any] | None = None,
+        workflow_config_version: int = 1,
     ) -> Run:
         store = self.session.get(Store, store_id)
         if store is None:
             raise NotFoundError("店铺不存在")
-        if workflow != "amazon_disbursement":
-            raise ValueError("工作流不在代码白名单")
-        if not store.identity_confirmed or not (store.expected_seller_id or "").strip():
-            raise ValueError("未绑定并确认卖家身份，禁止创建提现任务")
+        definition = self._definition(workflow)
+        if mode not in {str(item) for item in definition.supported_modes}:
+            raise ValueError(f"工作流不支持运行模式：{mode}")
+        expected_version = int(getattr(definition, "config_version", 1))
+        if int(workflow_config_version) != expected_version:
+            raise ValueError("工作流配置版本与当前代码不兼容")
+        config = dict(workflow_config or {})
+        if self.workflow_registry is not None:
+            try:
+                config = dict(self.workflow_registry.validate_config(workflow, config))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("工作流参数不符合当前版本的固定定义") from exc
+        if bool(getattr(definition, "requires_confirmed_identity", False)) and (
+            not store.identity_confirmed
+            or not (store.expected_seller_id or "").strip()
+        ):
+            raise ValueError("未绑定并确认卖家身份，禁止创建该流程任务")
         if not store.enabled:
             raise ValueError("店铺尚未启用")
         # An ``auto`` run no longer requires two prior approval-mode successes;
@@ -621,7 +832,17 @@ class WorkflowRepository:
             active = self.session.scalar(
                 select(Run.id).where(
                     Run.schedule_id == schedule_id,
-                    Run.status.in_(("QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_AUTH", "RECONCILING")),
+                    Run.status.in_(
+                        (
+                            "QUEUED",
+                            "RUNNING",
+                            "WAITING_APPROVAL",
+                            "WAITING_AUTH",
+                            "RECONCILING",
+                            "NEEDS_HUMAN_AUTH",
+                            "UNCERTAIN_FINANCIAL",
+                        )
+                    ),
                 ).limit(1)
             )
             if active:
@@ -634,6 +855,8 @@ class WorkflowRepository:
             trigger=trigger,
             requested_by=requested_by,
             scheduled_for_at=scheduled_for_at,
+            workflow_config=config,
+            workflow_config_version=expected_version,
         )
         self.session.add(run)
         self.session.flush()
@@ -670,6 +893,18 @@ class WorkflowRepository:
         old_status = self.session.scalar(select(Run.status).where(Run.id == run_id))
         if old_status is None:
             raise NotFoundError("任务不存在")
+        if old_status in {
+            "SUCCEEDED",
+            "PARTIAL",
+            "FAILED",
+            "CANCELLED",
+            "SKIPPED",
+        } and to_status != old_status:
+            # Terminal rows are immutable even if a stale caller accidentally
+            # includes the current terminal value in ``allowed_from``.  This
+            # is the database-side backstop for a worker that finishes after a
+            # concurrent cancellation request.
+            return False
         values: dict[str, Any] = {"status": to_status, "error": error, "updated_at": utc_now()}
         if to_status == "RUNNING":
             values["started_at"] = utc_now()
@@ -965,6 +1200,20 @@ class DashboardRepository:
 
 def _seller_identity(value: Any) -> str:
     return " ".join(str(value or "").split()).casefold()
+
+
+def _normalized_codes(values: Sequence[Any] | Any) -> list[str]:
+    if values is None:
+        return []
+    if isinstance(values, (str, bytes)):
+        values = [values]
+    return list(
+        dict.fromkeys(
+            str(code).strip().upper()
+            for code in values
+            if str(code).strip()
+        )
+    )
 
 
 # ``has_auto_mode_qualification`` used to live here and required the store's

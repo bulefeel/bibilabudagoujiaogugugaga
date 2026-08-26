@@ -84,10 +84,6 @@ class Store(TimestampMixin, Base):
 
     __table_args__ = (
         CheckConstraint("selector_type IN ('oauth','id')", name="ck_store_selector_type"),
-        CheckConstraint(
-            "enabled = 0 OR identity_confirmed = 1",
-            name="ck_store_enabled_requires_identity",
-        ),
     )
 
 
@@ -117,6 +113,34 @@ class StoreMarketplace(TimestampMixin, Base):
     )
 
 
+class ScheduleBatch(TimestampMixin, Base):
+    """Idempotency and audit envelope for one multi-store schedule request.
+
+    The executable unit deliberately remains :class:`Schedule`: every store
+    gets its own row, run history and failure boundary.  This parent only
+    proves which rows were created by one operator action and makes an HTTP
+    retry safe.
+    """
+
+    __tablename__ = "schedule_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    request_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    definition_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    definition_json: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict, nullable=False
+    )
+    schedule_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+
+    schedules: Mapped[list["Schedule"]] = relationship(back_populates="batch")
+
+    __table_args__ = (
+        CheckConstraint("schedule_count >= 0", name="ck_schedule_batch_count"),
+        UniqueConstraint("request_id", name="uq_schedule_batches_request_id"),
+        Index("ix_schedule_batches_created_at", "created_at"),
+    )
+
+
 class Schedule(TimestampMixin, Base):
     __tablename__ = "schedules"
 
@@ -124,6 +148,10 @@ class Schedule(TimestampMixin, Base):
     store_id: Mapped[int] = mapped_column(
         ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    batch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("schedule_batches.id", ondelete="SET NULL"), index=True
+    )
+    batch_order: Mapped[int | None] = mapped_column(Integer)
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     workflow: Mapped[str] = mapped_column(
         String(80), default="amazon_disbursement", nullable=False
@@ -135,17 +163,34 @@ class Schedule(TimestampMixin, Base):
     marketplace_codes: Mapped[list[str]] = mapped_column(
         MutableList.as_mutable(JSON), default=list, nullable=False
     )
+    workflow_config: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        default=dict,
+        server_default=text("'{}'"),
+        nullable=False,
+    )
+    workflow_config_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     misfire_grace_seconds: Mapped[int] = mapped_column(Integer, default=1800, nullable=False)
     last_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     next_run_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     store: Mapped[Store] = relationship(back_populates="schedules")
+    batch: Mapped[ScheduleBatch | None] = relationship(back_populates="schedules")
     runs: Mapped[list["Run"]] = relationship(back_populates="schedule")
 
     __table_args__ = (
         CheckConstraint("mode IN ('dry_run','approval','auto')", name="ck_schedule_mode"),
         CheckConstraint("misfire_grace_seconds BETWEEN 0 AND 1800", name="ck_misfire_grace"),
+        CheckConstraint(
+            "workflow_config_version >= 1", name="ck_schedule_workflow_config_version"
+        ),
+        CheckConstraint(
+            "batch_order IS NULL OR batch_order >= 1", name="ck_schedule_batch_order"
+        ),
+        UniqueConstraint("batch_id", "batch_order", name="uq_schedule_batch_order"),
     )
 
 
@@ -175,6 +220,17 @@ class Run(TimestampMixin, Base):
     result_summary: Mapped[dict[str, Any]] = mapped_column(
         MutableDict.as_mutable(JSON), default=dict, nullable=False
     )
+    # Immutable input snapshot.  Runtime code must not reread mutable schedule
+    # configuration after a run has been created.
+    workflow_config: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON),
+        default=dict,
+        server_default=text("'{}'"),
+        nullable=False,
+    )
+    workflow_config_version: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
 
     store: Mapped[Store] = relationship(back_populates="runs")
     schedule: Mapped[Schedule | None] = relationship(back_populates="runs")
@@ -200,6 +256,9 @@ class Run(TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("mode IN ('dry_run','approval','auto')", name="ck_run_mode"),
         CheckConstraint("trigger IN ('manual','schedule','recovery')", name="ck_run_trigger"),
+        CheckConstraint(
+            "workflow_config_version >= 1", name="ck_run_workflow_config_version"
+        ),
         Index("ix_runs_schedule_active", "schedule_id", "status"),
         Index(
             "uq_runs_schedule_occurrence",
@@ -229,6 +288,20 @@ class RunQueueEntry(TimestampMixin, Base):
     )
     action: Mapped[str] = mapped_column(String(24), default="START", nullable=False)
     priority: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    # Workflow priority is copied when the entry is created so later registry
+    # edits cannot reorder work already waiting in the durable queue.
+    business_priority: Mapped[int] = mapped_column(
+        Integer, default=1, server_default=text("1"), nullable=False
+    )
+    target_order: Mapped[int] = mapped_column(
+        Integer,
+        default=2_147_483_647,
+        server_default=text("2147483647"),
+        nullable=False,
+    )
+    # Snapshot only (not a FK): keeps one batch contiguous even if two batch
+    # timestamps collide or the source schedules are later deleted.
+    batch_scope_id: Mapped[int | None] = mapped_column(Integer)
     state: Mapped[str] = mapped_column(String(16), default="READY", nullable=False)
     scheduled_for_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     enqueued_at: Mapped[datetime] = mapped_column(
@@ -251,6 +324,14 @@ class RunQueueEntry(TimestampMixin, Base):
         ),
         CheckConstraint("priority IN (0,10,100)", name="ck_run_queue_priority"),
         CheckConstraint(
+            "business_priority >= 0", name="ck_run_queue_business_priority"
+        ),
+        CheckConstraint("target_order >= 1", name="ck_run_queue_target_order"),
+        CheckConstraint(
+            "batch_scope_id IS NULL OR batch_scope_id >= 1",
+            name="ck_run_queue_batch_scope_id",
+        ),
+        CheckConstraint(
             "state IN ('READY','CLAIMED','DONE','CANCELLED')",
             name="ck_run_queue_state",
         ),
@@ -265,7 +346,10 @@ class RunQueueEntry(TimestampMixin, Base):
             "state",
             "priority",
             "scheduled_for_at",
+            "business_priority",
             "enqueued_at",
+            "batch_scope_id",
+            "target_order",
             "id",
         ),
     )

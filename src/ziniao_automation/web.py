@@ -43,7 +43,11 @@ from .repositories import (
     StoreRepository,
     WorkflowRepository,
 )
+from .schedule_batch import BatchScheduleService, BatchScheduleValidationError
+from .scheduler import ScheduleProjectionReport
 from .schemas import (
+    BatchScheduleCreateInput,
+    BatchSchedulePreviewInput,
     BootstrapInput,
     FeishuSettingsInput,
     LoginInput,
@@ -51,6 +55,8 @@ from .schemas import (
     RunCreate,
     RunView,
     ScheduleCreate,
+    ScheduleDeleteView,
+    ScheduleMutationView,
     SchedulePatch,
     ScheduleView,
     StoreCreate,
@@ -60,6 +66,9 @@ from .schemas import (
     ZiniaoSettingsInput,
 )
 from .version import __version__, build_commit
+from .workflows import WorkflowRegistry
+from .workflows.amazon_disbursement import build_amazon_disbursement_definition
+from .workflows.errors import WorkflowNotRegistered
 from .ziniao.credentials import (
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
@@ -69,8 +78,11 @@ from .ziniao.credentials import (
     read_generic_credential,
     write_generic_credential,
 )
+from .ziniao.errors import ZiniaoCredentialError
 
 logger = logging.getLogger(__name__)
+
+_ZINIAO_CREDENTIAL_ERROR_CODE = "ZINIAO_CREDENTIALS_INVALID"
 
 
 def _release_before_automation(db: Session) -> None:
@@ -171,6 +183,10 @@ class UnconfiguredAutomationService:
         del store_id
         return False
 
+    async def get_active_store_setup_probe(self, store_id: int) -> dict[str, Any] | None:
+        del store_id
+        return None
+
     async def enqueue_run(self, run_id: str) -> None:
         raise RuntimeError("自动化运行服务尚未配置")
 
@@ -235,6 +251,10 @@ def _attach_queue_projection(db: Session, runs: list[Run]) -> None:
                 func.coalesce(
                     RunQueueEntry.scheduled_for_at, RunQueueEntry.enqueued_at
                 ).asc(),
+                RunQueueEntry.business_priority.asc(),
+                RunQueueEntry.enqueued_at.asc(),
+                RunQueueEntry.batch_scope_id.asc(),
+                RunQueueEntry.target_order.asc(),
                 RunQueueEntry.id.asc(),
             )
         )
@@ -272,7 +292,10 @@ def _attach_queue_projection(db: Session, runs: list[Run]) -> None:
             ready_positions.get(entry.id) if entry and entry.state == "READY" else None
         )
         run.queue_action = entry.action if entry else None
-        run.queued_at = entry.enqueued_at if entry else None
+        # Scheduled batch entries reuse ``enqueued_at`` as an immutable group
+        # ordering anchor.  ``created_at`` remains the real insertion time the
+        # operator expects to see in run history.
+        run.queued_at = entry.created_at if entry else None
 
 
 def create_app(
@@ -280,6 +303,7 @@ def create_app(
     *,
     automation_service: AutomationService | None = None,
     runtime_factory: Any | None = None,
+    workflow_registry: WorkflowRegistry | None = None,
 ) -> FastAPI:
     settings = settings or Settings.from_env()
     engine = create_sqlite_engine(settings)
@@ -308,6 +332,9 @@ def create_app(
                 app.state.runtime = runtime
                 app.state.automation_service = runtime.automation_service
                 app.state.schedule_manager = runtime.schedule_manager
+                runtime_registry = getattr(runtime, "workflow_registry", None)
+                if runtime_registry is not None:
+                    app.state.workflow_registry = runtime_registry
                 await runtime.start()
             yield
         finally:
@@ -328,6 +355,9 @@ def create_app(
     app.state.sessions = sessions
     app.state.automation_service = automation_service or UnconfiguredAutomationService()
     app.state.schedule_manager = None
+    app.state.workflow_registry = workflow_registry or WorkflowRegistry(
+        (build_amazon_disbursement_definition(),)
+    )
     app.state.templates = templates
     app.add_middleware(
         TrustedHostMiddleware,
@@ -524,7 +554,26 @@ def create_app(
 
     @app.get("/schedules", response_class=HTMLResponse)
     def schedules_page(request: Request, db: Session = Depends(get_session)) -> Response:
-        return render(request, "schedules.html", {"schedules": ScheduleRepository(db).list(), "stores": StoreRepository(db).list(enabled=True)}, db=db, page_title="任务排期")
+        registry = getattr(request.app.state, "workflow_registry", None)
+        metadata = list(registry.public_metadata()) if registry is not None else []
+        return render(
+            request,
+            "schedules.html",
+            {
+                "schedules": ScheduleRepository(db).list(),
+                # Ineligible stores stay visible so preview can explain what
+                # must be fixed instead of silently hiding an account.
+                "stores": StoreRepository(db).list(),
+                "workflow_labels": {
+                    item["key"]: item["display_name"] for item in metadata
+                },
+                "workflow_definitions": {
+                    item["key"]: item for item in metadata
+                },
+            },
+            db=db,
+            page_title="任务排期",
+        )
 
     @app.get("/approvals", response_class=HTMLResponse)
     def approvals_page(request: Request, db: Session = Depends(get_session)) -> Response:
@@ -535,14 +584,42 @@ def create_app(
     def runs_page(request: Request, db: Session = Depends(get_session)) -> Response:
         runs = WorkflowRepository(db).list_runs(limit=200)
         _attach_queue_projection(db, runs)
-        return render(request, "runs.html", {"runs": runs}, db=db, page_title="运行流水")
+        registry = getattr(request.app.state, "workflow_registry", None)
+        metadata = list(registry.public_metadata()) if registry is not None else []
+        return render(
+            request,
+            "runs.html",
+            {
+                "runs": runs,
+                "workflow_labels": {
+                    item["key"]: item["display_name"] for item in metadata
+                },
+            },
+            db=db,
+            page_title="运行流水",
+        )
 
     @app.get("/runs/{run_id}", response_class=HTMLResponse)
     def run_detail(run_id: str, request: Request, db: Session = Depends(get_session)) -> Response:
         run = WorkflowRepository(db).get_run(run_id, full=True)
         _attach_queue_projection(db, [run])
         guards = list(db.scalars(select(OperationGuard).where(OperationGuard.run_id == run_id)))
-        return render(request, "run_detail.html", {"run": run, "guards": guards}, db=db, page_title=f"任务 {run.id[:8]}")
+        registry = getattr(request.app.state, "workflow_registry", None)
+        definitions = {
+            item["key"]: item
+            for item in (registry.public_metadata() if registry is not None else ())
+        }
+        return render(
+            request,
+            "run_detail.html",
+            {
+                "run": run,
+                "guards": guards,
+                "workflow_meta": definitions.get(run.workflow),
+            },
+            db=db,
+            page_title=f"任务 {run.id[:8]}",
+        )
 
     @app.get("/diagnostics", response_class=HTMLResponse)
     def diagnostics_page(request: Request, db: Session = Depends(get_session)) -> Response:
@@ -603,6 +680,172 @@ def create_app(
         return FileResponse(path, filename=path.name)
 
     api = APIRouter(prefix="/api", dependencies=[Depends(current_admin)])
+
+    def active_workflow_registry(request: Request) -> WorkflowRegistry:
+        registry = getattr(request.app.state, "workflow_registry", None)
+        if not isinstance(registry, WorkflowRegistry):
+            raise HTTPException(503, "工作流注册表尚未初始化")
+        return registry
+
+    async def refresh_schedule_projection(
+        manager: Any, schedule_id: int
+    ) -> ScheduleProjectionReport | None:
+        """Return the scheduler report from one-row or full-refresh adapters."""
+
+        refresh_one = getattr(manager, "refresh_schedule", None)
+        if callable(refresh_one):
+            return await refresh_one(schedule_id)
+        refresh_all = getattr(manager, "refresh", None)
+        if callable(refresh_all):
+            return await refresh_all()
+        raise RuntimeError("当前定时器不支持刷新")
+
+    async def schedule_mutation_projection(
+        request: Request,
+        *,
+        schedule_id: int,
+        expects_projection: bool,
+        durable_action: str,
+    ) -> dict[str, Any]:
+        """Describe projection lag without turning a committed write into 5xx.
+
+        A create request is not idempotent, and neither patch nor delete needs
+        to be replayed once SQLite has committed.  Projection trouble must
+        therefore remain a successful durable response with an explicit
+        do-not-repeat warning.  A later process restart rebuilds APScheduler
+        from SQLite.
+        """
+
+        manager = request.app.state.schedule_manager
+        if manager is None:
+            return {
+                "scheduler_refreshed": False,
+                "scheduler_failed_schedule_ids": [schedule_id],
+                "warning": (
+                    f"{durable_action}，但当前进程没有定时器，尚未应用到运行计划；"
+                    "请不要重复提交本次操作。重启后台会按数据库记录自动重新加载。"
+                ),
+            }
+
+        try:
+            projection = await refresh_schedule_projection(manager, schedule_id)
+            # Compatibility with small embedded/test adapters that predate the
+            # structured report. Production ScheduleManager always returns it.
+            if projection is None:
+                return {"scheduler_refreshed": True}
+
+            reported_projected = getattr(
+                projection, "projected_schedule_ids", None
+            )
+            reported_failures = getattr(projection, "failed_schedule_ids", None)
+            if reported_projected is None or reported_failures is None:
+                raise RuntimeError("定时器刷新结果格式无效")
+            projected_schedule_ids = frozenset(
+                int(item) for item in reported_projected
+            )
+            failed_schedule_ids = frozenset(
+                int(item) for item in reported_failures
+            )
+            target_is_projected = schedule_id in projected_schedule_ids
+            target_failed = (
+                schedule_id in failed_schedule_ids
+                or target_is_projected != expects_projection
+            )
+            if not target_failed:
+                # A malformed unrelated legacy row is isolated by refresh().
+                # It must not make this successfully projected mutation look
+                # unsuccessful to the operator.
+                return {"scheduler_refreshed": True}
+
+            logger.error(
+                "schedule_mutation_projection_incomplete schedule_id=%s "
+                "expects_projection=%s projected=%s reported_failed=%s",
+                schedule_id,
+                expects_projection,
+                target_is_projected,
+                schedule_id in failed_schedule_ids,
+            )
+        except Exception:
+            # SQLite is already authoritative. Raising here would invite an
+            # unsafe duplicate create/replay while not undoing the first write.
+            logger.exception(
+                "schedule_mutation_refresh_failed schedule_id=%s", schedule_id
+            )
+
+        return {
+            "scheduler_refreshed": False,
+            "scheduler_failed_schedule_ids": [schedule_id],
+            "warning": (
+                f"{durable_action}，但定时器尚未应用这次变更；"
+                "请不要重复提交本次操作。重启后台会按数据库记录自动重新加载。"
+            ),
+        }
+
+    def normalise_workflow_input(
+        request: Request,
+        *,
+        workflow: str,
+        mode: str,
+        workflow_config: dict[str, Any] | None,
+        marketplace_codes: list[str] | None = None,
+    ) -> tuple[dict[str, Any], int, list[str]]:
+        """Validate one schedule/run input through the code-only registry.
+
+        ``marketplace_codes`` remains an HTTP compatibility field for the
+        existing console and older clients.  The versioned workflow config is
+        authoritative for every newly persisted row.
+        """
+
+        registry = active_workflow_registry(request)
+        try:
+            definition = registry.definition(workflow)
+        except WorkflowNotRegistered as exc:
+            raise ValueError("工作流不在当前版本的代码白名单中") from exc
+        supported = {item.value for item in definition.supported_modes}
+        if mode not in supported:
+            raise ValueError(f"工作流不支持运行模式：{mode}")
+
+        config = dict(workflow_config or {})
+
+        def normalized_codes(values: Any) -> list[str]:
+            """Compare legacy and versioned inputs using registry semantics.
+
+            Older clients may send lower-case or repeated marketplace codes,
+            while the registered workflow normalizes them to upper-case unique
+            values.  Normalize both sides before the compatibility comparison
+            so two equivalent requests are not rejected merely because their
+            spelling differs.
+            """
+
+            return list(
+                dict.fromkeys(
+                    str(code).strip().upper()
+                    for code in (values or [])
+                    if str(code).strip()
+                )
+            )
+
+        legacy_codes = normalized_codes(marketplace_codes)
+        if definition.requires_marketplace_targets:
+            configured = normalized_codes(config.get("marketplace_codes"))
+            if configured and legacy_codes and configured != legacy_codes:
+                raise ValueError("站点参数前后不一致，请刷新页面后重新选择")
+            if not configured and legacy_codes:
+                config["marketplace_codes"] = legacy_codes
+        try:
+            normalized = registry.validate_config(workflow, config)
+        except (ValidationError, TypeError, ValueError) as exc:
+            raise ValueError("工作流参数不符合当前版本的固定定义") from exc
+        codes = [str(code).upper() for code in normalized.get("marketplace_codes", [])]
+        if definition.requires_marketplace_targets and not codes:
+            raise ValueError("请至少选择一个站点")
+        return normalized, int(definition.config_version), codes
+
+    @api.get("/workflows")
+    def api_workflows(request: Request) -> list[dict[str, Any]]:
+        """Return only the registry's fixed, non-sensitive form metadata."""
+
+        return list(active_workflow_registry(request).public_metadata())
 
     @api.post("/settings/feishu", status_code=200)
     async def save_feishu_settings(
@@ -1001,10 +1244,56 @@ def create_app(
             result = await detector(store_id, payload.marketplace_codes)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
+        except ZiniaoCredentialError as exc:
+            # Keep this a system-level, machine-readable conflict.  The
+            # browser can pause a multi-store queue at its current position
+            # instead of counting every store as a separate launch failure.
+            safe_message = _safe_probe_error(exc).removeprefix(
+                f"{type(exc).__name__}: "
+            )
+            raise HTTPException(
+                409,
+                detail={
+                    "code": _ZINIAO_CREDENTIAL_ERROR_CODE,
+                    "message": (
+                        "紫鸟凭据预检未通过："
+                        f"{safe_message}。"
+                        "请到“系统诊断”重新保存紫鸟公司、账号和密码后重试。"
+                    ),
+                },
+            ) from exc
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
         waiting = result.get("status") in {"WAITING_AUTH", "CHECKING"}
         return JSONResponse(result, status_code=202 if waiting else 200)
+
+    @api.get("/stores/{store_id}/store-setup-probe")
+    async def api_get_active_store_setup_probe(
+        store_id: int,
+        request: Request,
+        db: Session = Depends(get_session),
+    ) -> Response:
+        """The probe currently holding this store, without needing its id.
+
+        The editor opens against whatever the server says is running, instead of
+        relying on a ``probe_id`` the browser may have dropped on a reload.  A
+        service that cannot answer degrades to "nothing running" rather than
+        failing: this is the call that restores the editor, and it must never be
+        the reason the editor will not open.
+        """
+
+        StoreRepository(db).get(store_id)
+        lookup = getattr(
+            request.app.state.automation_service,
+            "get_active_store_setup_probe",
+            None,
+        )
+        if not callable(lookup):
+            return Response(status_code=204)
+        payload = await lookup(store_id)
+        if payload is None:
+            return Response(status_code=204)
+        return JSONResponse(payload)
 
     @api.get("/stores/{store_id}/store-setup-probes/{probe_id}")
     async def api_get_store_setup_probe(
@@ -1052,13 +1341,43 @@ def create_app(
     ) -> Any:
         return StoreRepository(db).create(**payload.model_dump())
 
+    async def _require_no_active_store_setup(request: Request, store_id: int) -> None:
+        """Refuse to rewrite a store while a probe is driving its browser.
+
+        Both writers on the store editor need this.  Reset used to be the only
+        guarded one, which made the guard theatre: 「保存建档」 sits directly
+        above 「删除 / 重置建档」, carries the same identity fields, and also
+        calls ``replace_marketplaces`` — flipping the very site rows that reset
+        deliberately leaves alone.  The blocked path was strictly gentler than
+        the open one.
+        """
+
+        active_check = getattr(
+            request.app.state.automation_service, "has_active_store_setup", None
+        )
+        if not callable(active_check):
+            raise HTTPException(503, "店铺建档活动状态检查服务尚未配置")
+        try:
+            if await active_check(store_id):
+                raise ConflictError(
+                    "该店铺的统一建档正在运行，正占用对应的紫鸟店铺窗口。"
+                    "请先在该店铺的建档窗口点击「取消并关闭该店铺窗口」，"
+                    "或等待本次检测结束后再操作。"
+                )
+        except ConflictError:
+            raise
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+
     @api.patch("/stores/{store_id}", response_model=StoreView)
-    def api_patch_store(
+    async def api_patch_store(
         store_id: int,
         payload: StorePatch,
+        request: Request,
         _: AuthenticatedAdmin = Depends(verified_admin),
         db: Session = Depends(get_session),
     ) -> Any:
+        await _require_no_active_store_setup(request, store_id)
         changes = payload.model_dump(exclude_unset=True)
         marketplaces = changes.pop("marketplaces", None)
         repo = StoreRepository(db)
@@ -1081,20 +1400,7 @@ def create_app(
     ) -> Any:
         repo = StoreRepository(db)
         repo.get(store_id)
-        active_check = getattr(
-            request.app.state.automation_service, "has_active_store_setup", None
-        )
-        if not callable(active_check):
-            raise HTTPException(503, "店铺建档活动状态检查服务尚未配置")
-        try:
-            if await active_check(store_id):
-                raise ConflictError(
-                    "该店铺仍有身份与站点核验窗口正在运行，请先完成或取消检测"
-                )
-        except ConflictError:
-            raise
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from exc
+        await _require_no_active_store_setup(request, store_id)
 
         store, disabled_schedule_ids = repo.reset_setup(store_id)
         # SQLite must become authoritative before the in-memory scheduler is
@@ -1102,9 +1408,8 @@ def create_app(
         # will find enabled=False and create no task.
         db.commit()
         manager = request.app.state.schedule_manager
-        if manager is not None:
-            for schedule_id in disabled_schedule_ids:
-                await manager.refresh_schedule(schedule_id)
+        if manager is not None and disabled_schedule_ids:
+            await refresh_schedule_projection(manager, disabled_schedule_ids[0])
         db.expire(store, ["marketplaces"])
         store = repo.get(store_id)
         return {
@@ -1117,21 +1422,168 @@ def create_app(
     def api_schedules(db: Session = Depends(get_session)) -> list[Any]:
         return ScheduleRepository(db).list()
 
-    @api.post("/schedules", response_model=ScheduleView, status_code=201)
+    @api.post("/schedules/batch/preview")
+    def api_preview_schedule_batch(
+        payload: BatchSchedulePreviewInput,
+        request: Request,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        template = payload.template.model_dump()
+        config, _, _ = normalise_workflow_input(
+            request,
+            workflow=payload.template.workflow,
+            mode=payload.template.mode,
+            workflow_config=payload.template.workflow_config,
+        )
+        template["workflow_config"] = config
+        return BatchScheduleService(
+            db, active_workflow_registry(request)
+        ).preview(
+            store_ids=payload.store_ids,
+            template=template,
+        )
+
+    @api.post("/schedules/batch", status_code=201)
+    async def api_create_schedule_batch(
+        payload: BatchScheduleCreateInput,
+        request: Request,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        service = BatchScheduleService(db, active_workflow_registry(request))
+        template = payload.template.model_dump()
+        config, _, _ = normalise_workflow_input(
+            request,
+            workflow=payload.template.workflow,
+            mode=payload.template.mode,
+            workflow_config=payload.template.workflow_config,
+        )
+        template["workflow_config"] = config
+        # Authentication and CSRF checks have already completed.  End their
+        # read transaction so BatchScheduleService can reserve SQLite with
+        # BEGIN IMMEDIATE before the idempotency lookup and all child inserts.
+        db.commit()
+        try:
+            result = service.create(
+                request_id=str(payload.request_id),
+                store_ids=payload.store_ids,
+                template=template,
+            )
+        except BatchScheduleValidationError as exc:
+            raise HTTPException(status_code=422, detail=exc.preview) from exc
+        db.commit()
+
+        # SQLite is authoritative.  One full refresh projects every new child
+        # into APScheduler and avoids N repeated rebuilds for an N-store batch.
+        manager = request.app.state.schedule_manager
+        result["scheduler_refreshed"] = False
+        if manager is None:
+            result["warning"] = (
+                "排期已保存，但当前进程没有定时器；请重启后台后再确认，"
+                "不要重新新建排期。"
+            )
+        else:
+            try:
+                refresh = getattr(manager, "refresh", None)
+                if not callable(refresh):
+                    raise RuntimeError("当前定时器不支持完整刷新")
+                projection = await refresh()
+                failed_schedule_ids = frozenset()
+                # ``None`` keeps compatibility with small embedded adapters;
+                # the production ScheduleManager returns a structured report.
+                if projection is not None:
+                    reported_failures = getattr(
+                        projection, "failed_schedule_ids", None
+                    )
+                    if reported_failures is None:
+                        raise RuntimeError("定时器刷新结果格式无效")
+                    failed_schedule_ids = frozenset(
+                        int(schedule_id) for schedule_id in reported_failures
+                    )
+                batch_schedule_ids = {
+                    int(item["id"]) for item in result.get("schedules", ())
+                }
+                failed_batch_schedule_ids = sorted(
+                    batch_schedule_ids & failed_schedule_ids
+                )
+                if failed_batch_schedule_ids:
+                    logger.error(
+                        "schedule_batch_projection_incomplete batch_id=%s schedule_ids=%s",
+                        result.get("batch_id"),
+                        failed_batch_schedule_ids,
+                    )
+                    result["scheduler_failed_schedule_ids"] = (
+                        failed_batch_schedule_ids
+                    )
+                    result["scheduler_refreshed"] = False
+                    result["warning"] = (
+                        "排期已保存，但本批次有启用排期未成功加载到定时器；"
+                        "请使用同一批次重试，不要重新创建排期。重启后台也会自动重新加载。"
+                    )
+                else:
+                    # Unrelated malformed legacy schedules remain isolated and
+                    # must not make this healthy batch look unprojected.
+                    result["scheduler_refreshed"] = True
+            except Exception:
+                # The batch is already durable.  Report projection lag without
+                # turning a successful idempotent write into a client retry
+                # loop; retrying the same UUID will attempt refresh again.
+                logger.exception(
+                    "schedule_batch_refresh_failed batch_id=%s",
+                    result.get("batch_id"),
+                )
+                result["scheduler_refreshed"] = False
+                result["warning"] = (
+                    "排期已保存，但定时器刷新失败；请在当前页面使用同一批次重试，"
+                    "不要重新新建排期。重启后台也会自动重新加载。"
+                )
+        return result
+
+    @api.post(
+        "/schedules",
+        response_model=ScheduleMutationView,
+        response_model_exclude_none=True,
+        status_code=201,
+    )
     async def api_create_schedule(
         payload: ScheduleCreate,
         request: Request,
         _: AuthenticatedAdmin = Depends(verified_admin),
         db: Session = Depends(get_session),
     ) -> Any:
-        schedule = ScheduleRepository(db).create(**payload.model_dump())
+        values = payload.model_dump()
+        config, version, codes = normalise_workflow_input(
+            request,
+            workflow=payload.workflow,
+            mode=payload.mode,
+            workflow_config=payload.workflow_config,
+            marketplace_codes=list(payload.marketplace_codes),
+        )
+        values.update(
+            workflow_config=config,
+            workflow_config_version=version,
+            marketplace_codes=codes,
+        )
+        schedule = ScheduleRepository(
+            db, active_workflow_registry(request)
+        ).create(**values)
         db.commit()
-        manager = request.app.state.schedule_manager
-        if manager is not None:
-            await manager.refresh_schedule(schedule.id)
-        return schedule
+        projection = await schedule_mutation_projection(
+            request,
+            schedule_id=schedule.id,
+            expects_projection=bool(schedule.enabled),
+            durable_action="排期已保存",
+        )
+        result = ScheduleView.model_validate(schedule).model_dump()
+        result.update(projection)
+        return result
 
-    @api.patch("/schedules/{schedule_id}", response_model=ScheduleView)
+    @api.patch(
+        "/schedules/{schedule_id}",
+        response_model=ScheduleMutationView,
+        response_model_exclude_none=True,
+    )
     async def api_patch_schedule(
         schedule_id: int,
         payload: SchedulePatch,
@@ -1139,14 +1591,56 @@ def create_app(
         _: AuthenticatedAdmin = Depends(verified_admin),
         db: Session = Depends(get_session),
     ) -> Any:
-        schedule = ScheduleRepository(db).update(schedule_id, **payload.model_dump(exclude_unset=True))
+        repo = ScheduleRepository(db, active_workflow_registry(request))
+        schedule = repo.get(schedule_id)
+        changes = payload.model_dump(exclude_unset=True)
+        future_mode = str(changes.get("mode", schedule.mode))
+        supplied_config = changes.get("workflow_config")
+        supplied_codes = changes.get("marketplace_codes")
+        if supplied_config is not None or supplied_codes is not None or "mode" in changes:
+            effective_config = (
+                dict(supplied_config)
+                if supplied_config is not None
+                else dict(schedule.workflow_config or {})
+            )
+            # Legacy clients only know marketplace_codes.  Treat that field as
+            # an update to the canonical payout config rather than comparing it
+            # with the old snapshot and rejecting every real change.
+            if supplied_config is None and supplied_codes is not None:
+                effective_config["marketplace_codes"] = list(supplied_codes)
+            config, version, codes = normalise_workflow_input(
+                request,
+                workflow=schedule.workflow,
+                mode=future_mode,
+                workflow_config=effective_config,
+                marketplace_codes=(
+                    list(supplied_codes)
+                    if supplied_codes is not None
+                    else list(schedule.marketplace_codes or [])
+                ),
+            )
+            changes.update(
+                workflow_config=config,
+                workflow_config_version=version,
+                marketplace_codes=codes,
+            )
+        schedule = repo.update(schedule_id, **changes)
         db.commit()
-        manager = request.app.state.schedule_manager
-        if manager is not None:
-            await manager.refresh_schedule(schedule.id)
-        return schedule
+        projection = await schedule_mutation_projection(
+            request,
+            schedule_id=schedule.id,
+            expects_projection=bool(schedule.enabled),
+            durable_action="排期修改已保存",
+        )
+        result = ScheduleView.model_validate(schedule).model_dump()
+        result.update(projection)
+        return result
 
-    @api.delete("/schedules/{schedule_id}")
+    @api.delete(
+        "/schedules/{schedule_id}",
+        response_model=ScheduleDeleteView,
+        response_model_exclude_none=True,
+    )
     async def api_delete_schedule(
         schedule_id: int,
         request: Request,
@@ -1158,10 +1652,17 @@ def create_app(
         # authoritative; even if an old callback is already queued it will
         # find no schedule and perform no browser/financial action.
         db.commit()
-        manager = request.app.state.schedule_manager
-        if manager is not None:
-            await manager.refresh_schedule(schedule_id)
-        return {"status": "deleted", "schedule_id": schedule_id}
+        projection = await schedule_mutation_projection(
+            request,
+            schedule_id=schedule_id,
+            expects_projection=False,
+            durable_action="排期已删除",
+        )
+        return {
+            "status": "deleted",
+            "schedule_id": schedule_id,
+            **projection,
+        }
 
     @api.post("/schedules/{schedule_id}/run-now", status_code=202)
     async def api_run_schedule_now(
@@ -1181,7 +1682,11 @@ def create_app(
             # APScheduler jobs; it only reuses the guarded run-now operation.
             from .scheduler import ScheduleManager
 
-            manager = ScheduleManager(request.app.state.sessions, service)
+            manager = ScheduleManager(
+                request.app.state.sessions,
+                service,
+                workflow_registry=active_workflow_registry(request),
+            )
         try:
             run_id = await manager.run_now(schedule_id, requested_by=admin.username)
         except ConflictError:
@@ -1204,12 +1709,30 @@ def create_app(
         if isinstance(request.app.state.automation_service, UnconfiguredAutomationService):
             raise HTTPException(503, "自动化运行服务尚未配置")
         store = StoreRepository(db).get(payload.store_id)
-        requested = set(payload.marketplace_codes or [m.code for m in store.marketplaces if m.enabled])
+        requested_input = payload.marketplace_codes
+        if requested_input is None and not payload.workflow_config:
+            requested_input = [m.code for m in store.marketplaces if m.enabled]
+        config, version, codes = normalise_workflow_input(
+            request,
+            workflow=payload.workflow,
+            mode=payload.mode,
+            workflow_config=payload.workflow_config,
+            marketplace_codes=(list(requested_input) if requested_input is not None else None),
+        )
+        requested = set(codes)
         enabled = {m.code for m in store.marketplaces if m.enabled}
-        if not requested or not requested.issubset(enabled):
+        definition = active_workflow_registry(request).definition(payload.workflow)
+        if definition.requires_marketplace_targets and (
+            not requested or not requested.issubset(enabled)
+        ):
             raise HTTPException(422, "请选择该店铺已启用的站点")
-        run = WorkflowRepository(db).create_run(
-            store_id=payload.store_id, workflow=payload.workflow, mode=payload.mode
+        workflow_repo = WorkflowRepository(db, active_workflow_registry(request))
+        run = workflow_repo.create_run(
+            store_id=payload.store_id,
+            workflow=payload.workflow,
+            mode=payload.mode,
+            workflow_config=config,
+            workflow_config_version=version,
         )
         run.result_summary = {"requested_marketplaces": sorted(requested)}
         db.commit()
@@ -1217,7 +1740,7 @@ def create_app(
             await request.app.state.automation_service.enqueue_run(run.id)
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
-        return WorkflowRepository(db).get_run(run.id, full=True)
+        return workflow_repo.get_run(run.id, full=True)
 
     @api.get("/runs/{run_id}", response_model=RunView)
     def api_get_run(run_id: str, db: Session = Depends(get_session)) -> Any:

@@ -25,11 +25,14 @@ from .workflows import (
     DatabaseRunLoader,
     SqlAlchemyWorkflowRepository,
     WorkflowEngine,
+    WorkflowExecutionClass,
     WorkflowRegistry,
 )
+from .workflows.dispatcher import WorkflowDispatcher
 from .workflows.amazon_disbursement import (
     AmazonDisbursementWorkflow,
     AmazonPaymentsPage,
+    build_amazon_disbursement_definition,
 )
 from .ziniao.factory import build_controller
 from .ziniao.credentials import read_generic_credential
@@ -54,6 +57,8 @@ class RuntimeComposition:
     run_loader: Any
     automation_service: Any
     schedule_manager: ScheduleManager
+    workflow_registry: WorkflowRegistry | None = None
+    workflow_dispatcher: Any | None = None
     _started: bool = False
     _closed: bool = False
 
@@ -102,7 +107,7 @@ def build_runtime(
         repository=workflow_repository,
         page_adapter=AmazonPaymentsPage(),
     )
-    registry = WorkflowRegistry((workflow,))
+    registry = WorkflowRegistry((build_amazon_disbursement_definition(workflow),))
     if notifier is None:
         notification_adapter, delivery_service = _build_notifier(session_factory)
     else:
@@ -114,12 +119,18 @@ def build_runtime(
         notifier=notification_adapter,
         auth_timeout_seconds=float(settings.auth_wait_minutes * 60),
     )
+    workflow_dispatcher = WorkflowDispatcher(
+        registry=registry,
+        engines={WorkflowExecutionClass.FINANCIAL.value: workflow_engine},
+        repository=workflow_repository,
+    )
     run_loader = DatabaseRunLoader(
         session_factory,
         artifact_root=settings.evidence_dir,
+        workflow_registry=registry,
     )
     automation_service = AutomationService(
-        engine=workflow_engine,
+        engine=workflow_dispatcher,
         run_loader=run_loader,
         recovery_loader=run_loader.recovery_runs,
         ziniao_controller=controller,
@@ -134,6 +145,7 @@ def build_runtime(
         session_factory,
         automation_service,
         scheduler=scheduler,
+        workflow_registry=registry,
     )
     return RuntimeComposition(
         settings=settings,
@@ -144,6 +156,8 @@ def build_runtime(
         run_loader=run_loader,
         automation_service=automation_service,
         schedule_manager=schedule_manager,
+        workflow_registry=registry,
+        workflow_dispatcher=workflow_dispatcher,
     )
 
 

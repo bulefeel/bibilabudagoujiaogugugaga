@@ -144,6 +144,31 @@ def test_bulk_queue_is_persistent_and_network_errors_keep_current_position() -> 
     assert "当前店铺位置已保留" in script
 
 
+def test_global_credential_error_pauses_single_and_bulk_setup_without_store_failure() -> None:
+    script = _script()
+    base = (PROJECT_ROOT / "src/ziniao_automation/templates/base.html").read_text(
+        encoding="utf-8"
+    )
+    single = script[
+        script.index('if (action === "detect-store-setup")') :
+        script.index('if (action === "continue-store-setup")')
+    ]
+    bulk = script[
+        script.index("async function runNextBulkStoreSetup") :
+        script.index("function formData")
+    ]
+
+    assert 'const ziniaoCredentialErrorCode = "ZINIAO_CREDENTIALS_INVALID"' in script
+    assert "pauseStoreSetupForCredential(form, exc)" in single
+    assert "未将该店计为核验失败" in script
+    assert "pauseBulkStoreSetupForCredential(store, exc)" in bulk
+    assert "bulkStoreSetup.index += 1" not in bulk
+    assert "bulkStoreSetup.failed += 1" not in bulk
+    assert "凭据保存后重试当前店铺" in script
+    assert "不会继续打开下一家" in script
+    assert "app.js') }}?v=20260826-bulk-queue-reconcile" in base
+
+
 def test_bulk_refresh_revalidates_probe_before_showing_auth_actions() -> None:
     script = _script()
     restore = script[
@@ -204,8 +229,16 @@ def test_bulk_summary_counts_identity_separately_and_refreshes_cards() -> None:
     script = _script()
 
     assert "身份已建档" in template
-    assert "站点核验未通过" in template
-    assert "身份失败或跳过" in template
+    # "其中" and "次" are load-bearing. siteIncomplete is incremented inside the
+    # success branch, so it is a subset, and auth counts pauses rather than
+    # stores. Rendered as four equal tiles all reading as "家", a three-store
+    # queue showed 2+1+1+0 and looked like the program could not add up.
+    assert "其中站点未通过" in template
+    assert "<b data-bulk-store-setup-auth>0</b> 次" in template
+    # The bucket counts stores whose identity never got bound; an explicit skip
+    # after the identity was already committed is not one of them.
+    assert "身份未建档" in template
+    assert "身份失败或跳过" not in template
     assert "function identitySetupSucceeded(data)" in script
     assert "function siteSetupNeedsFollowup(data)" in script
     assert "bulkStoreSetup.siteIncomplete += 1" in script
@@ -214,6 +247,70 @@ def test_bulk_summary_counts_identity_separately_and_refreshes_cards() -> None:
     assert "restoreBulkSetupCompletionSummary()" in script
     assert "setTimeout(() => location.reload(), 100)" in script
     assert "下方店铺卡片已刷新为数据库最新状态" in script
+
+
+def test_a_restored_bulk_queue_is_checked_against_the_cards_on_the_page() -> None:
+    """sessionStorage records a belief; the cards record the database.
+
+    Between two loads of this page the operator can undo the very run the queue
+    is describing — 「删除 / 重置建档」 clears the identity and then reloads this
+    same tab — and the archive survived untouched. The banner went on announcing
+    「身份已建档 2」 above three cards that all read 「尚未绑定」, with no way to
+    tell which one was lying.
+    """
+
+    script = _script()
+
+    check = script[
+        script.index("function bulkQueueArchiveIsStale") :
+        script.index("function discardBulkStoreSetup")
+    ]
+    # Reconciled against the server-rendered cards, not against itself.
+    assert '$$("[data-store-card]")' in check
+    assert "dataset.identityState" in check
+    assert "return success > boundSoFar;" in check
+    assert "queue.some(store => !cards.has(store.id))" in check
+
+    restore = script[
+        script.index("function restoreBulkStoreSetup") :
+        script.index("function bulkSetupUi")
+    ]
+    assert "bulkQueueArchiveIsStale(queue, index, Number(saved.success || 0))" in restore
+    assert restore.index("bulkQueueArchiveIsStale") < restore.index("Object.assign"), (
+        "必须在把陈旧计数搬进 bulkStoreSetup 之前就判定，否则横幅已经渲染出假数字"
+    )
+
+
+def test_an_unfinished_bulk_queue_can_always_be_abandoned() -> None:
+    """A restored queue hijacks the toolbar button, so it needs a way out.
+
+    While one exists, 「一键自动建档全部店铺」 resumes it instead of starting a
+    fresh pass, and the only branch that re-picks eligible stores and zeroes the
+    counters is unreachable. Nothing cleared the archive on operator request, so
+    closing the tab was the sole escape — and no text on screen said so.
+    """
+
+    template = _template()
+    script = _script()
+
+    assert 'data-action="discard-bulk-store-setup"' in template
+    assert "放弃这个队列" in template
+    assert "data-bulk-store-setup-dismiss hidden" in template, "默认必须隐藏"
+
+    discard = script[
+        script.index("function discardBulkStoreSetup") :
+        script.index("function restoreBulkStoreSetup")
+    ]
+    assert "sessionStorage.removeItem(bulkSetupStorageKey)" in discard
+    assert "resumeAvailable: false" in discard
+    assert 'ui.start.textContent = "一键自动建档全部店铺"' in discard, (
+        "放弃之后工具栏按钮必须变回全新一轮的文案"
+    )
+    assert 'if (action === "discard-bulk-store-setup")' in script
+    # Shown only for a restored queue; a live pass must use 「跳过此店并继续」 so
+    # an open Ziniao window is never stranded.
+    assert "if (ui.dismiss) ui.dismiss.hidden = false;" in script
+    assert script.count("if (ui.dismiss) ui.dismiss.hidden = true;") >= 2
 
 
 def test_store_setup_can_be_deleted_and_reset() -> None:
@@ -246,4 +343,4 @@ def test_legacy_setup_routes_are_not_left_in_the_frontend_and_cache_is_bumped() 
         "detect-all-marketplace-setups",
     ):
         assert legacy not in combined
-    assert "20260821-diagnostics-styles" in base
+    assert "20260826-bulk-queue-reconcile" in base

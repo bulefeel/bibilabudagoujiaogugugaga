@@ -16,6 +16,7 @@ from ziniao_automation.db import (
 from ziniao_automation.models import OperationGuard, Store, StoreMarketplace
 from ziniao_automation.workflows.errors import HumanAuthRequired
 from ziniao_automation.workflows.runtime import AutomationService
+from ziniao_automation.ziniao.errors import ZiniaoCredentialError
 
 
 class _PageToken:
@@ -112,6 +113,37 @@ async def _terminal(service, store_id, probe_id):
     raise AssertionError("unified setup probe did not finish")
 
 
+@pytest.mark.asyncio
+async def test_unified_setup_preflights_credentials_before_probe_or_site_write(
+    tmp_path,
+) -> None:
+    class CredentialFailController(_Controller):
+        def __init__(self) -> None:
+            super().__init__()
+            self.preflight_calls = 0
+
+        def preflight_credentials(self) -> None:
+            self.preflight_calls += 1
+            raise ZiniaoCredentialError("紫鸟凭据引用已失效")
+
+    controller = CredentialFailController()
+    service, sessions, store_id = _service(tmp_path, controller)
+
+    with pytest.raises(ZiniaoCredentialError, match="凭据引用已失效"):
+        await service.detect_store_setup(store_id, ["CA", "UK"])
+
+    assert controller.preflight_calls == 1
+    assert controller.opens == 0
+    assert service._marketplace_setup_probes == {}
+    assert service._marketplace_setup_store_probes == {}
+    with sessions() as db:
+        assert list(
+            db.scalars(
+                select(StoreMarketplace).where(
+                    StoreMarketplace.store_id == store_id
+                )
+            )
+        ) == []
 
 
 
@@ -120,6 +152,63 @@ async def _terminal(service, store_id, probe_id):
 
 
 
+
+
+
+
+@pytest.mark.asyncio
+async def test_unified_setup_reaching_the_end_succeeds_and_reports_its_store(
+    tmp_path, monkeypatch
+) -> None:
+    """Drive a unified setup all the way to its terminal payload.
+
+    Every other test in this file stops the probe early — on a credential
+    failure, on the hard deadline, or by cancelling a reattached probe.  Nothing
+    exercised the terminal ``return`` of ``_run_store_setup_account_sites``,
+    which deleted ``store_id`` at the top of the body and then read it again
+    when assembling that payload.  The result was an UnboundLocalError on every
+    setup whose assisted login actually got through, finalized as FAILED via the
+    generic-exception branch: unified setup could never report success, and the
+    only reason nobody saw it is that the probe usually stalls earlier, at
+    assisted login.
+    """
+
+    controller = _Controller()
+    service, sessions, store_id = _service(tmp_path, controller)
+
+    async def identity(self, page, marketplace):
+        del self, page, marketplace
+        return "A1SELLERFIXTURE", "payments-dashboard"
+
+    async def preflight(self, page, run, marketplace):
+        del self, page, run, marketplace
+
+    monkeypatch.setattr(
+        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.detect_identity",
+        identity,
+    )
+    monkeypatch.setattr(
+        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.preflight",
+        preflight,
+    )
+    monkeypatch.setattr(
+        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.resolved_page_for",
+        lambda self, page: page,
+    )
+
+    started = await service.detect_store_setup(store_id, ["CA", "UK"])
+    result = await _terminal(service, store_id, started["probe_id"])
+
+    assert result["status"] == "SUCCEEDED", result.get("message")
+    # The regression made this key the crash site, so assert the value, not just
+    # its presence.
+    assert result["store_id"] == store_id
+    assert result["seller_id"] == "A1SELLERFIXTURE"
+    assert {site["status"] for site in result["marketplaces"]} == {"SUCCEEDED"}
+    with sessions() as db:
+        store = db.get(Store, store_id)
+        assert store.expected_seller_id == "A1SELLERFIXTURE"
+        assert store.identity_confirmed is True
 
 
 @pytest.mark.asyncio

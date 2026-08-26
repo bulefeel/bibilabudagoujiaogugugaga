@@ -11,9 +11,24 @@ from sqlalchemy.orm import Session
 from ziniao_automation.composition import RuntimeComposition
 from ziniao_automation.config import Settings
 from ziniao_automation.db import create_sqlite_engine, init_database, make_session_factory
-from ziniao_automation.models import OperationGuard, Run, Schedule, SiteRun, Store, StoreMarketplace
+from ziniao_automation.models import (
+    OperationGuard,
+    Run,
+    Schedule,
+    ScheduleBatch,
+    SiteRun,
+    Store,
+    StoreMarketplace,
+)
 from ziniao_automation.repositories import ScheduleRepository, WorkflowRepository
 from ziniao_automation.scheduler import ScheduleManager
+from ziniao_automation.workflows.registry import (
+    EmptyWorkflowConfig,
+    WorkflowDefinition,
+    WorkflowExecutionClass,
+    WorkflowRegistry,
+)
+from ziniao_automation.workflows.types import RunMode
 
 
 class FakeAutomation:
@@ -160,7 +175,9 @@ async def _schedule_rebuild_options_and_api_refresh_projection(db_env):
     with factory() as db:
         db.get(Schedule, schedule_id).enabled = False
         db.commit()
-    await manager.refresh_schedule(schedule_id)
+    projection = await manager.refresh_schedule(schedule_id)
+    assert projection.projected_schedule_ids == frozenset()
+    assert projection.failed_schedule_ids == frozenset()
     assert fake_scheduler.jobs == {}
     with factory() as db:
         assert db.get(Schedule, schedule_id).next_run_at is None
@@ -246,6 +263,164 @@ async def _schedule_trigger_is_single_instance(db_env):
         assert rows[0].result_summary["requested_marketplaces"] == ["CA"]
 
 
+class BatchAutomation(FakeAutomation):
+    def __init__(self) -> None:
+        super().__init__()
+        self.batches: list[tuple[str, ...]] = []
+
+    async def enqueue_runs(self, run_ids) -> None:
+        self.batches.append(tuple(run_ids))
+
+
+def _seed_two_store_batch(factory):
+    with factory() as db:
+        batch = ScheduleBatch(
+            request_id="00000000-0000-4000-8000-000000000001",
+            definition_hash="b" * 64,
+            definition_json={},
+            schedule_count=2,
+        )
+        db.add(batch)
+        db.flush()
+        schedule_ids: list[int] = []
+        for order in (1, 2):
+            store = Store(
+                name=f"Batch Store {order}",
+                selector_type="oauth",
+                selector_value=f"batch-oauth-{order}",
+                browser_oauth=f"batch-oauth-{order}",
+                expected_seller_id=f"SELLER-{order}",
+                identity_confirmed=True,
+                enabled=True,
+            )
+            db.add(store)
+            db.flush()
+            db.add(
+                StoreMarketplace(
+                    store_id=store.id,
+                    code="CA",
+                    domain="sellercentral.amazon.ca",
+                    currency="CAD",
+                    enabled=True,
+                )
+            )
+            schedule = Schedule(
+                store_id=store.id,
+                batch_id=batch.id,
+                batch_order=order,
+                name="same batch",
+                workflow="amazon_disbursement",
+                mode="dry_run",
+                local_time="09:00",
+                days_of_week="*",
+                timezone="Asia/Singapore",
+                marketplace_codes=["CA"],
+                workflow_config={"marketplace_codes": ["CA"]},
+                enabled=True,
+            )
+            db.add(schedule)
+            db.flush()
+            schedule_ids.append(schedule.id)
+        db.commit()
+        return schedule_ids
+
+
+def test_same_occurrence_batch_is_created_and_enqueued_once(db_env):
+    _, factory = db_env
+    schedule_ids = _seed_two_store_batch(factory)
+    automation = BatchAutomation()
+    manager = ScheduleManager(factory, automation, scheduler=FakeScheduler())
+    occurrence = datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc)
+
+    first = asyncio.run(
+        manager.trigger_schedule(schedule_ids[0], scheduled_for_at=occurrence)
+    )
+
+    assert first is not None
+    assert len(automation.batches) == 1
+    assert len(automation.batches[0]) == 2
+    with factory() as db:
+        runs = list(
+            db.query(Run)
+            .filter(Run.schedule_id.in_(schedule_ids))
+            .order_by(Run.schedule_id)
+        )
+        assert len(runs) == 2
+    # The second APScheduler callback observes both persisted occurrences and
+    # must not wake/enqueue a second time.
+    assert (
+        asyncio.run(
+            manager.trigger_schedule(schedule_ids[1], scheduled_for_at=occurrence)
+        )
+        is None
+    )
+    assert len(automation.batches) == 1
+
+
+def test_scheduler_identity_gate_follows_generic_workflow_definition(db_env):
+    _, factory = db_env
+    with factory() as db:
+        store = Store(
+            name="Read only store",
+            selector_type="id",
+            selector_value="generic-profile",
+            expected_seller_id=None,
+            identity_confirmed=False,
+            enabled=True,
+        )
+        db.add(store)
+        db.flush()
+        schedule = Schedule(
+            store_id=store.id,
+            name="read-only",
+            workflow="future_report",
+            mode="dry_run",
+            local_time="09:00",
+            days_of_week="*",
+            timezone="Asia/Singapore",
+            marketplace_codes=[],
+            workflow_config={},
+            enabled=True,
+        )
+        db.add(schedule)
+        db.commit()
+        schedule_id = schedule.id
+
+    registry = WorkflowRegistry(
+        [
+            WorkflowDefinition(
+                key="future_report",
+                display_name="Future report",
+                description="test",
+                workflow=None,
+                supported_modes=(RunMode.DRY_RUN,),
+                default_mode=RunMode.DRY_RUN,
+                config_version=1,
+                config_model=EmptyWorkflowConfig,
+                requires_confirmed_identity=False,
+                requires_financial_lock=False,
+                execution_class=WorkflowExecutionClass.STANDARD,
+            )
+        ]
+    )
+    automation = FakeAutomation()
+    manager = ScheduleManager(
+        factory,
+        automation,
+        scheduler=FakeScheduler(),
+        workflow_registry=registry,
+    )
+    run_id = asyncio.run(
+        manager.trigger_schedule(
+            schedule_id,
+            scheduled_for_at=datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc),
+        )
+    )
+    assert run_id is not None
+    with factory() as db:
+        assert db.get(Run, run_id).status == "QUEUED"
+
+
 def test_auto_mode_no_longer_requires_prior_approval_successes(db_env):
     """The two-approval prerequisite was removed on the operator's instruction.
 
@@ -311,11 +486,9 @@ def test_auto_mode_still_requires_a_confirmed_seller_identity(db_env):
     store_id, _ = seed_store(factory)
     with factory() as db:
         store = db.get(Store, store_id)
-        # ``ck_store_enabled_requires_identity`` forbids an enabled store with
-        # an unconfirmed identity, so both flags have to move together.  The
-        # identity check runs before the enable check in both repositories, so
-        # this still exercises the identity message.
-        store.enabled = False
+        # Store availability is workflow-neutral; the financial definition
+        # must still reject this unconfirmed seller independently.
+        store.enabled = True
         store.identity_confirmed = False
         db.commit()
     with factory() as db:

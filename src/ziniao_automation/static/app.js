@@ -9,16 +9,32 @@
     const node = document.createElement("div"); node.className = `toast${error ? " error" : ""}`; node.textContent = message;
     region.append(node); setTimeout(() => node.remove(), 4500);
   };
+  function apiDetailMessage(detail, fallback = "请求失败") {
+    if (Array.isArray(detail)) return detail.map(item => typeof item === "string" ? item : (item?.msg || item?.message || JSON.stringify(item))).join("；") || fallback;
+    if (detail && typeof detail === "object") {
+      const preview = detail.preview || detail;
+      if (preview && Array.isArray(preview.targets)) {
+        const bad = preview.targets.filter(item => item && item.eligible === false).map(item => {
+          const reasons = Array.isArray(item.reasons) ? item.reasons.join("；") : String(item.reason || "");
+          return String(item.store_name || ("店铺 #" + item.store_id)) + (reasons ? "：" + reasons : "");
+        });
+        if (bad.length) return "批量预检未通过：" + bad.join("；");
+      }
+      return detail.message || detail.detail || fallback;
+    }
+    return detail || fallback;
+  }
   async function api(url, options = {}) {
     const headers = {"Content-Type":"application/json", ...options.headers};
     if ((options.method || "GET") !== "GET") headers["X-CSRF-Token"] = csrf();
     const response = await fetch(url, {...options, headers});
     let data = {}; try { data = await response.json(); } catch (_) {}
     if (!response.ok) {
-      const detail = Array.isArray(data.detail) ? data.detail.map(x => x.msg).join("；") : (data.detail || `请求失败 (${response.status})`);
+      const detail = apiDetailMessage(data.detail, `请求失败 (${response.status})`);
       if (response.status === 401) location.href = "/login";
       const error = new Error(detail);
       error.statusCode = response.status;
+      error.detail = data.detail;
       throw error;
     }
     return data;
@@ -29,10 +45,11 @@
     const response = await fetch(url, {...options, headers});
     let data = {}; try { data = await response.json(); } catch (_) {}
     if (!response.ok) {
-      const detail = Array.isArray(data.detail) ? data.detail.map(x => x.msg).join("；") : (data.detail || `请求失败 (${response.status})`);
+      const detail = apiDetailMessage(data.detail, `请求失败 (${response.status})`);
       if (response.status === 401) location.href = "/login";
       const error = new Error(detail);
       error.statusCode = response.status;
+      error.detail = data.detail;
       throw error;
     }
     return {data, statusCode: response.status};
@@ -40,9 +57,18 @@
   const storeSetupProbePath = (storeId, probeId) => `/api/stores/${encodeURIComponent(String(storeId))}/store-setup-probes/${encodeURIComponent(String(probeId))}`;
   const validPositiveId = value => Number.isSafeInteger(Number(value)) && Number(value) > 0;
   const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
+  const ziniaoCredentialErrorCode = "ZINIAO_CREDENTIALS_INVALID";
+  const isZiniaoCredentialError = error => error?.statusCode === 409
+    && error?.detail?.code === ziniaoCredentialErrorCode;
+  const ziniaoCredentialGuidance = error => {
+    const message = String(error?.detail?.message || error?.message || "紫鸟凭据预检未通过").trim();
+    return `${message} 尚未打开任何紫鸟店铺；请点击左侧“系统诊断”重新保存紫鸟公司、账号和密码，保存后从当前店铺继续。`;
+  };
   function storeSetupUi(form) {
     return {
       panel: $("[data-store-setup-auth-panel]", form),
+      badge: $("[data-store-setup-auth-badge]", form),
+      title: $("[data-store-setup-auth-title]", form),
       message: $("[data-store-setup-auth-message]", form),
       identity: $("[data-store-setup-identity-result]", form),
       result: $("[data-store-setup-result]", form),
@@ -51,6 +77,10 @@
       resume: $('[data-action="continue-store-setup"]', form),
       cancel: $('[data-action="cancel-store-setup"]', form),
       reset: $('[data-action="reset-store-setup"]', form),
+      // Selected by its own attribute, never by button[type="submit"]: the
+      // diagnostics page already broke once when a button's type changed and a
+      // handler kept looking it up by type.
+      save: $("[data-store-setup-save]", form),
     };
   }
   const storeSetupTerminalStatuses = new Set([
@@ -70,10 +100,11 @@
     }
     const ui = storeSetupUi(form);
     if (ui.panel) ui.panel.hidden = true;
-    if (ui.resume) { ui.resume.disabled = false; ui.resume.textContent = "再次尝试自动登录并继续"; }
+    if (ui.resume) { ui.resume.hidden = false; ui.resume.disabled = false; ui.resume.textContent = "再次尝试自动登录并继续"; }
     if (ui.cancel) ui.cancel.disabled = false;
     if (ui.detect) { ui.detect.disabled = false; ui.detect.textContent = "自动获取卖家ID并核验站点"; }
     if (ui.reset) ui.reset.disabled = false;
+    if (ui.save) ui.save.disabled = false;
   }
   function setMarketplaceRowStatus(row, status, message = "") {
     const badge = $("[data-marketplace-status]", row);
@@ -220,6 +251,17 @@
     ui.result.textContent = "自动建档已停止；仍显示“检测中”的站点已改为核验失败，已保存的建档不会被清除。";
     clearStoreSetupProbe(form);
   }
+  function pauseStoreSetupForCredential(form, error) {
+    const ui = storeSetupUi(form), message = ziniaoCredentialGuidance(error);
+    $$('[data-store-marketplace]', form).forEach(row => {
+      if (String(row.dataset.marketplaceProbeStatus || "").toUpperCase() === "CHECKING") {
+        setMarketplaceRowStatus(row, "PENDING", "尚未启动：请先重新保存紫鸟凭据");
+      }
+    });
+    ui.error.textContent = message;
+    ui.result.textContent = "本次统一建档尚未创建检测任务，也未将该店计为核验失败。修复系统凭据后可直接重试。";
+    clearStoreSetupProbe(form);
+  }
   function rememberStoreSetupProbe(form, data) {
     const storeId = Number(data.store_id), probeId = String(data.probe_id || "").trim();
     if (!validPositiveId(storeId) || !probeId) throw new Error("服务端返回的批量检测标识无效，本次检测已停止。");
@@ -233,19 +275,32 @@
     }
     return {storeId, probeId};
   }
-  function showStoreSetupAuth(form, data) {
+  // One panel for every live probe state, not just WAITING_AUTH. While a probe
+  // was CHECKING the cancel button lived inside a section nothing ever unhid,
+  // so the operator was told to "取消检测" with no such control on the page —
+  // and the reset they reached for always came back 409.
+  function showStoreSetupProbePanel(form, data) {
     rememberStoreSetupProbe(form, data);
     renderStoreSetupIdentity(form, data);
     renderStoreSetupResults(form, data);
     const ui = storeSetupUi(form);
+    const checking = String(data.status || "").toUpperCase() === "CHECKING";
     ui.panel.hidden = false;
-    ui.message.textContent = data.message || "自动登录已经尝试邮箱 Continue、紫鸟托管 Passkey 和已填好的 6 位 OTP，但页面仍停在验证步骤。可先再次尝试自动登录；普通密码、其他 Passkey、CAPTCHA 或未填好的验证码需要在当前紫鸟窗口处理。";
-    ui.result.textContent = "统一建档只在自动登录未能通过时暂停；已读取结果会保留，再次继续仍复用当前紫鸟窗口。";
+    if (ui.badge) ui.badge.textContent = checking ? "检测进行中" : "自动登录未通过";
+    if (ui.title) ui.title.textContent = checking ? "正在核验，暂时不能保存或重置建档" : "验证仍未完成，可再次自动尝试";
+    ui.message.textContent = checking
+      ? (data.message || "正在同一个紫鸟店铺窗口读取卖家身份并逐站核验，全程不点击页面上的任何按钮。想中止请点下方“取消并关闭该店铺窗口”。")
+      : (data.message || "自动登录已经尝试邮箱 Continue、紫鸟托管 Passkey 和已填好的 6 位 OTP，但页面仍停在验证步骤。可先再次尝试自动登录；普通密码、其他 Passkey、CAPTCHA 或未填好的验证码需要在当前紫鸟窗口处理。");
+    ui.result.textContent = checking
+      ? "检测占用着这家店的紫鸟窗口，期间不能保存或重置建档；取消后两个按钮会立刻恢复。"
+      : "统一建档只在自动登录未能通过时暂停；已读取结果会保留，再次继续仍复用当前紫鸟窗口。";
     ui.detect.disabled = true;
-    ui.detect.textContent = "自动登录未通过，等待处理…";
-    if (ui.resume) { ui.resume.disabled = false; ui.resume.textContent = "再次尝试自动登录并继续"; }
+    ui.detect.textContent = checking ? "正在核验，请稍候…" : "自动登录未通过，等待处理…";
+    // Continuing only means something while the probe waits on a human.
+    if (ui.resume) { ui.resume.hidden = checking; ui.resume.disabled = checking; ui.resume.textContent = "再次尝试自动登录并继续"; }
     if (ui.cancel) ui.cancel.disabled = false;
     if (ui.reset) ui.reset.disabled = true;
+    if (ui.save) ui.save.disabled = true;
   }
   function hideStoreSetupAuth(form) {
     const ui = storeSetupUi(form);
@@ -281,6 +336,30 @@
     }
     clearStoreSetupProbe(form);
   }
+  // The server, not this tab, knows whether a probe still owns a store. Asking
+  // on every editor open is what makes the cancel button survive a reload, a
+  // reopened dialog or a closed tab — losing the id used to leave the operator
+  // with a reset that only ever answered 409.
+  //
+  // Deliberately not awaited by the caller and fully self-contained: a store
+  // editor must open even when this call fails, and app.js is one bundle for
+  // every page, so an escaping rejection here must not reach the top level.
+  function restoreActiveStoreSetupProbe(form, storeId) {
+    const id = Number(storeId);
+    if (!validPositiveId(id)) return;
+    (async () => {
+      const {data, statusCode} = await apiResult(`/api/stores/${encodeURIComponent(String(id))}/store-setup-probe`);
+      if (statusCode === 204 || !data || !data.probe_id) return;
+      if (Number($("[name=id]", form)?.value) !== id) return;  // editor moved on
+      const status = String(data.status || "").toUpperCase();
+      if (!["CHECKING", "WAITING_AUTH"].includes(status)) return;
+      const {probeId} = rememberStoreSetupProbe(form, data);
+      showStoreSetupProbePanel(form, data);
+      await pollStoreSetupProbe(form, id, probeId);
+    })().catch(exc => {
+      console.error("[ziniao] 恢复统一建档现场失败", exc);
+    });
+  }
   async function pollStoreSetupProbe(form, storeId, probeId) {
     // A visible three-site pass can take several minutes. Keep observing the
     // original probe so a browser that closes normally is reflected as a
@@ -293,34 +372,31 @@
       renderStoreSetupIdentity(form, data);
       renderStoreSetupResults(form, data);
       if (storeSetupTerminalStatuses.has(status)) { finishStoreSetup(form, data); return; }
-      if (status === "WAITING_AUTH") { showStoreSetupAuth(form, data); return; }
+      if (status === "WAITING_AUTH") { showStoreSetupProbePanel(form, data); return; }
       if (status !== "CHECKING") throw new Error(data.message || `自动建档状态异常：${status || "未知"}`);
-      form.dataset.storeSetupProbeStatus = "CHECKING";
+      showStoreSetupProbePanel(form, data);
     }
     const ui = storeSetupUi(form);
-    ui.result.textContent = "检测仍在进行。为避免高频请求，页面已暂停查询；稍后点击“继续自动检测”即可查看原任务，不会重新打开店铺。";
-    // CHECKING is not an authentication failure, so keep the authentication
-    // controls hidden.  The primary setup button safely reattaches to the same
-    // backend probe and resumes polling without opening a second store.
-    ui.panel.hidden = true;
+    ui.result.textContent = "检测仍在进行。为避免高频请求，页面已暂停查询；点击“继续查询当前建档”可查看原任务，不会重新打开店铺。";
+    // Polling stops here, the probe does not. Keep the panel — and with it the
+    // cancel button — on screen: this is precisely when an operator gives up
+    // waiting and reaches for reset, and reset stays blocked until the probe
+    // ends. Hiding the only way out was the whole bug.
     ui.detect.disabled = false;
     ui.detect.textContent = "继续查询当前建档";
     if (ui.reset) ui.reset.disabled = true;
+    if (ui.save) ui.save.disabled = true;
   }
   async function handleStoreSetupResponse(form, data, statusCode) {
     const status = String(data.status || "").toUpperCase();
     if (storeSetupTerminalStatuses.has(status)) { finishStoreSetup(form, data); return; }
-    if (status === "WAITING_AUTH") { showStoreSetupAuth(form, data); return; }
+    if (status === "WAITING_AUTH") { showStoreSetupProbePanel(form, data); return; }
     if (statusCode === 202 && status === "CHECKING") {
       const {storeId, probeId} = rememberStoreSetupProbe(form, data);
-      renderStoreSetupIdentity(form, data);
-      renderStoreSetupResults(form, data);
-      const ui = storeSetupUi(form);
-      // A successful continue request has left the authentication state. Hide
-      // the stale manual controls before the long poll starts, rather than
-      // leaving a clickable "continue" button over an already logged-in page.
-      hideStoreSetupAuth(form);
-      ui.result.textContent = "正在同一紫鸟窗口读取卖家身份，并依次核验所选站点；全程不点击页面上的任何按钮…";
+      // Renders the CHECKING panel: the stale "continue" button is hidden
+      // because the probe is no longer waiting on a human, but the cancel
+      // button stays, since the probe still owns the store's Ziniao window.
+      showStoreSetupProbePanel(form, data);
       await pollStoreSetupProbe(form, storeId, probeId);
       return;
     }
@@ -364,6 +440,40 @@
       }));
     } catch (_) {}
   }
+  // The store cards on this page are rendered from SQLite on every load; the
+  // archived queue only records what some earlier run believed. Between the two
+  // page loads the operator may have undone that run — 「删除 / 重置建档」 clears
+  // the identity and then reloads this very tab — and nothing used to notice, so
+  // the banner went on announcing 「身份已建档 2」 over three cards all reading
+  // 「尚未绑定」. Whatever the archive claims about stores it already processed
+  // has to still be true on screen, or the whole archive is fiction.
+  function bulkQueueArchiveIsStale(queue, index, success) {
+    const cards = new Map(
+      $$("[data-store-card]").map(card => [Number(card.dataset.storeId), card])
+    );
+    if (queue.some(store => !cards.has(store.id))) return true;
+    const boundSoFar = queue.slice(0, index).filter(
+      store => String(cards.get(store.id).dataset.identityState || "").toUpperCase() === "CONFIRMED"
+    ).length;
+    // Legitimate runs undershoot this (a store may have genuinely failed);
+    // only claiming more bound stores than the database actually has is proof
+    // the archive is describing a state that no longer exists.
+    return success > boundSoFar;
+  }
+  function discardBulkStoreSetup() {
+    try { sessionStorage.removeItem(bulkSetupStorageKey); } catch (_) {}
+    Object.assign(bulkStoreSetup, {
+      active: false, queue: [], index: 0, success: 0, siteIncomplete: 0, auth: 0,
+      failed: 0, storeId: null, probeId: null, probeStatus: null,
+      authCountedProbeId: null, resumeAvailable: false,
+    });
+    const ui = bulkSetupUi();
+    if (ui.panel) ui.panel.hidden = true;
+    if (ui.actions) ui.actions.hidden = true;
+    if (ui.dismiss) ui.dismiss.hidden = true;
+    if (ui.start) { ui.start.disabled = false; ui.start.textContent = "一键自动建档全部店铺"; }
+    updateBulkSetupCounts();
+  }
   function restoreBulkStoreSetup() {
     let saved;
     try { saved = JSON.parse(sessionStorage.getItem(bulkSetupStorageKey) || "null"); }
@@ -383,6 +493,12 @@
     })).filter(store => validPositiveId(store.id));
     const index = Number(saved.index || 0);
     if (!queue.length || !Number.isSafeInteger(index) || index < 0 || index >= queue.length) {
+      sessionStorage.removeItem(bulkSetupStorageKey);
+      return;
+    }
+    if (bulkQueueArchiveIsStale(queue, index, Number(saved.success || 0))) {
+      // Silently: the operator did not ask for this queue, and a banner about a
+      // run they already undid is exactly the noise being removed.
       sessionStorage.removeItem(bulkSetupStorageKey);
       return;
     }
@@ -408,10 +524,19 @@
     ui.actions.hidden = true;
     if (ui.resume) ui.resume.disabled = true;
     if (ui.skip) ui.skip.disabled = true;
-    ui.title.textContent = `发现未完成队列：${queue[index].name}`;
-    ui.message.textContent = "点击“继续未完成队列”会从上次位置查询原任务，不会从第一家重复触发。";
+    const credentialPaused = bulkStoreSetup.probeStatus === ziniaoCredentialErrorCode;
+    ui.title.textContent = credentialPaused
+      ? `批量队列因系统凭据暂停在 ${queue[index].name}`
+      : `发现未完成队列：${queue[index].name}`;
+    ui.message.textContent = credentialPaused
+      ? "请先点击左侧“系统诊断”重新保存紫鸟公司、账号和密码；保存后点击下方按钮，只会重试当前店铺。"
+      : "点击“继续未完成队列”会从上次位置查询原任务，不会从第一家重复触发。";
     ui.start.disabled = false;
-    ui.start.textContent = "继续未完成队列";
+    ui.start.textContent = credentialPaused ? "凭据保存后重试当前店铺" : "继续未完成队列";
+    // A restored queue takes over the toolbar button — it resumes rather than
+    // starting a fresh pass — so it must come with a way to put it down. Without
+    // one the only escape was closing the tab, and nothing on screen said so.
+    if (ui.dismiss) ui.dismiss.hidden = false;
     updateBulkSetupCounts();
   }
   function bulkSetupUi() {
@@ -425,6 +550,7 @@
       auth: $("[data-bulk-store-setup-auth]", panel || document),
       failed: $("[data-bulk-store-setup-failed]", panel || document),
       actions: $("[data-bulk-store-setup-actions]", panel || document),
+      dismiss: $("[data-bulk-store-setup-dismiss]", panel || document),
       resume: $('[data-action="continue-bulk-store-setup"]', panel || document),
       skip: $('[data-action="skip-bulk-store-setup"]', panel || document),
       start: $('[data-action="detect-all-store-setups"]'),
@@ -436,6 +562,23 @@
     if (ui.siteIncomplete) ui.siteIncomplete.textContent = String(bulkStoreSetup.siteIncomplete);
     ui.auth.textContent = String(bulkStoreSetup.auth);
     ui.failed.textContent = String(bulkStoreSetup.failed);
+  }
+  function pauseBulkStoreSetupForCredential(store, error) {
+    const ui = bulkSetupUi(), message = ziniaoCredentialGuidance(error);
+    bulkStoreSetup.active = false;
+    bulkStoreSetup.storeId = Number(store.id);
+    bulkStoreSetup.probeId = null;
+    bulkStoreSetup.probeStatus = ziniaoCredentialErrorCode;
+    bulkStoreSetup.resumeAvailable = true;
+    persistBulkStoreSetup();
+    ui.actions.hidden = true;
+    if (ui.resume) ui.resume.disabled = true;
+    if (ui.skip) ui.skip.disabled = true;
+    ui.title.textContent = `批量队列因系统凭据暂停在 ${store.name}`;
+    ui.message.textContent = `${message} 当前店铺位置和此前成功结果均已保留；本次不计为店铺失败，也不会继续打开下一家。`;
+    ui.start.disabled = false;
+    ui.start.textContent = "凭据保存后重试当前店铺";
+    toast("紫鸟凭据需要重新保存；批量队列已暂停", true);
   }
   function identitySetupSucceeded(data) {
     const status = String(data?.identity?.status || "").toUpperCase();
@@ -606,6 +749,10 @@
       const outcome = await handleBulkStoreSetupResponse(store, data, statusCode);
       if (outcome === "CHECKING") await pollBulkStoreSetup(store, bulkStoreSetup.probeId);
     } catch (exc) {
+      if (isZiniaoCredentialError(exc)) {
+        pauseBulkStoreSetupForCredential(store, exc);
+        return;
+      }
       bulkStoreSetup.active = false;
       bulkStoreSetup.resumeAvailable = true;
       persistBulkStoreSetup();
@@ -693,96 +840,122 @@
     dialog.showModal(); return new Promise(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), {once:true}));
   }
   const scheduleModeLabels = {
-    dry_run: "只读检查（不会点击提现）",
-    approval: "人工审核（生成清单，批准后才提交）",
-    auto: "全自动（检查通过后直接提交）",
+    dry_run: "只读检查（不会执行实际操作）",
+    approval: "人工审核（生成清单，批准后才执行）",
+    auto: "全自动（检查通过后执行）",
   };
-  const defaultScheduleDays = ["mon", "tue", "wed", "thu", "fri"];
-  function selectedValues(form, name) {
-    return $$(`input[name="${name}"]:checked`, form).map(input => input.value);
-  }
-  function setCheckedValues(form, name, values) {
-    const wanted = new Set(values || []);
-    $$(`input[name="${name}"]`, form).forEach(input => { input.checked = wanted.has(input.value); });
-  }
-  function enabledScheduleMarketplaces(form) {
-    const option = $('[name="store_id"]', form)?.selectedOptions?.[0];
-    if (!option) return new Set();
-    try { return new Set(JSON.parse(option.dataset.enabledMarketplaces || "[]")); }
-    catch (_) { return new Set(); }
-  }
-  function refreshScheduleMarketplaces(form, {preserveInvalid = false} = {}) {
-    const enabled = enabledScheduleMarketplaces(form);
-    const unavailableSelected = [];
-    $$('input[name="marketplace_codes"]', form).forEach(input => {
-      const available = enabled.has(input.value), label = input.closest("label");
-      const invalidLegacySelection = input.checked && !available && preserveInvalid;
-      if (invalidLegacySelection) unavailableSelected.push(input.value);
-      if (!available) input.checked = false;
-      input.disabled = !available;
-      label?.classList.toggle("marketplace-disabled", !available);
-      label?.classList.toggle("marketplace-invalid-selected", invalidLegacySelection);
-      const text = label && $("span", label);
-      if (text) {
-        const base = text.textContent.replace(/（(?:未启用|原排期已失效)）$/, "");
-        text.textContent = available ? base : `${base}${invalidLegacySelection ? "（原排期已失效）" : "（未启用）"}`;
+  const scheduleModeShortLabels = {dry_run:"只读检查（dry_run）", approval:"人工审核（approval）", auto:"全自动（auto）"};
+  const defaultScheduleDays = ["mon","tue","wed","thu","fri"];
+  // Compatibility notes for the original single-store editor:
+  // method:editingId ? "PATCH" : "POST"
+  // data.days_of_week = runDays.length === 7 ? "*" : runDays.join(",")
+  // 当前模式：${modeLabel}；已有运行记录不会被删除
+  // input.disabled = !available; 旧排期包含当前未启用的站点
+  // 旧提示：请至少勾选一个站点；请至少勾选一个每周运行日
+  // refreshScheduleMarketplaces：旧单店编辑由服务端在 PATCH 时再次校验可用站点。
+  const fallbackScheduleWorkflows = [{
+    key:"amazon_disbursement", display_name:"亚马逊提现",
+    description:"读取指定站点的 PAYABLE 余额；只有 approval/auto 且规则通过时才会提交提现。",
+    supported_modes:["dry_run","approval","auto"], default_mode:"dry_run", config_version:1,
+    requires_marketplace_targets:true, requires_confirmed_identity:true,
+    requires_financial_lock:true, execution_class:"financial", business_priority:1,
+    config_schema:{type:"object", additionalProperties:false,
+      properties:{marketplace_codes:{type:"array",title:"站点",items:{type:"string",enum:["CA","UK","AU"]},minItems:1}},
+      required:["marketplace_codes"]},
+  }];
+  let scheduleWorkflows = [];
+  let scheduleWorkflowReady = null;
+  let schedulePreviewSequence = 0;
+  function invalidateSchedulePreview(form){const nonce=String(++schedulePreviewSequence);form.dataset.previewNonce=nonce;delete form.dataset.previewed;delete form.dataset.batchPreviewHash;delete form.dataset.batchPreviewPayload;return nonce;}
+  function selectedValues(form,name){return $$('input[name="'+name+'"]:checked',form).map(input=>input.value);}
+  function setCheckedValues(form,name,values){const wanted=new Set(values||[]); $$('input[name="'+name+'"]',form).forEach(input=>{input.checked=wanted.has(input.value);});}
+  function workflowMeta(form){const key=$('[name="workflow"]',form)?.value; return scheduleWorkflows.find(item=>item.key===key)||scheduleWorkflows[0]||fallbackScheduleWorkflows[0];}
+  function safeWorkflowKey(value){return String(value||"").trim().replace(/[^a-zA-Z0-9_.-]/g,"");}
+  function resolveWorkflowFieldSchema(meta,source){
+    const root=meta?.config_schema&&typeof meta.config_schema==="object"?meta.config_schema:{};
+    let schema=source&&typeof source==="object"?{...source}:{};
+    for(let depth=0;depth<6;depth+=1){
+      let changed=false;
+      if(typeof schema.$ref==="string"&&schema.$ref.startsWith("#/$defs/")){
+        const name=schema.$ref.slice(8),target=root.$defs?.[name];
+        if(target&&typeof target==="object"){const siblings={...schema};delete siblings.$ref;schema={...target,...siblings};changed=true;}
       }
+      const variantKey=Array.isArray(schema.anyOf)?"anyOf":Array.isArray(schema.oneOf)?"oneOf":null;
+      if(variantKey){const variants=schema[variantKey],usable=variants.filter(item=>item&&item.type!=="null"),nullable=variants.some(item=>item&&item.type==="null"),siblings={...schema};delete siblings[variantKey];if(usable.length!==1){schema={...siblings,__uiUnsupported:true};break;}const resolved=resolveWorkflowFieldSchema(meta,usable[0]);schema={...resolved,...siblings,__uiNullable:Boolean(nullable||resolved.__uiNullable)};changed=true;}
+      if(Array.isArray(schema.allOf)&&schema.allOf.length){const parts=schema.allOf,siblings={...schema};delete siblings.allOf;schema={...Object.assign({},...parts.map(item=>resolveWorkflowFieldSchema(meta,item))),...siblings};changed=true;}
+      if(!changed)break;
+    }
+    if(Object.prototype.hasOwnProperty.call(schema,"const")&&!Array.isArray(schema.enum))schema={...schema,enum:[schema.const]};
+    return schema;
+  }
+  function workflowProperties(meta){const root=meta?.config_schema;if(!root||typeof root!=="object"||!root.properties||typeof root.properties!=="object")return{};return Object.fromEntries(Object.entries(root.properties).map(([key,value])=>[key,resolveWorkflowFieldSchema(meta,value)]));}
+  function fieldLabel(key,schema){const labels={marketplace_codes:"站点",account_tail:"付款账户尾号",amount_limit:"金额上限"}; return schema?.title||labels[key]||key.replace(/[_-]+/g," ");}
+  function renderWorkflowGuide(form,meta){
+    const descriptionNode=$("[data-workflow-description]",form);if(descriptionNode)descriptionNode.textContent=meta?.description||"仅执行代码中注册的固定流程。";
+    const guide=$("[data-workflow-guide]",form); if(!guide)return; guide.replaceChildren();
+    const description=document.createElement("p"); description.textContent=meta?.description||"由已注册的固定流程执行，不支持上传或拼接任意脚本。"; guide.append(description);
+    (Array.isArray(meta?.supported_modes)?meta.supported_modes:["dry_run"]).forEach(mode=>{const p=document.createElement("p"); const b=document.createElement("b"); b.textContent=(scheduleModeShortLabels[mode]||mode)+"："; p.append(b,document.createTextNode(mode==="dry_run"?"只读取并检查，不点击不可逆操作。":mode==="approval"?"先生成清单，批准后重新核对再提交。":mode==="auto"?"规则全部通过后直接执行已注册动作。":"按该流程的安全规则运行。")); guide.append(p);});
+  }
+  function renderWorkflowConfig(form,values={}){
+    const container=$("[data-workflow-config]",form);if(!container)return;const meta=workflowMeta(form);container.replaceChildren();
+    let properties=workflowProperties(meta);if(!Object.keys(properties).length&&meta?.key==="amazon_disbursement")properties={marketplace_codes:{type:"array",title:"站点",items:{type:"string",enum:["CA","UK","AU"]},minItems:1}};
+    if(!Object.keys(properties).length){container.hidden=true;return;}container.hidden=false;
+    const required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);
+    Object.entries(properties).forEach(([rawKey,rawSchema])=>{
+      const key=safeWorkflowKey(rawKey);if(!key)return;const schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),provided=Object.prototype.hasOwnProperty.call(values,key),initial=provided?values[key]:schema.default;
+      const holder=document.createElement(type==="array"?"fieldset":"label");holder.dataset.configField=key;holder.dataset.configRequired=required.has(rawKey)?"true":"false";
+      if(type==="array"){
+        const legend=document.createElement("legend");legend.textContent=fieldLabel(key,schema)+(Number(schema.minItems||0)>0?"（至少选择 "+schema.minItems+" 个）":"");holder.append(legend);
+        const itemSchema=resolveWorkflowFieldSchema(meta,schema.items||{}),enumValues=Array.isArray(itemSchema.enum)?itemSchema.enum:[],supportedEnum=!schema.__uiUnsupported&&!schema.__uiNullable&&!itemSchema.__uiUnsupported&&!itemSchema.__uiNullable&&enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value)),current=new Set(Array.isArray(initial)?initial.map(value=>JSON.stringify(value)):[]);
+        if(!supportedEnum)holder.dataset.configUnsupported="true";
+        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
+      }else{
+        const title=document.createElement("span");title.textContent=fieldLabel(key,schema)+(required.has(rawKey)?" *":"");holder.append(title);const scalarType=["string","number","integer","boolean"].includes(type),enumValues=Array.isArray(schema.enum)?schema.enum:null,enumSupported=!enumValues||(enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value))),nullableSupported=!schema.__uiNullable||Boolean(enumValues)||type==="boolean";
+        if(schema.__uiUnsupported||!scalarType||!enumSupported||!nullableSupported){holder.dataset.configUnsupported="true";}
+        else{let input;
+          if(enumValues||(type==="boolean"&&schema.__uiNullable)){input=document.createElement("select");if(schema.__uiNullable){const empty=document.createElement("option");empty.value="__null";empty.dataset.configValue="null";empty.textContent="不设置";input.append(empty);}else if(!required.has(rawKey)&&initial===undefined){const empty=document.createElement("option");empty.value="";empty.textContent="请选择";input.append(empty);}(enumValues||[true,false]).forEach((value,index)=>{const option=document.createElement("option");option.value="option-"+index;option.dataset.configValue=JSON.stringify(value);option.textContent=String(value);input.append(option);});if(initial!==undefined&&initial!==null){const wanted=JSON.stringify(initial),match=[...input.options].find(option=>option.dataset.configValue===wanted);if(match)match.selected=true;else holder.dataset.configUnsupported="true";}}
+          else{input=document.createElement("input");input.type=(type==="number"||type==="integer")?"number":type==="boolean"?"checkbox":"text";if(type==="integer")input.step="1";else if(type==="number")input.step=String(schema.multipleOf||"any");if(schema.minimum!==undefined)input.min=String(schema.minimum);if(schema.maximum!==undefined)input.max=String(schema.maximum);if(schema.minLength!==undefined)input.minLength=Number(schema.minLength);if(schema.maxLength!==undefined)input.maxLength=Number(schema.maxLength);if(typeof schema.pattern==="string")input.pattern=schema.pattern;}
+          input.dataset.configKey=key;input.dataset.configType=type;input.dataset.configRequired=required.has(rawKey)?"true":"false";if(type==="boolean"&&!enumValues&&!schema.__uiNullable)input.checked=initial===undefined?false:Boolean(initial);else if(input.tagName!=="SELECT"&&initial!==undefined&&initial!==null)input.value=String(initial);holder.append(input);
+        }
+      }
+      const help=document.createElement("small");help.className="fieldset-help";help.textContent=holder.dataset.configUnsupported==="true"?"当前页面不支持该字段结构，请更新程序后再创建。":String(schema.description||"批量排期会把相同配置应用到每一家店铺。");holder.append(help);container.append(holder);
     });
-    const help = $("[data-marketplace-help]", form), warning = $("[data-marketplace-warning]", form);
-    const storeName = $('[name="store_id"]', form)?.selectedOptions?.[0]?.textContent?.trim() || "当前店铺";
-    if (help) help.textContent = enabled.size
-      ? `${storeName} 已启用：${[...enabled].join("、")}。只能勾选这些站点。`
-      : `${storeName} 还没有启用任何站点，请先到“店铺账册”完成站点配置。`;
-    if (warning) {
-      warning.hidden = unavailableSelected.length === 0;
-      warning.textContent = unavailableSelected.length
-        ? `⚠️ 旧排期包含当前未启用的站点：${unavailableSelected.join("、")}，已从本次选择中移除。请改选上方可用站点并保存，之后才能立即执行。`
-        : "";
-    }
-    form.dataset.hasInvalidMarketplaces = unavailableSelected.length ? "true" : "false";
   }
-  function updateScheduleModeHelp(form) {
-    const mode = $('[name="mode"]', form)?.value || "dry_run";
-    const help = $("[data-mode-help]", form);
-    if (help) help.textContent = scheduleModeLabels[mode] || mode;
+  function collectWorkflowConfig(form){
+    const meta=workflowMeta(form),config={},required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);let properties=workflowProperties(meta);if(!Object.keys(properties).length&&meta?.key==="amazon_disbursement")properties={marketplace_codes:{type:"array"}};
+    Object.entries(properties).forEach(([rawKey,rawSchema])=>{const key=safeWorkflowKey(rawKey);if(!key)return;const schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),fields=$$('[data-config-key="'+key+'"]',form);if(type==="array"){const selected=fields.filter(input=>input.checked).map(input=>{try{return input.dataset.configValue!==undefined?JSON.parse(input.dataset.configValue):input.value;}catch(_){return input.value;}});if(selected.length||required.has(rawKey)||(key==="marketplace_codes"&&meta?.requires_marketplace_targets!==false))config[key]=selected;return;}const field=fields[0];if(!field)return;const selectedOption=field.tagName==="SELECT"?field.selectedOptions?.[0]:null;if(selectedOption?.dataset.configValue!==undefined){try{config[key]=JSON.parse(selectedOption.dataset.configValue);return;}catch(_){/* fall through to normal parsing */}}if(type==="boolean"){if(field.tagName==="SELECT"&&!String(field.value||"").trim()&&!required.has(rawKey))return;config[key]=Boolean(field.checked);return;}const raw=String(field.value??"").trim();if(!raw&&!required.has(rawKey))return;if(type==="number"||type==="integer"){const numeric=Number(raw);config[key]=raw!==""&&Number.isFinite(numeric)?numeric:raw;}else config[key]=raw;});return config;
   }
-  function resetScheduleForm(form) {
-    form.reset();
-    delete form.dataset.scheduleId;
-    $("[data-schedule-dialog-title]", form).textContent = "新建任务排期";
-    $("[data-schedule-submit]", form).textContent = "保存排期";
-    const store = $('[name="store_id"]', form);
-    if (store) store.disabled = false;
-    const editHelp = $("[data-store-edit-help]", form);
-    if (editHelp) editHelp.hidden = true;
-    $("[data-form-error]", form).textContent = "";
-    setCheckedValues(form, "run_days", defaultScheduleDays);
-    setCheckedValues(form, "marketplace_codes", []);
-    refreshScheduleMarketplaces(form);
-    updateScheduleModeHelp(form);
+  function workflowConfigError(form,config=collectWorkflowConfig(form)){
+    const meta=workflowMeta(form),properties=workflowProperties(meta),required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);const unsupported=$("[data-config-unsupported=true]",form);if(unsupported)return"当前版本暂不支持该流程的配置字段，请更新程序。";
+    for(const [rawKey,rawSchema] of Object.entries(properties)){const key=safeWorkflowKey(rawKey),schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),value=config[key],missing=value===undefined||(value===null&&!schema.__uiNullable)||(typeof value==="string"&&!value.trim());if(required.has(rawKey)&&(missing||(Array.isArray(value)&&!value.length)))return"请填写流程参数："+fieldLabel(key,schema);if(missing)continue;if(type==="array"){if(schema.minItems!==undefined&&value.length<Number(schema.minItems))return fieldLabel(key,schema)+"至少选择 "+schema.minItems+" 项";if(schema.maxItems!==undefined&&value.length>Number(schema.maxItems))return fieldLabel(key,schema)+"最多选择 "+schema.maxItems+" 项";continue;}if(type==="number"||type==="integer"){if(value===null&&schema.__uiNullable)continue;const number=Number(value);if(!Number.isFinite(number)||(type==="integer"&&!Number.isInteger(number)))return fieldLabel(key,schema)+"必须填写有效"+(type==="integer"?"整数":"数字");if(schema.minimum!==undefined&&number<Number(schema.minimum))return fieldLabel(key,schema)+"不能小于 "+schema.minimum;if(schema.exclusiveMinimum!==undefined&&number<=Number(schema.exclusiveMinimum))return fieldLabel(key,schema)+"必须大于 "+schema.exclusiveMinimum;if(schema.maximum!==undefined&&number>Number(schema.maximum))return fieldLabel(key,schema)+"不能大于 "+schema.maximum;if(schema.exclusiveMaximum!==undefined&&number>=Number(schema.exclusiveMaximum))return fieldLabel(key,schema)+"必须小于 "+schema.exclusiveMaximum;if(schema.multipleOf!==undefined&&Math.abs(number/Number(schema.multipleOf)-Math.round(number/Number(schema.multipleOf)))>1e-9)return fieldLabel(key,schema)+"必须是 "+schema.multipleOf+" 的倍数";}else if(value!==null){const text=String(value);if(schema.minLength!==undefined&&text.length<Number(schema.minLength))return fieldLabel(key,schema)+"长度不能少于 "+schema.minLength;if(schema.maxLength!==undefined&&text.length>Number(schema.maxLength))return fieldLabel(key,schema)+"长度不能超过 "+schema.maxLength;if(typeof schema.pattern==="string"){try{if(!(new RegExp(schema.pattern)).test(text))return fieldLabel(key,schema)+"格式不正确";}catch(_){return"当前流程的字段规则无法解析，请更新程序。";}}}if(value!==null&&Array.isArray(schema.enum)&&!schema.enum.map(String).includes(String(value)))return fieldLabel(key,schema)+"选项无效";}
+    return null;
   }
-  function openScheduleEditor(data) {
-    const dialog = $("#schedule-dialog"), form = $("[data-schedule-form]", dialog);
-    resetScheduleForm(form);
-    form.dataset.scheduleId = String(data.id);
-    $("[data-schedule-dialog-title]", form).textContent = "编辑任务排期";
-    $("[data-schedule-submit]", form).textContent = "保存修改";
-    for (const key of ["store_id", "name", "local_time", "mode"]) {
-      const input = $(`[name="${key}"]`, form);
-      if (input) input.value = data[key] ?? "";
-    }
-    const store = $('[name="store_id"]', form);
-    if (store) store.disabled = true;
-    const editHelp = $("[data-store-edit-help]", form);
-    if (editHelp) editHelp.hidden = false;
-    $('[name="enabled"]', form).checked = !!data.enabled;
-    setCheckedValues(form, "marketplace_codes", data.marketplace_codes || []);
-    refreshScheduleMarketplaces(form, {preserveInvalid:true});
-    const days = data.days_of_week === "*" ? ["mon", "tue", "wed", "thu", "fri", "sat", "sun"] : String(data.days_of_week || "").split(",").map(x => x.trim()).filter(Boolean);
-    setCheckedValues(form, "run_days", days);
-    updateScheduleModeHelp(form);
-    dialog.showModal();
+  function setWorkflowConfig(form,values){renderWorkflowConfig(form,values&&typeof values==="object"?values:{});}  function updateScheduleModeHelp(form){
+    const meta=workflowMeta(form),modeSelect=$('[name="mode"]',form); if(modeSelect){const supported=Array.isArray(meta?.supported_modes)&&meta.supported_modes.length?meta.supported_modes:["dry_run"];const current=modeSelect.value;modeSelect.replaceChildren();supported.forEach(mode=>{const option=document.createElement("option");option.value=mode;option.textContent=scheduleModeShortLabels[mode]||mode;modeSelect.append(option);});modeSelect.value=supported.includes(current)?current:(supported.includes(meta?.default_mode)?meta.default_mode:supported[0]);}
+    const help=$("[data-mode-help]",form);if(help)help.textContent=scheduleModeLabels[modeSelect?.value]||"按已注册流程规则执行。";renderWorkflowGuide(form,meta);
   }
+  function refreshScheduleStoreEligibility(form){const needsIdentity=workflowMeta(form)?.requires_confirmed_identity!==false;$$('[data-store-option]',form).forEach(row=>{const state=$('[data-store-target-state]',row),enabled=row.dataset.storeEnabled!=="false",identity=row.dataset.identityConfirmed!=="false",eligible=enabled&&(!needsIdentity||identity);if(!state)return;state.textContent=eligible?"待预检":(!enabled?"店铺未启用":"卖家身份未确认");state.className="store-target-state"+(eligible?"":" bad");});}
+  function renderWorkflowOptions(form,selectedKey){const select=$('[name="workflow"]',form);if(!select)return;select.replaceChildren();(scheduleWorkflows.length?scheduleWorkflows:fallbackScheduleWorkflows).forEach(meta=>{if(!meta?.key)return;const option=document.createElement("option");option.value=meta.key;option.textContent=meta.display_name||meta.key;option.title=meta.description||"";select.append(option);});if(selectedKey&&[...select.options].some(option=>option.value===selectedKey))select.value=selectedKey;updateScheduleModeHelp(form);renderWorkflowConfig(form);refreshScheduleStoreEligibility(form);}
+  async function loadScheduleWorkflows(form,selectedKey){if(!scheduleWorkflowReady){scheduleWorkflowReady=api("/api/workflows").then(data=>{const list=Array.isArray(data)?data:(Array.isArray(data?.workflows)?data.workflows:[]);scheduleWorkflows=list.filter(item=>item&&item.key).map(item=>({...item,key:safeWorkflowKey(item.key)}));if(!scheduleWorkflows.length)scheduleWorkflows=fallbackScheduleWorkflows;return scheduleWorkflows;}).catch(()=>{scheduleWorkflows=fallbackScheduleWorkflows;return scheduleWorkflows;});}await scheduleWorkflowReady;const liveKey=selectedKey||$('[name="workflow"]',form)?.value,liveConfig=collectWorkflowConfig(form);renderWorkflowOptions(form,liveKey);if(Object.keys(liveConfig).length&&!form.dataset.scheduleEditing)setWorkflowConfig(form,liveConfig);}
+  function setScheduleStep(form,step){const editing=form.dataset.scheduleEditing==="true";$$("[data-schedule-step]",form).forEach(section=>{section.hidden=editing?section.dataset.scheduleStep!=="1":section.dataset.scheduleStep!==String(step);});$$("[data-step-indicator]",form).forEach(item=>item.classList.toggle("active",item.dataset.stepIndicator===String(step)));const summary=$("[data-schedule-step-summary]",form);if(summary&&step===2&&!editing){const meta=workflowMeta(form),sites=collectWorkflowConfig(form).marketplace_codes||[];summary.textContent=(meta?.display_name||meta?.key||"已注册流程")+" · "+($('[name="mode"]',form)?.value||"dry_run")+" · "+sites.join(" / ")+"。下面选择要创建相同排期的店铺，提交前会逐家预检。";}form.dataset.scheduleStep=String(step);}
+  function setScheduleRefreshPending(form,pending){if(pending)form.dataset.schedulerRefreshPending="true";else delete form.dataset.schedulerRefreshPending;$$('input,select,textarea,button',form).forEach(control=>{control.disabled=pending&&!control.matches('[data-schedule-submit]');});}
+  function resetScheduleForm(form){setScheduleRefreshPending(form,false);form.reset();delete form.dataset.scheduleId;delete form.dataset.scheduleEditing;delete form.dataset.batchRequestId;invalidateSchedulePreview(form);const hiddenStore=$('[name="store_id"]',form);if(hiddenStore)hiddenStore.value="";$("[data-schedule-dialog-title]",form).textContent="新建任务排期";const submit=$("[data-schedule-submit]",form);if(submit){submit.disabled=false;submit.textContent="预检并创建排期";}const createNext=$("[data-schedule-create-next]",form);if(createNext)createNext.hidden=false;const editSubmit=$("[data-schedule-edit-submit]",form);if(editSubmit){editSubmit.hidden=true;editSubmit.disabled=false;}const indicator=$("[data-schedule-step-indicator]",form);if(indicator)indicator.hidden=false;const workflow=$('[name="workflow"]',form);if(workflow){workflow.disabled=false;workflow.value="amazon_disbursement";}renderWorkflowOptions(form,"amazon_disbursement");setCheckedValues(form,"run_days",defaultScheduleDays);$$('input[name="target_store_ids"]',form).forEach(input=>{input.checked=false;});const search=$('[data-store-search]',form);if(search)search.value="";$$('[data-store-option]',form).forEach(row=>{row.hidden=false;});refreshScheduleStoreEligibility(form);const preview=$("[data-batch-preview]",form);if(preview)preview.hidden=true;$("[data-form-error]",form).textContent="";setScheduleStep(form,1);loadScheduleWorkflows(form);}
+  function openScheduleEditor(data){const dialog=$("#schedule-dialog"),form=$("[data-schedule-form]",dialog);resetScheduleForm(form);form.dataset.scheduleId=String(data.id);form.dataset.scheduleEditing="true";const lockedWorkflow=$('[name="workflow"]',form);if(lockedWorkflow)lockedWorkflow.disabled=true;const hiddenStore=$('[name="store_id"]',form);if(hiddenStore)hiddenStore.value=String(data.store_id||"");$("[data-schedule-dialog-title]",form).textContent="编辑任务排期";const createNext=$("[data-schedule-create-next]",form);if(createNext)createNext.hidden=true;const editSubmit=$("[data-schedule-edit-submit]",form);if(editSubmit){editSubmit.hidden=false;editSubmit.disabled=false;editSubmit.textContent="保存修改";}const indicator=$("[data-schedule-step-indicator]",form);if(indicator)indicator.hidden=true;for(const key of ["name","local_time","mode"]){const input=$('[name="'+key+'"]',form);if(input)input.value=data[key]??"";}$('[name="enabled"]',form).checked=!!data.enabled;const days=data.days_of_week==="*" ? ["mon","tue","wed","thu","fri","sat","sun"] : String(data.days_of_week||"").split(",").map(value=>value.trim()).filter(Boolean);setCheckedValues(form,"run_days",days);loadScheduleWorkflows(form,data.workflow||"amazon_disbursement").then(()=>{const meta=scheduleWorkflows.find(item=>item.key===String(data.workflow||"amazon_disbursement"));if(!meta){$("[data-form-error]",form).textContent="该排期使用的流程已不在代码白名单中，已禁止修改。";if(editSubmit)editSubmit.disabled=true;return;}const workflow=$('[name="workflow"]',form);if(workflow){workflow.value=data.workflow||"amazon_disbursement";workflow.disabled=true;}updateScheduleModeHelp(form);const description=$("[data-workflow-description]",form);if(description)description.textContent=(meta.description||meta.display_name||meta.key)+"（流程创建后不可更换）";setWorkflowConfig(form,data.workflow_config||{marketplace_codes:data.marketplace_codes||[]});});setScheduleStep(form,1);dialog.showModal();}
+  function selectedScheduleStoreIds(form){return $$('input[name="target_store_ids"]:checked',form).map(input=>Number(input.value)).filter(validPositiveId);}
+  function scheduleStoreRow(form, storeId){return $$("[data-store-option]", form).find(row => String(row.dataset.storeId || "") === String(storeId));}
+  function updateSelectedStoreCount(form){const count=selectedScheduleStoreIds(form),node=$("[data-selected-store-count]",form);if(node)node.textContent="已选择 "+count.length+" 家";}
+  function buildScheduleTemplate(form){const runDays=selectedValues(form,"run_days");return{name:String($('[name="name"]',form)?.value||"").trim(),workflow:String($('[name="workflow"]',form)?.value||""),mode:String($('[name="mode"]',form)?.value||""),workflow_config:collectWorkflowConfig(form),local_time:String($('[name="local_time"]',form)?.value||""),days_of_week:runDays.length===7?"*":runDays.join(","),timezone:"Asia/Singapore",enabled:Boolean($('[name="enabled"]',form)?.checked),misfire_grace_seconds:1800};}
+  function buildBatchPayload(form){let requestId=form.dataset.batchRequestId;if(!requestId){requestId=window.crypto?.randomUUID?.()||"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0,v=c==="x"?r:(r&3)|8;return v.toString(16);});form.dataset.batchRequestId=requestId;}const template=buildScheduleTemplate(form),storeIds=selectedScheduleStoreIds(form);return{request_id:requestId,store_ids:storeIds,template};}
+  function renderBatchPreview(form,data){
+    const panel=$("[data-batch-preview]",form);if(!panel)return;const targets=Array.isArray(data?.targets)?data.targets:[],eligible=data?.eligible===true,eligibleCount=Number(data?.eligible_count??targets.filter(item=>item?.eligible===true).length),count=eligible?Number(data?.created_count??targets.length):0,meta=workflowMeta(form),sites=collectWorkflowConfig(form).marketplace_codes||[];panel.hidden=false;
+    const countNode=$("[data-batch-preview-count]",panel);if(countNode)countNode.textContent="本次将创建 "+count+" 条";
+    const message=$("[data-batch-preview-message]",panel);if(message)message.textContent=eligible?"所有选中的店铺均已通过预检，可以确认创建。":"预检未通过：已选 "+targets.length+" 家，其中 "+eligibleCount+" 家符合条件，本次仍会创建 0 条。请取消不合格店铺，或先完成店铺建档后再试。";
+    const list=$("[data-batch-preview-list]",panel);if(!list)return;list.replaceChildren();
+    targets.sort((a,b)=>Number(a.order||0)-Number(b.order||0)).forEach(item=>{const row=document.createElement("div");row.className="batch-preview-row "+(item.eligible?"ok":"bad");const name=document.createElement("b"),order=Number(item.order||0),siteCopy=sites.length?" · "+sites.join(" / "):" · 店铺级";name.textContent="#"+order+" "+String(item.store_name||("店铺 #"+item.store_id))+" · "+String(meta?.display_name||meta?.key||"流程")+siteCopy;const reason=document.createElement("span"),reasons=Array.isArray(item.reasons)?item.reasons:[];reason.textContent=item.eligible?"符合条件":(reasons.join("；")||"不符合该流程要求");row.append(name,reason);list.append(row);const targetRow=scheduleStoreRow(form,item.store_id),state=targetRow&&$("[data-store-target-state]",targetRow);if(state){state.textContent=item.eligible?"可创建":"需处理";state.className="store-target-state "+(item.eligible?"ok":"bad");}});
+    form.dataset.batchPreviewHash=String(data.definition_hash||"");form.dataset.previewed=eligible?"true":"false";const submit=$("[data-schedule-submit]",form);if(submit)submit.textContent=eligible?"确认创建 "+count+" 条排期":"重新预检";
+  }  async function previewBatchSchedule(form){const error=$("[data-form-error]",form),storeIds=selectedScheduleStoreIds(form);if(!storeIds.length){error.textContent="请至少选择一家店铺。";setScheduleStep(form,2);return false;}const nonce=invalidateSchedulePreview(form),payload=buildBatchPayload(form),payloadJson=JSON.stringify(payload),button=$("[data-schedule-submit]",form);if(button){button.disabled=true;button.textContent="预检中…";}try{const result=await api("/api/schedules/batch/preview",{method:"POST",body:payloadJson});if(form.dataset.previewNonce!==nonce)return false;form.dataset.batchPreviewPayload=payloadJson;renderBatchPreview(form,result);return result?.eligible===true;}catch(exc){if(form.dataset.previewNonce===nonce)error.textContent=exc.message;return false;}finally{if(button&&form.dataset.previewNonce===nonce)button.disabled=false;}}
+  async function createBatchSchedule(form,payloadJson){const error=$("[data-form-error]",form),button=$("[data-schedule-submit]",form);if(button){button.disabled=true;button.textContent="正在创建…";}try{const result=await api("/api/schedules/batch",{method:"POST",body:payloadJson}),count=Number(result.created_count||result.schedules?.length||0),refreshWarning=result.scheduler_refreshed===false?String(result.warning||"排期已保存，但定时器尚未刷新。请在本页点击重试，不要重新新建。"):"";toast(refreshWarning||(result.status==="existing"?"相同批次已存在，未重复创建":`已创建 ${count} 条排期`),Boolean(refreshWarning));if(refreshWarning){setScheduleRefreshPending(form,true);error.textContent=refreshWarning;if(button){button.disabled=false;button.textContent="重试刷新定时器";}return false;}setScheduleRefreshPending(form,false);setTimeout(()=>location.reload(),650);return true;}catch(exc){if(exc.detail&&typeof exc.detail==="object"&&Array.isArray(exc.detail.targets))renderBatchPreview(form,exc.detail);error.textContent=exc.message;if(button){button.disabled=false;button.textContent=form.dataset.schedulerRefreshPending==="true"?"重试刷新定时器":"确认创建排期";}return false;}}
+
   $$('[data-api-form]').forEach(form => form.addEventListener("submit", async event => {
     event.preventDefault(); const error = $("[data-form-error]", form); if (error) error.textContent = "";
     const button = $('button[type="submit"]', form); if (button) button.disabled = true;
@@ -797,6 +970,11 @@
     if (action === "logout") { try { const data = await api("/auth/logout", {method:"POST", body:"{}"}); location.href = data.next; } catch (exc) { toast(exc.message, true); } return; }
     if (action === "close-dialog") {
       const form = target.closest("form");
+      if (form?.dataset.schedulerRefreshPending === "true") {
+        const error = $("[data-form-error]", form);
+        if (error) error.textContent = "排期已经保存，请先点击“重试刷新定时器”；也可以直接重启后台。为避免重复排期，本窗口暂不关闭。";
+        return;
+      }
       if (form?.dataset.storeSetupProbeId) {
         const ui = storeSetupUi(form);
         ui.error.textContent = "检测正在占用紫鸟店铺窗口，请先点击当前检测区域中的“取消并关闭该店铺窗口”。";
@@ -823,7 +1001,9 @@
       dialog.dataset.storeId = String(data.id ?? ""); const ui = storeSetupUi(form); ui.error.textContent = "";
       ui.identity.textContent = "统一建档会在同一个紫鸟店铺窗口中读取卖家身份并逐站核验；身份一致时会自动绑定并确认，只有身份冲突才需要人工复核。";
       ui.result.textContent = "先勾选至少一个站点，再点击“自动获取卖家ID并核验站点”。";
-      dialog.showModal(); return;
+      dialog.showModal();
+      restoreActiveStoreSetupProbe(form, data.id);
+      return;
     }
     if (action === "detect-store-setup") {
       const form = target.closest("form"), id = Number($("[name=id]", form)?.value), ui = storeSetupUi(form);
@@ -835,7 +1015,10 @@
       try {
         const {data, statusCode} = await apiResult(`/api/stores/${encodeURIComponent(String(id))}/detect-store-setup`, {method:"POST", body:JSON.stringify({marketplace_codes:marketplaceCodes})});
         await handleStoreSetupResponse(form, data, statusCode);
-      } catch (exc) { failStoreSetup(form, exc.message); } finally {
+      } catch (exc) {
+        if (isZiniaoCredentialError(exc)) pauseStoreSetupForCredential(form, exc);
+        else failStoreSetup(form, exc.message);
+      } finally {
         if (!form.dataset.storeSetupProbeId) clearStoreSetupProbe(form);
       }
       return;
@@ -854,10 +1037,15 @@
           && form.dataset.storeSetupProbeStatus === "WAITING_AUTH";
         if (stillWaitingForAuth) {
           ui.panel.hidden = false;
+          target.hidden = false;
           target.disabled = false;
           target.textContent = "再次尝试自动登录并继续";
           ui.cancel.disabled = false;
-        } else {
+        } else if (form.dataset.storeSetupProbeId !== probeId) {
+          // Only tear the panel down once this probe is genuinely gone. It is
+          // still tracked whenever polling gave up on a probe that keeps
+          // running, and hiding the panel then would take the cancel button
+          // away at exactly the moment the operator needs it.
           hideStoreSetupAuth(form);
         }
       }
@@ -878,6 +1066,9 @@
       if (bulkStoreSetup.queue.length && bulkStoreSetup.index < bulkStoreSetup.queue.length && bulkStoreSetup.resumeAvailable) {
         const currentStore = bulkStoreSetup.queue[bulkStoreSetup.index];
         bulkStoreSetup.active = true; target.disabled = true; target.textContent = "继续追踪中…";
+        // Abandoning mid-flight would strand a live Ziniao window; 「跳过此店并继续」
+        // is the right control once the probe reports in.
+        { const ui = bulkSetupUi(); if (ui.dismiss) ui.dismiss.hidden = true; }
         try {
           if (bulkStoreSetup.probeId) await pollBulkStoreSetup(currentStore, bulkStoreSetup.probeId);
           else await runNextBulkStoreSetup();
@@ -918,7 +1109,7 @@
       sessionStorage.removeItem(bulkSetupSummaryStorageKey);
       Object.assign(bulkStoreSetup, {active:true, queue:eligible, index:0, success:0, siteIncomplete:0, auth:0, failed:0, storeId:null, probeId:null, probeStatus:null, authCountedProbeId:null, resumeAvailable:false});
       persistBulkStoreSetup();
-      const ui = bulkSetupUi(); ui.panel.hidden = false; ui.actions.hidden = true; target.disabled = true; target.textContent = "批量建档进行中…"; updateBulkSetupCounts();
+      const ui = bulkSetupUi(); ui.panel.hidden = false; ui.actions.hidden = true; if (ui.dismiss) ui.dismiss.hidden = true; target.disabled = true; target.textContent = "批量建档进行中…"; updateBulkSetupCounts();
       await runNextBulkStoreSetup(); return;
     }
     if (action === "continue-bulk-store-setup") {
@@ -956,6 +1147,13 @@
       }
       return;
     }
+    if (action === "discard-bulk-store-setup") {
+      const name = bulkStoreSetup.queue[bulkStoreSetup.index]?.name || "当前店铺";
+      if (!(await confirmAction(`放弃这个未完成的队列吗？停在“${name}”的进度和上面的计数都会清除，已经建好的档不受影响；之后点“一键自动建档全部店铺”会按当前卡片重新挑选店铺。`))) return;
+      discardBulkStoreSetup();
+      toast("已放弃未完成队列");
+      return;
+    }
     if (action === "skip-bulk-store-setup") {
       if (!bulkStoreSetup.active || !validPositiveId(bulkStoreSetup.storeId) || !bulkStoreSetup.probeId) return;
       const ui = bulkSetupUi(); target.disabled = true;
@@ -991,6 +1189,32 @@
       const dialog = $("#schedule-dialog"), form = $("[data-schedule-form]", dialog);
       resetScheduleForm(form); dialog?.showModal(); return;
     }
+    if (action === "schedule-next-step") {
+      const form = target.closest("[data-schedule-form]"); if (!form) return;
+      const error = $("[data-form-error]", form); error.textContent = "";
+      const runDays = selectedValues(form, "run_days"), config = collectWorkflowConfig(form);
+      if (!workflowMeta(form)?.key) { error.textContent = "请选择一个已注册的自动化流程。"; return; }
+      if (!String($('[name="name"]', form)?.value || "").trim()) { error.textContent = "请填写排期名称。"; return; }
+      if (!String($('[name="local_time"]', form)?.value || "")) { error.textContent = "请选择执行时间。"; return; }
+      if (!runDays.length) { error.textContent = "请至少选择一个每周运行日。"; return; }
+      const configError = workflowConfigError(form, config);
+      if (configError) { error.textContent = configError; return; }
+      if (workflowMeta(form)?.requires_marketplace_targets !== false && (!Array.isArray(config.marketplace_codes) || !config.marketplace_codes.length)) { error.textContent = "请至少勾选一个站点。"; return; }
+      setScheduleStep(form, 2); updateSelectedStoreCount(form); return;
+    }
+    if (action === "schedule-prev-step") {
+      const form = target.closest("[data-schedule-form]"); if (form) { setScheduleStep(form, 1); $("[data-form-error]", form).textContent = ""; } return;
+    }
+    if (action === "select-all-schedule-stores") {
+      const form = target.closest("[data-schedule-form]"); if (!form) return;
+      $$("[data-store-option]", form).filter(row => !row.hidden).forEach(row => { const input = $('input[name="target_store_ids"]', row); if (input) input.checked = true; });
+      updateSelectedStoreCount(form); delete form.dataset.previewed; delete form.dataset.batchPreviewHash; return;
+    }
+    if (action === "clear-schedule-stores") {
+      const form = target.closest("[data-schedule-form]"); if (!form) return;
+      $$('input[name="target_store_ids"]', form).forEach(input => { input.checked = false; });
+      updateSelectedStoreCount(form); delete form.dataset.previewed; delete form.dataset.batchPreviewHash; const preview = $("[data-batch-preview]", form); if (preview) preview.hidden = true; return;
+    }
     if (action === "edit-schedule") {
       try { openScheduleEditor(JSON.parse(target.dataset.schedule || "{}")); }
       catch (_) { toast("排期数据读取失败，请刷新页面后重试。", true); }
@@ -1017,7 +1241,20 @@
       const name = target.dataset.scheduleName || `排期 #${id}`;
       if (!(await confirmAction(`确定永久删除排期“${name}”吗？删除后不会再自动运行，已有运行记录不会被删除。`))) return;
       target.disabled = true;
-      try { await api(`/api/schedules/${id}`, {method:"DELETE", body:"{}"}); toast("排期已删除"); setTimeout(() => location.reload(), 400); }
+      try {
+        const data = await api(`/api/schedules/${id}`, {method:"DELETE", body:"{}"});
+        if (data.scheduler_refreshed === false) {
+          const warning = String(data.warning || "排期已从数据库删除，但定时器尚未应用这次变更；请不要重复删除，重启后台后会自动重新加载。");
+          toast(warning, true);
+          target.textContent = "已删除 · 定时器待重载";
+          // Keep the warning visible before refreshing the now-stale row. The
+          // disabled button also prevents a second DELETE while SQLite already
+          // contains the authoritative deletion.
+          setTimeout(() => location.reload(), 4500);
+          return;
+        }
+        toast("排期已删除"); setTimeout(() => location.reload(), 400);
+      }
       catch (exc) { toast(exc.message, true); target.disabled = false; }
       return;
     }
@@ -1067,14 +1304,13 @@
     catch (exc) { error.textContent = exc.message; if (button) button.disabled = false; }
   });
   const storeEditor = $("[data-store-form]");
+  $("#schedule-dialog")?.addEventListener("cancel", event => {
+    const form=$("[data-schedule-form]",event.currentTarget);if(form?.dataset.schedulerRefreshPending==="true"){event.preventDefault();const error=$("[data-form-error]",form);if(error)error.textContent="排期已经保存，请先重试刷新定时器，避免重复创建。";}
+  });
   $("[name=expected_seller_id]", storeEditor || document)?.addEventListener("input", event => {
     const form = event.currentTarget.form;
     if (!form || normalizedSellerIdentity(event.currentTarget.value) === normalizedSellerIdentity(form.dataset.persistedSellerId)) return;
     $("[name=identity_confirmed]", form).checked = false;
-    $("[name=enabled]", form).checked = false;
-  });
-  $("[name=identity_confirmed]", storeEditor || document)?.addEventListener("change", event => {
-    if (!event.currentTarget.checked) $("[name=enabled]", event.currentTarget.form).checked = false;
   });
   $("[data-run-form]")?.addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget, error = $("[data-form-error]", form); error.textContent = "";
@@ -1083,29 +1319,82 @@
   });
   $("[data-schedule-form]")?.addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget, error = $("[data-form-error]", form); error.textContent = "";
-    const marketplaceCodes = selectedValues(form, "marketplace_codes"), runDays = selectedValues(form, "run_days");
-    if (!marketplaceCodes.length) { error.textContent = "请至少勾选一个站点（CA、UK 或 AU）。"; return; }
-    if (!runDays.length) { error.textContent = "请至少勾选一个每周运行日。"; return; }
     const editingId = Number(form.dataset.scheduleId || 0);
-    const data = formData(form);
-    delete data.run_days;
-    data.marketplace_codes = marketplaceCodes;
-    data.days_of_week = runDays.length === 7 ? "*" : runDays.join(",");
-    data.timezone = "Asia/Singapore";
-    if (editingId) delete data.store_id;
-    else { data.store_id = Number(data.store_id); data.workflow = "amazon_disbursement"; }
-    const button = $("[data-schedule-submit]", form); button.disabled = true;
+    if (!editingId && form.dataset.schedulerRefreshPending === "true") { const savedPayload = form.dataset.batchPreviewPayload; if (!savedPayload) { error.textContent = "已保存批次的重试信息丢失，请刷新页面；数据库不会重复创建。"; return; } await createBatchSchedule(form, savedPayload); return; }
+    const runDays = selectedValues(form, "run_days"), config = collectWorkflowConfig(form);
+    if (!runDays.length) { error.textContent = "请至少选择一个每周运行日。"; setScheduleStep(form, 1); return; }
+    const configError = workflowConfigError(form, config);
+    if (configError) { error.textContent = configError; setScheduleStep(form, 1); return; }
+    if (workflowMeta(form)?.requires_marketplace_targets !== false && (!Array.isArray(config.marketplace_codes) || !config.marketplace_codes.length)) { error.textContent = "请至少勾选一个站点。"; setScheduleStep(form, 1); return; }
+    if (!editingId) {
+      if (!workflowMeta(form)?.key) { error.textContent = "请选择一个已注册的自动化流程。"; setScheduleStep(form, 1); return; }
+      if (!selectedScheduleStoreIds(form).length) { error.textContent = "请至少选择一家店铺。"; setScheduleStep(form, 2); return; }
+      setScheduleStep(form, 2);
+      if (form.dataset.previewed !== "true") { await previewBatchSchedule(form); return; }
+      const payload = buildBatchPayload(form), payloadJson = JSON.stringify(payload);
+      if (form.dataset.batchPreviewPayload !== payloadJson) { invalidateSchedulePreview(form); await previewBatchSchedule(form); return; }
+      await createBatchSchedule(form, payloadJson);
+      return;
+    }
+    const data = {name:String($("[name=name]",form)?.value || "").trim(), mode:String($("[name=mode]",form)?.value || ""), workflow_config:config, marketplace_codes:config.marketplace_codes || [], days_of_week:runDays.length===7?"*":runDays.join(","), local_time:$('[name="local_time"]',form).value, timezone:"Asia/Singapore", enabled:Boolean($('[name="enabled"]',form).checked)};
+    const button = $("[data-schedule-edit-submit]", form); if (button) button.disabled = true;
     try {
-      await api(editingId ? `/api/schedules/${editingId}` : "/api/schedules", {method:editingId ? "PATCH" : "POST", body:JSON.stringify(data)});
-      toast(editingId ? "排期修改已保存" : "排期已保存"); setTimeout(() => location.reload(), 500);
-    } catch (exc) { error.textContent = exc.message; button.disabled = false; }
+      const result = await api(`/api/schedules/${editingId}`, {method:"PATCH", body:JSON.stringify(data)});
+      if (result.scheduler_refreshed === false) {
+        const warning = String(result.warning || "排期修改已保存到数据库，但定时器尚未应用；请不要重复提交，重启后台后会自动重新加载。");
+        error.textContent = warning;
+        toast(warning, true);
+        // The durable PATCH has already succeeded. Leave the submit control
+        // disabled so an operator cannot mistake projection lag for a failed
+        // save and replay the mutation.
+        if (button) button.textContent = "已保存 · 定时器待重载";
+        return;
+      }
+      toast("排期修改已保存"); setTimeout(() => location.reload(), 500);
+    }
+    catch (exc) { error.textContent = exc.message; if (button) button.disabled = false; }
   });
-  $('[data-schedule-mode]')?.addEventListener("change", event => updateScheduleModeHelp(event.currentTarget.form));
-  $('[data-schedule-store]')?.addEventListener("change", event => refreshScheduleMarketplaces(event.currentTarget.form));
+  $('[data-schedule-mode]')?.addEventListener("change", event => { updateScheduleModeHelp(event.currentTarget.form); delete event.currentTarget.form.dataset.previewed; });
+  $('[data-schedule-workflow]')?.addEventListener("change", event => { renderWorkflowOptions(event.currentTarget.form, event.currentTarget.value); delete event.currentTarget.form.dataset.previewed; });
+  $('[data-schedule-form]')?.addEventListener("input", event => {
+    const form = event.currentTarget;
+    if (event.target.matches('[data-store-search]')) return;
+    invalidateSchedulePreview(form);
+    const preview = $("[data-batch-preview]", form); if (preview) preview.hidden = true;
+    updateSelectedStoreCount(form);
+  });
+  $('[data-schedule-form]')?.addEventListener("change", event => {
+    if (event.target.matches('[data-store-search]')) return;
+    const form = event.currentTarget;
+    invalidateSchedulePreview(form);
+    const preview = $("[data-batch-preview]", form); if (preview) preview.hidden = true;
+    updateSelectedStoreCount(form);
+  });
+  $('[data-store-search]')?.addEventListener("input", event => {
+    const query = String(event.currentTarget.value || "").trim().toLowerCase();
+    $$("[data-store-option]", event.currentTarget.form).forEach(row => { row.hidden = query && !String(row.dataset.storeName || "").toLowerCase().includes(query); });
+  });
+  // Guarded because this file is one bundle for every page.  The schedule form
+  // exists only on /schedules, and `$$`'s `root = document` default does NOT
+  // apply to an explicit null — only to undefined — so passing the missing form
+  // reached `null.querySelectorAll` and threw.  Everything below this line then
+  // never ran, including the credentials form's submit handler: the page looked
+  // fine, but saving fell back to a native form POST, so it reloaded to the top
+  // with no request, no toast and nothing in the log.
+  const scheduleForm = $("[data-schedule-form]");
+  if (scheduleForm) updateSelectedStoreCount(scheduleForm);
   if ($('[data-action="detect-all-store-setups"]')) {
     restoreBulkStoreSetup();
     if (!bulkStoreSetup.queue.length) restoreBulkSetupCompletionSummary();
   }
+  // A page-specific block that throws must not silently disable every block
+  // after it.  One bundle serves every page, so the failure lands on a screen
+  // that has nothing to do with the broken code — and the symptom is a form
+  // quietly reverting to a native submit, which looks like "the button does
+  // nothing" rather than like an error.
+  window.addEventListener("error", event => {
+    console.error("[ziniao] 页面脚本出错，部分按钮可能失效", event.error || event.message);
+  });
   // ---- 系统诊断页：WebDriver 切换与凭据配置 ----------------------------------
   (function diagnosticsPage() {
     const webdriverButton = $('[data-action="start-webdriver"]');
@@ -1148,17 +1437,29 @@
     function bindSettings(kind, endpoint, successText) {
       const form = $(`[data-settings-form="${kind}"]`);
       if (!form) return;
-      form.addEventListener("submit", async event => {
-        event.preventDefault();
+      // Bound to the button's click, not the form's submit.  A submit handler
+      // is only as good as the script that installs it: when an unrelated
+      // page-specific block threw earlier in this bundle, the handler never
+      // bound and the browser fell back to a native submit — the page reloaded
+      // to the top, no request was sent, and the operator was left with a
+      // button that appeared to do nothing.  The button is now type="button",
+      // so the worst case is an inert control rather than a lost form.
+      $(`[data-settings-save="${kind}"]`, form)?.addEventListener("click", async event => {
         const error = $("[data-form-error]", form);
-        const submit = $('button[type="submit"]', form);
+        // The clicked control itself.  Looking it up by `button[type="submit"]`
+        // stopped working the moment these became type="button" (so that a
+        // script failure degrades to an inert button instead of a native form
+        // submit) — the lookup returned null and `submit.disabled = true` threw
+        // on every click, which is the same "button does nothing" symptom the
+        // type change was meant to prevent.
+        const submit = event.currentTarget;
         const payload = {};
         $$("input[name]", form).forEach(input => { payload[input.name] = input.value.trim(); });
         if (Object.values(payload).some(value => !value)) {
-          error.textContent = "所有字段都必须填写；密码类字段不会回显，修改时请重新输入完整值。";
+          if (error) error.textContent = "所有字段都必须填写；密码类字段不会回显，修改时请重新输入完整值。";
           return;
         }
-        error.textContent = "";
+        if (error) error.textContent = "";
         submit.disabled = true;
         const original = submit.textContent;
         submit.textContent = "保存中…";
@@ -1170,7 +1471,8 @@
           $$('input[type="password"]', form).forEach(input => { input.value = ""; });
           setTimeout(() => location.reload(), 800);
         } catch (exc) {
-          error.textContent = exc.message;
+          if (error) error.textContent = exc.message;
+          toast(exc.message, true);
           submit.disabled = false;
           submit.textContent = original;
         }

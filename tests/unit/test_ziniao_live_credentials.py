@@ -480,3 +480,95 @@ async def test_credential_reference_preserves_startup_fields_when_blob_is_partia
     assert client.config.username == "boot-user"
     assert client.config.password == "stored-password"
     await client.close()
+
+
+@pytest.mark.asyncio
+async def test_webdriver_launch_detaches_like_the_batch_file(monkeypatch, tmp_path) -> None:
+    """Ziniao must outlive the spawning call, not become our child.
+
+    ``Ziniao-WebDriver.bat`` uses ``start ""`` — a detached launch — and that is
+    the form that has always worked.  Started as an ordinary child of a service
+    running under ``pythonw`` it inherits a console-less context and our process
+    group, and exits within seconds: the field log showed three consecutive
+    "Starting Ziniao WebDriver mode" lines, no surviving ziniao.exe, and 16851
+    never opening.
+    """
+
+    from ziniao_automation.ziniao import webdriver_mode as mode
+
+    exe = tmp_path / "ziniao.exe"
+    exe.write_bytes(b"")
+    captured: dict[str, object] = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+
+        class _P:  # noqa: D401 - stand-in for the spawned process
+            pass
+
+        return _P()
+
+    monkeypatch.setattr(mode.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mode, "_running_ziniao_pids", lambda _e: _none())
+    monkeypatch.setattr(mode, "port_open", lambda *a, **k: False)
+    monkeypatch.setattr(mode, "READY_TIMEOUT_SECONDS", 0.01)
+
+    await mode.start_webdriver_mode(exe, host="127.0.0.1", port=16851, blockers=[])
+
+    assert captured["args"][1:] == (
+        "--run_type=web_driver",
+        "--ipc_type=http",
+        "--port=16851",
+    ), "启动参数必须和 Ziniao-WebDriver.bat 一致"
+    flags = captured["kwargs"].get("creationflags", 0)
+    assert flags & 0x00000008, "缺少 DETACHED_PROCESS，紫鸟会继承本服务的无控制台上下文"
+    assert flags & 0x00000200, "缺少 CREATE_NEW_PROCESS_GROUP，本服务退出会波及用户的浏览器"
+
+
+async def _none():
+    return []
+
+
+def test_launch_environment_drops_variables_that_hijack_electron(monkeypatch) -> None:
+    """A poisoned parent environment must not follow Ziniao into its own process.
+
+    VS Code exports ``ELECTRON_RUN_AS_NODE=1`` to everything under its extension
+    host.  ziniao.exe is an Electron binary, so with that variable set it starts
+    as a bare Node interpreter, prints ``bad option: --run_type=web_driver`` to
+    stderr, exits with code 9 and never opens 16851 — while our own logs happily
+    report "Starting Ziniao WebDriver mode".  Observed 2026-08-26; the button
+    was blamed on the launch method for a full round before this turned up.
+    """
+
+    from ziniao_automation.ziniao.webdriver_mode import launch_environment
+
+    monkeypatch.setenv("ELECTRON_RUN_AS_NODE", "1")
+    monkeypatch.setenv("NODE_OPTIONS", "--require=/tmp/evil.js")
+    monkeypatch.setenv("ZINIAO_KEEP_ME", "yes")
+
+    env = launch_environment()
+
+    assert "ELECTRON_RUN_AS_NODE" not in env
+    assert "NODE_OPTIONS" not in env
+    assert env["ZINIAO_KEEP_ME"] == "yes", "只该摘掉劫持变量，不该重建整个环境"
+
+
+def test_both_launch_sites_scrub_the_environment() -> None:
+    """The run-time launcher and the console button share one entry point.
+
+    ``controller.launch_ziniao_webdriver`` is what a scheduled run uses; the
+    console button goes through ``webdriver_mode.start_webdriver_mode``.  Fixing
+    only the one being demonstrated would leave the other broken in exactly the
+    same way, and that failure surfaces mid-run.
+    """
+
+    import inspect
+
+    from ziniao_automation.ziniao import controller, webdriver_mode
+
+    for source in (
+        inspect.getsource(controller.launch_ziniao_webdriver),
+        inspect.getsource(webdriver_mode.start_webdriver_mode),
+    ):
+        assert "launch_environment()" in source

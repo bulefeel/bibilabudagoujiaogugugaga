@@ -135,6 +135,27 @@ class ZiniaoClient:
             self._closed = True
             await self._http.aclose()
 
+    def preflight_credentials(self) -> None:
+        """Validate the current credential snapshot without making a request.
+
+        The resolved values are deliberately discarded.  Callers learn only
+        whether the configured database/vault reference is usable; company,
+        username and password never leave this adapter or appear in a return
+        value.  In particular this method does not probe port 16851.
+        """
+
+        if self._closed:
+            raise RuntimeError("ZiniaoClient has been closed")
+        snapshot = self._credentials()
+        if (
+            not str(snapshot.get("company") or "").strip()
+            or not str(snapshot.get("username") or "").strip()
+            or not str(snapshot.get("password") or "")
+        ):
+            raise ZiniaoCredentialError(
+                "紫鸟凭据不完整，请在系统设置中重新保存公司、账号和密码"
+            )
+
     def _credentials(self) -> dict[str, str]:
         startup = {
             "company": self.config.company,

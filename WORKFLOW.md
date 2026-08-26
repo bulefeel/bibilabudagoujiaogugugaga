@@ -8,11 +8,14 @@ from ziniao_automation.workflows import (
     DatabaseRunLoader,
     SqlAlchemyWorkflowRepository,
     WorkflowEngine,
+    WorkflowExecutionClass,
     WorkflowRegistry,
 )
+from ziniao_automation.workflows.dispatcher import WorkflowDispatcher
 from ziniao_automation.workflows.amazon_disbursement import (
     AmazonDisbursementWorkflow,
     AmazonPaymentsPage,
+    build_amazon_disbursement_definition,
 )
 
 repository = SqlAlchemyWorkflowRepository(session_factory)
@@ -20,21 +23,39 @@ workflow = AmazonDisbursementWorkflow(
     repository=repository,
     page_adapter=AmazonPaymentsPage(),
 )
+registry = WorkflowRegistry((build_amazon_disbursement_definition(workflow),))
 engine = WorkflowEngine(
-    registry=WorkflowRegistry((workflow,)),
+    registry=registry,
     repository=repository,
     browser_sessions=ziniao_controller,
     notifier=notifier,
 )
-loader = DatabaseRunLoader(session_factory, artifact_root=settings.evidence_dir)
+dispatcher = WorkflowDispatcher(
+    registry=registry,
+    engines={WorkflowExecutionClass.FINANCIAL.value: engine},
+    repository=repository,
+)
+loader = DatabaseRunLoader(
+    session_factory,
+    artifact_root=settings.evidence_dir,
+    workflow_registry=registry,
+)
 automation = AutomationService(
-    engine=engine,
+    engine=dispatcher,
     run_loader=loader,
     recovery_loader=loader.recovery_runs,
     ziniao_controller=ziniao_controller,
     session_factory=session_factory,
 )
 ```
+
+排期与扩展约束：
+
+- `GET /api/workflows` 只公开代码注册的固定展示元数据和配置字段定义。
+- `POST /api/schedules/batch/preview` 先逐店检查；任意一家不合格时整批写入 0 条。
+- `POST /api/schedules/batch` 使用 UUID `request_id` 保证重复点击只创建一次，并为每家店铺生成独立排期。
+- 新流程必须新增 `WorkflowDefinition`、Pydantic 配置模型、执行器和页面适配器；网页不能上传脚本或提交未注册字段。
+- 排期修改后，已经创建的 Run 与队列条目仍使用各自的配置、配置版本、业务优先级及批次顺序快照。
 
 安全边界：
 

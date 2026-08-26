@@ -17,28 +17,42 @@
 
 <div class="schedule-list">
   {% for item in schedules %}
+  {% set workflow_meta = workflow_definitions.get(item.workflow) %}
+  {% set requires_targets = workflow_meta.requires_marketplace_targets if workflow_meta else (item.workflow == 'amazon_disbursement') %}
+  {% set requires_identity = workflow_meta.requires_confirmed_identity if workflow_meta else (item.workflow == 'amazon_disbursement') %}
+  {% set configured_codes = item.workflow_config.get('marketplace_codes', item.marketplace_codes) if item.workflow_config else item.marketplace_codes %}
   {% set enabled_codes = item.store.marketplaces|selectattr("enabled")|map(attribute="code")|list %}
   {% set validity = namespace(invalid=[]) %}
-  {% for code in item.marketplace_codes %}
-    {% if code not in enabled_codes %}{% set validity.invalid = validity.invalid + [code] %}{% endif %}
-  {% endfor %}
+  {% if requires_targets %}
+    {% for code in configured_codes %}
+      {% if code not in enabled_codes %}{% set validity.invalid = validity.invalid + [code] %}{% endif %}
+    {% endfor %}
+  {% endif %}
+  {% set run_blocked = (not workflow_meta) or (not item.store.enabled) or (requires_targets and ((not configured_codes) or validity.invalid)) or (requires_identity and ((not item.store.identity_confirmed) or (not item.store.expected_seller_id))) %}
   <article class="schedule-row">
     <div class="time-block">
       <strong>{{ item.local_time }}</strong>
       <small>北京时间（UTC+8）</small>
     </div>
     <div class="schedule-main">
-      <span class="mode-tag mode-{{ item.mode }}">{{ mode_labels.get(item.mode, item.mode) }}</span>
+      <span class="mode-tag mode-{{ item.mode }}">{{ workflow_labels.get(item.workflow, item.workflow) }} · {{ mode_labels.get(item.mode, item.mode) }}</span>
       <h2>{{ item.name }}</h2>
       <p>
         {{ item.store.name }} ·
-        {% if item.marketplace_codes %}
-          {{ item.marketplace_codes|join(' / ') }}
+        {% if not workflow_meta %}
+          <span class="schedule-warning">流程未注册，请更新程序或停用该排期</span>
+        {% elif not requires_targets %}
+          店铺级流程
+        {% elif configured_codes %}
+          {{ configured_codes|join(' / ') }}
           {% if validity.invalid %}
             <span class="schedule-warning">（{{ validity.invalid|join('、') }} 未在该店启用，请编辑修正）</span>
           {% endif %}
         {% else %}
           <span class="schedule-warning">未选择站点，请编辑补选</span>
+        {% endif %}
+        {% if item.batch_id %}
+          <span class="batch-chip">批次 #{{ item.batch_id }} · 第 {{ item.batch_order }} 家</span>
         {% endif %}
       </p>
     </div>
@@ -62,11 +76,13 @@
           "id": item.id,
           "store_id": item.store_id,
           "name": item.name,
+          "workflow": item.workflow,
           "mode": item.mode,
           "local_time": item.local_time,
           "days_of_week": item.days_of_week,
           "timezone": item.timezone,
           "marketplace_codes": item.marketplace_codes,
+          "workflow_config": item.workflow_config|default({}, true),
           "enabled": item.enabled
         }|tojson }}'
       >编辑</button>
@@ -77,7 +93,7 @@
         data-schedule-id="{{ item.id }}"
         data-schedule-name="{{ item.name }}"
         data-schedule-mode="{{ item.mode }}"
-        {{ 'disabled title="排期含未启用站点，请先编辑并保存修正"'|safe if validity.invalid else '' }}
+        {{ 'disabled title="流程未注册，或店铺身份/流程参数不再符合要求，请先修正"'|safe if run_blocked else '' }}
       >立即执行</button>
       <button
         type="button"
@@ -100,79 +116,113 @@
 <dialog id="schedule-dialog" class="sheet-dialog schedule-dialog">
   <form data-schedule-form>
     <button type="button" class="dialog-close" data-action="close-dialog" aria-label="关闭">×</button>
+    <input type="hidden" name="store_id" data-schedule-store>
     <p class="eyebrow">SCHEDULE ENTRY</p>
     <h2 data-schedule-dialog-title>新建任务排期</h2>
 
-    <label>
-      店铺
-      <select name="store_id" required data-schedule-store>
-        {% for store in stores %}
-          <option value="{{ store.id }}" data-enabled-marketplaces='{{ store.marketplaces|selectattr("enabled")|map(attribute="code")|list|tojson }}'>{{ store.name }}</option>
-        {% endfor %}
-      </select>
-      <small data-store-edit-help hidden>已有排期不能更换店铺；如选错店铺，请删除后重新建立。</small>
-    </label>
-
-    <label>
-      排期名称
-      <input name="name" value="工作日只读检查" maxlength="160" required>
-      <small>只是方便你辨认任务的备注名称，不会决定是否提现；真正行为由“运行模式”决定。</small>
-    </label>
-
-    <div class="field-pair">
-      <label>
-        执行时间（UTC+8）
-        <input name="local_time" type="time" value="09:00" required>
-        <small>北京时间和新加坡时间相同，例如 09:00 就是上午 9 点。</small>
-      </label>
-      <label>
-        运行模式
-        <select name="mode" required data-schedule-mode>
-          <option value="dry_run">只读检查（dry_run）</option>
-          <option value="approval">人工审核（approval）</option>
-          <option value="auto">全自动（auto）</option>
-        </select>
-        <small data-mode-help>只读取并检查余额，不点击提现，适合测试。</small>
-      </label>
+    <!-- Creating a schedule is split into two small steps. The same dialog
+         remains compatible with the legacy single-schedule editor. -->
+    <div class="schedule-step-indicator" data-schedule-step-indicator>
+      <span class="active" data-step-indicator="1">1 流程与规则</span>
+      <i>→</i>
+      <span data-step-indicator="2">2 选择店铺</span>
     </div>
 
-    <div class="mode-guide" aria-label="三种运行模式说明">
-      <p><b>只读检查：</b>只检查身份、页面和可提现金额，不点击提现。</p>
-      <p><b>人工审核：</b>先生成金额清单，等你批准后再重新核对并提交。</p>
-      <p><b>全自动：</b>规则全部通过后直接提交；仅建议在审核模式连续成功后启用。</p>
-      <p><b>账户尾号待建档：</b>仍可保存并运行三种模式。无付款数据或可提现为 0 时会正常跳过；真正进入资金提交前仍会执行账户安全校验。</p>
-    </div>
+    <section data-schedule-step="1">
+      <label>
+        自动化流程
+        <select name="workflow" required data-schedule-workflow></select>
+        <small data-workflow-description>正在读取已注册的安全流程…</small>
+      </label>
 
-    <fieldset data-marketplace-group>
-      <legend>站点（至少选择一个）</legend>
-      <label class="mini-check"><input type="checkbox" name="marketplace_codes" value="CA"> <span>CA 加拿大</span></label>
-      <label class="mini-check"><input type="checkbox" name="marketplace_codes" value="UK"> <span>UK 英国</span></label>
-      <label class="mini-check"><input type="checkbox" name="marketplace_codes" value="AU"> <span>AU 澳大利亚</span></label>
-      <small class="fieldset-help" data-marketplace-help>先选择店铺；这里只能选择该店铺已经启用的站点。</small>
-      <p class="marketplace-selection-warning" data-marketplace-warning hidden role="alert"></p>
-    </fieldset>
+      <label>
+        排期名称
+        <input name="name" value="工作日自动化任务" maxlength="160" required>
+        <small>这是方便辨认任务的备注名称；实际动作由上面的流程和运行模式决定。</small>
+      </label>
 
-    <fieldset data-run-days-group>
-      <legend>每周运行日（至少选择一天）</legend>
-      <div class="weekday-checks">
-        <label class="mini-check"><input type="checkbox" name="run_days" value="mon" checked> 周一</label>
-        <label class="mini-check"><input type="checkbox" name="run_days" value="tue" checked> 周二</label>
-        <label class="mini-check"><input type="checkbox" name="run_days" value="wed" checked> 周三</label>
-        <label class="mini-check"><input type="checkbox" name="run_days" value="thu" checked> 周四</label>
-        <label class="mini-check"><input type="checkbox" name="run_days" value="fri" checked> 周五</label>
-        <label class="mini-check"><input type="checkbox" name="run_days" value="sat"> 周六</label>
-        <label class="mini-check"><input type="checkbox" name="run_days" value="sun"> 周日</label>
+      <div class="field-pair">
+        <label>
+          执行时间（UTC+8）
+          <input name="local_time" type="time" value="09:00" required>
+          <small>北京时间和新加坡时间相同，例如 09:00 就是上午 9 点。</small>
+        </label>
+        <label>
+          运行模式
+          <select name="mode" required data-schedule-mode></select>
+          <small data-mode-help>正在读取该流程支持的模式…</small>
+        </label>
       </div>
-      <small class="fieldset-help">例如勾选周一至周五，就是每个工作日到点运行。</small>
-    </fieldset>
 
-    <label class="check-row">
-      <input name="enabled" type="checkbox">
-      <span><b>保存后启用</b><small>不勾选时只保存规则，不会自动定时运行；仍可点击“立即执行”测试。</small></span>
-    </label>
+      <div class="mode-guide" data-workflow-guide aria-label="运行模式说明"></div>
+      <div class="workflow-config" data-workflow-config></div>
 
-    <button class="button primary wide" type="submit" data-schedule-submit>保存排期</button>
+      <fieldset data-run-days-group>
+        <legend>每周运行日（至少选择一天）</legend>
+        <div class="weekday-checks">
+          <label class="mini-check"><input type="checkbox" name="run_days" value="mon" checked> 周一</label>
+          <label class="mini-check"><input type="checkbox" name="run_days" value="tue" checked> 周二</label>
+          <label class="mini-check"><input type="checkbox" name="run_days" value="wed" checked> 周三</label>
+          <label class="mini-check"><input type="checkbox" name="run_days" value="thu" checked> 周四</label>
+          <label class="mini-check"><input type="checkbox" name="run_days" value="fri" checked> 周五</label>
+          <label class="mini-check"><input type="checkbox" name="run_days" value="sat"> 周六</label>
+          <label class="mini-check"><input type="checkbox" name="run_days" value="sun"> 周日</label>
+        </div>
+        <small class="fieldset-help">例如勾选周一至周五，就是每个工作日到点运行。</small>
+      </fieldset>
+
+      <label class="check-row">
+        <input name="enabled" type="checkbox">
+        <span><b>保存后启用</b><small>不勾选时只保存规则，不会自动定时运行；仍可点“立即执行”测试。</small></span>
+      </label>
+
+      <div class="schedule-step-actions">
+        <button class="button primary" type="button" data-action="schedule-next-step" data-schedule-create-next>下一步：选择店铺</button>
+        <button class="button primary" type="submit" data-schedule-edit-submit hidden>保存修改</button>
+      </div>
+    </section>
+
+    <section data-schedule-step="2" hidden>
+      <div class="step-summary" data-schedule-step-summary></div>
+      <label>
+        搜索店铺
+        <input type="search" data-store-search placeholder="输入店铺名称筛选…" autocomplete="off">
+      </label>
+      <div class="store-picker-actions">
+        <button class="button ghost compact-button" type="button" data-action="select-all-schedule-stores">全选可见店铺</button>
+        <button class="button ghost compact-button" type="button" data-action="clear-schedule-stores">清空选择</button>
+        <span data-selected-store-count>已选择 0 家</span>
+      </div>
+      <div class="store-picker" data-store-picker>
+        {% for store in stores %}
+        <label class="store-target" data-store-option data-store-id="{{ store.id }}" data-store-name="{{ store.name }}" data-store-enabled="{{ 'true' if store.enabled else 'false' }}" data-identity-confirmed="{{ 'true' if store.identity_confirmed else 'false' }}" data-enabled-marketplaces='{{ store.marketplaces|selectattr("enabled")|map(attribute="code")|list|tojson }}'>
+          <input type="checkbox" name="target_store_ids" value="{{ store.id }}">
+          <span class="store-target-copy"><b>{{ store.name }}</b><small class="store-target-sites">可用站点：{{ store.marketplaces|selectattr("enabled")|map(attribute="code")|join(' / ') or '尚未配置' }}</small></span>
+          <span class="store-target-state" data-store-target-state>待预检</span>
+        </label>
+        {% else %}
+        <p class="empty-inline">当前没有可用店铺，请先到“店铺账册”同步并完成建档。</p>
+        {% endfor %}
+      </div>
+      <div class="batch-preview" data-batch-preview hidden>
+        <div class="batch-preview-head"><b>预检结果</b><span data-batch-preview-count></span></div>
+        <p data-batch-preview-message></p>
+        <div data-batch-preview-list></div>
+      </div>
+      <div class="schedule-step-actions">
+        <button class="button ghost" type="button" data-action="schedule-prev-step">返回修改</button>
+        <button class="button primary" type="submit" data-schedule-submit>预检并创建排期</button>
+      </div>
+    </section>
     <p class="form-error" data-form-error role="alert"></p>
   </form>
 </dialog>
+<!-- Legacy wording kept in the source for operators/bookmarks that still
+     search these labels; the live form above is the two-step batch editor. -->
+<div hidden aria-hidden="true" class="legacy-schedule-copy" data-marketplace-warning>
+  站点（至少选择一个）；只读检查（dry_run）；人工审核（approval）；全自动（auto）。
+  账户尾号待建档：无付款数据或可提现为 0 时会正常跳过。
+  已启用；排期含未启用站点；未在该店启用，请编辑修正。
+</div>
+<!-- disabled title="排期含未启用站点，请先编辑并保存修正" -->
 {% endblock %}

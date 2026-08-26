@@ -50,6 +50,26 @@ class ModeReport:
     details: dict[str, object] = field(default_factory=dict)
 
 
+# Variables that hijack an Electron binary before its own main script runs.
+# ``ELECTRON_RUN_AS_NODE=1`` makes ziniao.exe start as a bare Node interpreter:
+# it rejects its own flags ("bad option: --run_type=web_driver"), exits with
+# code 9, and never opens 16851.  VS Code exports it to everything under its
+# extension host, so a service started from a VS Code terminal inherits it and
+# can never launch Ziniao — with no hint as to why.  ``NODE_OPTIONS`` is the
+# same class of hazard: Electron honours it and a stray ``--require`` changes
+# what the client is before we get a say.
+ELECTRON_HIJACK_VARIABLES = ("ELECTRON_RUN_AS_NODE", "NODE_OPTIONS")
+
+
+def launch_environment() -> dict[str, str]:
+    """Our environment minus anything that would replace Ziniao's entry point."""
+
+    env = dict(os.environ)
+    for name in ELECTRON_HIJACK_VARIABLES:
+        env.pop(name, None)
+    return env
+
+
 def port_open(host: str, port: int, *, timeout: float = 0.5) -> bool:
     with socket.socket() as probe:
         probe.settimeout(timeout)
@@ -196,14 +216,29 @@ async def start_webdriver_mode(
     logger.info(
         "Starting Ziniao WebDriver mode: port=%s", port, extra={"event": "webdriver_switch"}
     )
+    # Detached, exactly like ``start ""`` in Ziniao-WebDriver.bat — which is the
+    # form that has always worked.  Launched as an ordinary child of this
+    # service it inherits our console-less pythonw context and process group,
+    # and Ziniao exits again within seconds: the log shows three successive
+    # "Starting Ziniao WebDriver mode" lines and afterwards no ziniao.exe alive
+    # at all, while 16851 never opens.  DETACHED_PROCESS gives it no console to
+    # inherit and CREATE_NEW_PROCESS_GROUP keeps our shutdown signals away from
+    # a browser the operator is using.
+    creation_flags = 0
+    if os.name == "nt":
+        creation_flags = 0x00000008 | 0x00000200
     try:
         await asyncio.create_subprocess_exec(
             str(executable),
             *LAUNCH_ARGUMENTS,
             f"--port={port}",
             cwd=str(executable.parent),
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            creationflags=creation_flags,
+            close_fds=True,
+            env=launch_environment(),
         )
     except OSError as exc:
         return ModeReport(

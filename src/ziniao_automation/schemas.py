@@ -5,16 +5,46 @@ from __future__ import annotations
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 MarketplaceCode = Literal["CA", "UK", "AU"]
 RunMode = Literal["dry_run", "approval", "auto"]
+Weekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
 class ApiModel(BaseModel):
     model_config = ConfigDict(from_attributes=True)
+
+
+class StrictApiModel(ApiModel):
+    """Reject silently ignored input on state-changing generic endpoints."""
+
+    model_config = ConfigDict(from_attributes=True, extra="forbid")
+
+
+def _normalise_days(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        days = [str(item).strip().lower() for item in value]
+    elif isinstance(value, str):
+        stripped = value.strip().lower()
+        if stripped == "*":
+            return "*"
+        days = [item.strip() for item in stripped.split(",") if item.strip()]
+    else:
+        raise ValueError("运行日必须是星期列表或逗号分隔文本")
+    allowed = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+    if not days:
+        raise ValueError("请至少选择一个运行日")
+    if len(days) != len(set(days)):
+        raise ValueError("运行日不可重复")
+    unknown = [item for item in days if item not in allowed]
+    if unknown:
+        raise ValueError("运行日仅支持 mon 至 sun")
+    ordered = [item for item in allowed if item in days]
+    return "*" if len(ordered) == 7 else ",".join(ordered)
 
 
 class MarketplaceInput(ApiModel):
@@ -99,27 +129,39 @@ class StoreSetupResetView(ApiModel):
     disabled_schedules: int = 0
 
 
-class ScheduleCreate(ApiModel):
+class ScheduleCreate(StrictApiModel):
     store_id: int
     name: str = Field(min_length=1, max_length=160)
-    workflow: Literal["amazon_disbursement"] = "amazon_disbursement"
-    mode: RunMode = "dry_run"
+    workflow: str = Field(default="amazon_disbursement", min_length=1, max_length=80)
+    mode: str = Field(default="dry_run", min_length=1, max_length=24)
     local_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     days_of_week: str = "mon,tue,wed,thu,fri"
     timezone: str = Field(default="Asia/Singapore", max_length=64)
     marketplace_codes: list[MarketplaceCode] = Field(default_factory=list)
+    workflow_config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = False
     misfire_grace_seconds: int = Field(default=1800, ge=0, le=1800)
 
+    @field_validator("days_of_week", mode="before")
+    @classmethod
+    def valid_days(cls, value: Any) -> str:
+        return _normalise_days(value)
 
-class SchedulePatch(ApiModel):
+
+class SchedulePatch(StrictApiModel):
     name: str | None = Field(None, min_length=1, max_length=160)
-    mode: RunMode | None = None
+    mode: str | None = Field(None, min_length=1, max_length=24)
     local_time: str | None = Field(None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
     days_of_week: str | None = None
     timezone: str | None = Field(None, max_length=64)
     marketplace_codes: list[MarketplaceCode] | None = None
+    workflow_config: dict[str, Any] | None = None
     enabled: bool | None = None
+
+    @field_validator("days_of_week", mode="before")
+    @classmethod
+    def valid_days(cls, value: Any) -> str | None:
+        return None if value is None else _normalise_days(value)
 
 
 class ScheduleView(ApiModel):
@@ -132,15 +174,72 @@ class ScheduleView(ApiModel):
     days_of_week: str
     timezone: str
     marketplace_codes: list[str]
+    workflow_config: dict[str, Any] = Field(default_factory=dict)
+    workflow_config_version: int = 1
+    batch_id: int | None = None
+    batch_order: int | None = None
     enabled: bool
     next_run_at: datetime | None
 
 
-class RunCreate(ApiModel):
+class ScheduleMutationView(ScheduleView):
+    """A durable schedule write plus its process-local projection status."""
+
+    scheduler_refreshed: bool
+    scheduler_failed_schedule_ids: list[int] | None = None
+    warning: str | None = None
+
+
+class ScheduleDeleteView(ApiModel):
+    status: Literal["deleted"] = "deleted"
+    schedule_id: int
+    scheduler_refreshed: bool
+    scheduler_failed_schedule_ids: list[int] | None = None
+    warning: str | None = None
+
+
+class RunCreate(StrictApiModel):
     store_id: int
-    workflow: Literal["amazon_disbursement"] = "amazon_disbursement"
-    mode: RunMode = "dry_run"
+    workflow: str = Field(default="amazon_disbursement", min_length=1, max_length=80)
+    mode: str = Field(default="dry_run", min_length=1, max_length=24)
     marketplace_codes: list[MarketplaceCode] | None = None
+    workflow_config: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchScheduleTemplate(StrictApiModel):
+    name: str = Field(min_length=1, max_length=160)
+    workflow: str = Field(default="amazon_disbursement", min_length=1, max_length=80)
+    mode: str = Field(default="dry_run", min_length=1, max_length=24)
+    workflow_config: dict[str, Any] = Field(default_factory=dict)
+    local_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+    days_of_week: str = "mon,tue,wed,thu,fri"
+    timezone: str = Field(default="Asia/Singapore", min_length=1, max_length=64)
+    enabled: bool = False
+    misfire_grace_seconds: int = Field(default=1800, ge=0, le=1800)
+
+    @field_validator("days_of_week", mode="before")
+    @classmethod
+    def valid_days(cls, value: Any) -> str:
+        return _normalise_days(value)
+
+
+class BatchSchedulePreviewInput(StrictApiModel):
+    request_id: UUID | None = None
+    store_ids: list[int] = Field(min_length=1, max_length=500)
+    template: BatchScheduleTemplate
+
+    @field_validator("store_ids")
+    @classmethod
+    def unique_store_ids(cls, value: list[int]) -> list[int]:
+        if any(item <= 0 for item in value):
+            raise ValueError("店铺ID必须为正整数")
+        if len(value) != len(set(value)):
+            raise ValueError("批量选择的店铺不可重复")
+        return value
+
+
+class BatchScheduleCreateInput(BatchSchedulePreviewInput):
+    request_id: UUID
 
 
 class SiteRunView(ApiModel):
@@ -160,6 +259,8 @@ class RunView(ApiModel):
     schedule_id: int | None
     workflow: str
     mode: str
+    workflow_config: dict[str, Any] = Field(default_factory=dict)
+    workflow_config_version: int = 1
     trigger: str
     status: str
     created_at: datetime

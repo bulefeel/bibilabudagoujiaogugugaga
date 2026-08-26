@@ -350,7 +350,6 @@ class WorkflowEngine:
             RunStatus.CANCELLED,
             allowed_from=(
                 RunStatus.QUEUED,
-                RunStatus.RUNNING,
                 RunStatus.WAITING_APPROVAL,
                 RunStatus.WAITING_AUTH,
                 RunStatus.NEEDS_HUMAN_AUTH,
@@ -473,10 +472,19 @@ class WorkflowEngine:
                 # default SUCCEEDED — RUN_EXAMPLE_B reported 「任务检查已完成」
                 # while its marketplace still had a balance that nothing attempted.
                 status = RunStatus.PARTIAL
-        current = await self.repository.get_run_status(run.id)
-        await self.repository.set_run_status(
-            run.id, status, allowed_from=(current,)
+        changed = await self.repository.set_run_status(
+            run.id,
+            status,
+            allowed_from=(RunStatus.RUNNING, RunStatus.RECONCILING),
         )
+        if not changed:
+            # A terminal status is never an execution lease.  In particular,
+            # an old cancellation race must not let a still-running coroutine
+            # rewrite CANCELLED as SUCCEEDED (or emit a green success report).
+            # The SQL ARMED barrier now prevents that race at its source; this
+            # remains defence in depth for already-running/legacy workers.
+            current = await self.repository.get_run_status(run.id)
+            return ExecutionResult(run.id, current, tuple(operations))
         await self._notify(workflow, run, status)
         return ExecutionResult(run.id, status, tuple(operations))
 

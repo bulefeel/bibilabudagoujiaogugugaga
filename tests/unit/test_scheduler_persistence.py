@@ -24,6 +24,30 @@ class RecordingAutomation:
         self.run_ids.append(run_id)
 
 
+class ProjectionJob:
+    def __init__(self, job_id: str) -> None:
+        self.id = job_id
+        self.next_run_time = datetime(2026, 8, 13, 1, tzinfo=timezone.utc)
+
+
+class ProjectionScheduler:
+    """Small APScheduler stand-in used to test row-level refresh isolation."""
+
+    def __init__(self) -> None:
+        self.jobs: dict[str, ProjectionJob] = {}
+
+    def add_job(self, _func, **kwargs):
+        job = ProjectionJob(kwargs["id"])
+        self.jobs[job.id] = job
+        return job
+
+    def get_jobs(self):
+        return list(self.jobs.values())
+
+    def remove_job(self, job_id: str):
+        self.jobs.pop(job_id, None)
+
+
 @pytest.fixture()
 def database(tmp_path: Path):
     settings = Settings(
@@ -78,6 +102,65 @@ def seed_daily_schedule(factory, *, created_at: datetime) -> int:
         session.add(schedule)
         session.commit()
         return schedule.id
+
+
+def seed_valid_and_corrupt_schedules(factory, *, created_at: datetime) -> tuple[int, int]:
+    with factory() as session:
+        store = Store(
+            name="Mixed schedule store",
+            selector_type="oauth",
+            selector_value="oauth-mixed-schedule",
+            browser_oauth="oauth-mixed-schedule",
+            expected_seller_id="EXPECTED-MIXED",
+            identity_confirmed=True,
+            enabled=True,
+        )
+        session.add(store)
+        session.flush()
+        session.add(
+            StoreMarketplace(
+                store_id=store.id,
+                code="CA",
+                domain="sellercentral.amazon.ca",
+                currency="CAD",
+                enabled=True,
+            )
+        )
+        valid = Schedule(
+            store_id=store.id,
+            name="Valid schedule",
+            workflow="amazon_disbursement",
+            mode="dry_run",
+            local_time="09:00",
+            days_of_week="*",
+            timezone="Asia/Singapore",
+            marketplace_codes=["CA"],
+            workflow_config={"marketplace_codes": ["CA"]},
+            workflow_config_version=1,
+            enabled=True,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        # Bypass repository validation intentionally: this represents a
+        # malformed legacy/imported row that the scheduler must isolate.
+        corrupt = Schedule(
+            store_id=store.id,
+            name="Corrupt schedule",
+            workflow="amazon_disbursement",
+            mode="dry_run",
+            local_time="not-a-time",
+            days_of_week="*",
+            timezone="Asia/Singapore",
+            marketplace_codes=["CA"],
+            workflow_config={"marketplace_codes": ["CA"]},
+            workflow_config_version=1,
+            enabled=True,
+            created_at=created_at,
+            updated_at=created_at,
+        )
+        session.add_all((valid, corrupt))
+        session.commit()
+        return valid.id, corrupt.id
 
 
 def as_utc(value: datetime) -> datetime:
@@ -252,5 +335,57 @@ def test_legacy_local_wall_clock_next_run_does_not_hide_missed_occurrence(databa
             assert as_utc(session.get(Run, created[0]).scheduled_for_at) == datetime(
                 2026, 8, 14, 1, tzinfo=timezone.utc
             )
+
+    asyncio.run(scenario())
+
+
+def test_refresh_isolates_corrupt_schedule_projection(database):
+    async def scenario() -> None:
+        created_at = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        valid_id, corrupt_id = seed_valid_and_corrupt_schedules(
+            database, created_at=created_at
+        )
+        with database() as session:
+            session.get(Schedule, corrupt_id).next_run_at = datetime(
+                2026, 8, 12, 1, tzinfo=timezone.utc
+            )
+            session.commit()
+
+        scheduler = ProjectionScheduler()
+        manager = ScheduleManager(
+            database,
+            RecordingAutomation(),
+            scheduler=scheduler,
+        )
+        report = await manager.refresh()
+
+        assert report.projected_schedule_ids == frozenset({valid_id})
+        assert report.failed_schedule_ids == frozenset({corrupt_id})
+        assert f"db-schedule:{valid_id}" in scheduler.jobs
+        assert f"db-schedule:{corrupt_id}" not in scheduler.jobs
+        with database() as session:
+            assert session.get(Schedule, corrupt_id).next_run_at is None
+
+    asyncio.run(scenario())
+
+
+def test_missed_recovery_continues_after_corrupt_schedule(database):
+    async def scenario() -> None:
+        now = datetime(2026, 8, 13, 12, tzinfo=timezone.utc)
+        valid_id, corrupt_id = seed_valid_and_corrupt_schedules(
+            database, created_at=now - timedelta(days=10)
+        )
+        automation = RecordingAutomation()
+        manager = ScheduleManager(database, automation, clock=lambda: now)
+
+        created = await manager.recover_latest_missed(now=now)
+
+        assert len(created) == 1
+        assert automation.run_ids == list(created)
+        with database() as session:
+            valid_runs = session.query(Run).filter_by(schedule_id=valid_id).all()
+            corrupt_runs = session.query(Run).filter_by(schedule_id=corrupt_id).all()
+            assert len(valid_runs) == 1
+            assert corrupt_runs == []
 
     asyncio.run(scenario())

@@ -19,9 +19,11 @@ from .errors import (
     AuthWaitExpired,
     CdpHealthError,
     ZiniaoConnectionError,
+    ZiniaoCredentialError,
     ZiniaoLaunchError,
 )
 from .locks import ExecutionLocks
+from .webdriver_mode import LAUNCH_ARGUMENTS, launch_environment
 from .models import (
     BrowserProfile,
     ProfileSelector,
@@ -202,6 +204,11 @@ class ZiniaoController:
     async def sync_profiles(self) -> list[BrowserProfile]:
         await self.ensure_running()
         return await self.client.get_browser_list()
+
+    def preflight_credentials(self) -> None:
+        """Validate live Ziniao credentials without contacting Ziniao/CDP."""
+
+        self.client.preflight_credentials()
 
     async def ensure_running(self) -> None:
         """Ensure the local control API is reachable without global restarts."""
@@ -529,6 +536,12 @@ class ZiniaoController:
                     self.config.max_start_attempts,
                 )
                 return handle
+            except ZiniaoCredentialError:
+                # A missing/expired global credential reference cannot be
+                # repaired by restarting one store.  Most importantly, do not
+                # issue stopBrowser with the same unusable credentials and do
+                # not repeat this system-level failure four times per store.
+                raise
             except Exception as exc:
                 last_issue = str(exc)
                 startup_target_retry = _is_retryable_startup_target_error(exc)
@@ -644,12 +657,8 @@ def is_ziniao_process_running() -> bool:
 def launch_ziniao_webdriver(path: Path, port: int) -> subprocess.Popen[Any]:
     """Start the desktop client in WebDriver mode without a shell."""
     return subprocess.Popen(
-        [
-            str(path),
-            "--run_type=web_driver",
-            "--ipc_type=http",
-            f"--port={port}",
-        ],
+        [str(path), *LAUNCH_ARGUMENTS, f"--port={port}"],
         cwd=str(path.parent),
         close_fds=True,
+        env=launch_environment(),
     )

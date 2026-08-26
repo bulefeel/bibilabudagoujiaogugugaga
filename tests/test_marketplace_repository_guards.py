@@ -86,9 +86,10 @@ def test_new_seller_can_be_explicitly_confirmed_in_the_same_patch(sessions) -> N
 
         assert updated.expected_seller_id == "SELLER-CHANGED"
         assert updated.identity_confirmed is True
-        # An old enabled=True is never carried across implicitly.  The editor
-        # must explicitly submit enabled=True if the operator wants that too.
-        assert updated.enabled is False
+        # Availability is workflow-neutral. Payout schedules still require
+        # the newly confirmed identity, while identity-free workflows remain
+        # allowed to use this Ziniao environment.
+        assert updated.enabled is True
 
 
 def test_ziniao_environment_change_always_revokes_same_patch_confirmation(

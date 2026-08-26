@@ -25,20 +25,20 @@
   <header><p class="eyebrow">CREDENTIALS</p><h3>凭据配置</h3></header>
   <p class="fieldset-help">密码和 Secret 只写入 <b>Windows 凭据管理器</b>，不会保存在数据库或配置文件里，页面也不会回显。要修改就重新输入一次完整的值。</p>
 
-  <form class="settings-card" data-settings-form="ziniao">
+  <form class="settings-card" onsubmit="return false" data-settings-form="ziniao">
     <div class="settings-card-head"><b>紫鸟账号</b><span class="verify-mark {{ 'ok' if diagnostics.ziniao_credential_readable else '' }}">{{ '已配置' if diagnostics.ziniao_credential_readable else '未配置' }}</span></div>
     <label>企业名称<input name="company" autocomplete="off" required value="{{ diagnostics.ziniao_company }}"></label>
     <label>登录账号<input name="username" autocomplete="off" required value="{{ diagnostics.ziniao_username }}"></label>
     <label>登录密码<input name="password" type="password" autocomplete="new-password" required placeholder="{{ '已配置，如需修改请重新输入' if diagnostics.ziniao_credential_readable else '' }}"></label>
-    <div class="settings-card-actions"><button class="button primary" type="submit">保存紫鸟账号</button><span class="form-error" data-form-error></span></div>
+    <div class="settings-card-actions"><button class="button primary" type="button" data-settings-save="ziniao">保存紫鸟账号</button><span class="form-error" data-form-error></span></div>
   </form>
 
-  <form class="settings-card" data-settings-form="feishu">
+  <form class="settings-card" onsubmit="return false" data-settings-form="feishu">
     <div class="settings-card-head"><b>飞书通知</b><span class="verify-mark {{ 'ok' if diagnostics.feishu_credential_readable else '' }}">{{ '已配置' if diagnostics.feishu_credential_readable else '未配置' }}</span></div>
     <label>App ID<input name="app_id" autocomplete="off" required value="{{ diagnostics.feishu_app_id }}"></label>
     <label>App Secret<input name="app_secret" type="password" autocomplete="new-password" required placeholder="{{ '已配置，如需修改请重新输入' if diagnostics.feishu_credential_readable else '' }}"></label>
     <label>Chat ID<input name="chat_id" autocomplete="off" required placeholder="通常以 oc_ 开头" value="{{ diagnostics.feishu_chat_id }}"></label>
-    <div class="settings-card-actions"><button class="button primary" type="submit">保存飞书配置</button><button class="button ghost" type="button" data-action="test-feishu" {{ '' if diagnostics.feishu_credential_readable else 'disabled' }}>发送测试消息</button><span class="form-error" data-form-error></span></div>
+    <div class="settings-card-actions"><button class="button primary" type="button" data-settings-save="feishu">保存飞书配置</button><button class="button ghost" type="button" data-action="test-feishu" {{ '' if diagnostics.feishu_credential_readable else 'disabled' }}>发送测试消息</button><span class="form-error" data-form-error></span></div>
   </form>
 </section>
 

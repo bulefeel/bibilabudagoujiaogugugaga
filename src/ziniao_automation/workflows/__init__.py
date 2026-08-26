@@ -9,7 +9,12 @@ from .contracts import (
     WorkflowRepository,
 )
 from .engine import WorkflowEngine
-from .registry import WorkflowRegistry
+from .dispatcher import WorkflowDispatcher
+from .registry import (
+    WorkflowDefinition,
+    WorkflowExecutionClass,
+    WorkflowRegistry,
+)
 from .repository_sqlalchemy import SqlAlchemyWorkflowRepository
 from .runtime import AutomationService, DatabaseRunLoader
 from .types import *
@@ -21,6 +26,9 @@ __all__ = [
     "Notifier",
     "Workflow",
     "WorkflowEngine",
+    "WorkflowDispatcher",
+    "WorkflowDefinition",
+    "WorkflowExecutionClass",
     "WorkflowRegistry",
     "WorkflowRepository",
     "SqlAlchemyWorkflowRepository",

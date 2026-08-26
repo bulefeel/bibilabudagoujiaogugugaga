@@ -128,6 +128,8 @@ class WorkflowRun:
     mode: RunMode
     store: StoreRef
     marketplaces: tuple[MarketplaceRef, ...]
+    workflow_config: Mapping[str, Any] = field(default_factory=dict)
+    workflow_config_version: int = 1
     requested_by: str = "admin"
     artifact_dir: Path | None = None
 

@@ -294,8 +294,31 @@ class SqlAlchemyWorkflowRepository:
             return _approval_record(row)
 
     async def arm_operation(self, intent: OperationIntent) -> OperationRecord:
-        """Create and COMMIT ARMED before returning to caller."""
+        """Create and COMMIT ARMED only while the run still owns RUNNING.
+
+        SQLite's ``BEGIN IMMEDIATE`` serializes the status check and guard
+        insert against cancellation/status writers.  On databases with row
+        locks, ``FOR UPDATE`` provides the equivalent boundary.  Consequently
+        a cancellation that wins first produces no ARMED row, while an arming
+        transaction that wins first is durable before the browser click.
+        """
         with self.session_factory() as session:
+            connection = session.connection()
+            is_sqlite = connection.dialect.name == "sqlite"
+            if is_sqlite:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+            run_status_stmt = select(Run.status).where(Run.id == intent.run_id)
+            if not is_sqlite:
+                run_status_stmt = run_status_stmt.with_for_update()
+            run_status = session.scalar(run_status_stmt)
+            if run_status is None:
+                session.rollback()
+                raise LookupError(f"任务 {intent.run_id} 不存在")
+            if run_status != RunStatus.RUNNING.value:
+                session.rollback()
+                raise InvalidTransition(
+                    "资金操作仅允许在任务持有 RUNNING 执行权时进入 ARMED"
+                )
             site = session.scalar(
                 select(SiteRun).where(
                     SiteRun.run_id == intent.run_id,

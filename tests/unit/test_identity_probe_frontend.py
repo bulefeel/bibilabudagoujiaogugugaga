@@ -33,7 +33,18 @@ def test_unified_store_setup_is_the_only_visible_identity_probe_contract() -> No
     assert "sellercentral.amazon" not in script.lower()
 
 
-def test_unified_setup_auth_controls_appear_only_for_waiting_auth() -> None:
+def test_the_cancel_control_is_reachable_for_every_live_probe_state() -> None:
+    """A running probe must always leave the operator a way to stop it.
+
+    The panel holding 「取消并关闭该店铺窗口」 is ``hidden`` in the template and
+    used to be revealed only from the ``WAITING_AUTH`` branches.  While a probe
+    was ``CHECKING`` the page therefore had no cancel control at all, while the
+    reset it blocks answered 「请先完成或取消检测」 — naming an action with no
+    button behind it.  Both live states now render the same panel, and only the
+    "continue" button, which means nothing unless a human is being waited on, is
+    hidden while checking.
+    """
+
     script = _script()
     template = _template()
 
@@ -50,11 +61,54 @@ def test_unified_setup_auth_controls_appear_only_for_waiting_auth() -> None:
     assert "只有次数用尽" in template
     assert "未填内容、候选不唯一、CAPTCHA、非托管 Passkey" in template
     assert "不会换到普通 Chrome" in template
-    assert 'if (status === "WAITING_AUTH") { showStoreSetupAuth(form, data); return; }' in script
-    assert "showStoreSetupAuth(form, data)" in script
-    assert "ui.panel.hidden = false" in script
-    assert "ui.panel.hidden = true" in script
     assert "再次尝试自动登录并继续" in template
+
+    panel = script[
+        script.index("function showStoreSetupProbePanel") :
+        script.index("function hideStoreSetupAuth")
+    ]
+    assert "ui.panel.hidden = false" in panel
+    assert "ui.panel.hidden = true" not in panel, "活动探针的面板绝不能被这个函数藏起来"
+    # Cancel is unconditional; only continue depends on the state.
+    assert "if (ui.cancel) ui.cancel.disabled = false;" in panel
+    assert "ui.resume.hidden = checking" in panel
+
+    assert 'if (status === "WAITING_AUTH") { showStoreSetupProbePanel(form, data); return; }' in script
+    assert "showStoreSetupAuth(" not in script, "旧的只认 WAITING_AUTH 的入口应当已删除"
+
+    poll = script[
+        script.index("async function pollStoreSetupProbe") :
+        script.index("async function handleStoreSetupResponse")
+    ]
+    assert "showStoreSetupProbePanel(form, data);" in poll
+    assert "ui.panel.hidden = true" not in poll, (
+        "轮询放弃时把面板藏起来，正好夺走操作员此刻最需要的取消按钮"
+    )
+
+
+def test_the_editor_recovers_a_running_probe_from_the_server() -> None:
+    """``probe_id`` in the DOM is not a reliable record of what is running.
+
+    Reopening the editor clears it, a reload drops it, closing the tab loses it
+    — and the backend keeps holding the store's Ziniao window regardless.  The
+    editor asks the server on every open so the panel, and its cancel button,
+    come back on their own.
+    """
+
+    script = _script()
+
+    assert "/store-setup-probe`" in script, "缺少按店铺查活动探针的端点调用"
+    assert "restoreActiveStoreSetupProbe(form, data.id);" in script
+
+    restore = script[
+        script.index("function restoreActiveStoreSetupProbe") :
+        script.index("async function pollStoreSetupProbe")
+    ]
+    assert "statusCode === 204" in restore, "没有探针时服务端返回 204，必须当作正常情况"
+    # One app.js serves every page: an unhandled rejection here would break
+    # handlers registered later in the file.
+    assert ".catch(" in restore
+    assert 'if (!validPositiveId(id)) return;' in restore
 
 
 def test_detected_identity_uses_authoritative_auto_confirmation_flags() -> None:

@@ -24,12 +24,14 @@ from ziniao_automation.models import (
 )
 from ziniao_automation.repositories import StoreRepository, WorkflowRepository
 from ziniao_automation.web import create_app
+from ziniao_automation.ziniao.errors import ZiniaoCredentialError
 
 
 class FakeAutomation:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
         self.active_store_setup = False
+        self.active_store_setup_probe: dict | None = None
 
     async def sync_ziniao(self):
         return {"created": 0, "updated": 0}
@@ -60,6 +62,10 @@ class FakeAutomation:
     async def has_active_store_setup(self, store_id: int) -> bool:
         self.calls.append(("has_active_store_setup", str(store_id)))
         return self.active_store_setup
+
+    async def get_active_store_setup_probe(self, store_id: int):
+        self.calls.append(("get_active_store_setup_probe", str(store_id)))
+        return self.active_store_setup_probe
 
 
 class SyncAutomation(FakeAutomation):
@@ -150,6 +156,13 @@ class UnifiedSetupAutomation(FakeAutomation):
 
     async def cancel_store_setup_probe(self, store_id: int, probe_id: str):
         return {"status": "CANCELLED", "probe_id": probe_id, "store_id": store_id}
+
+
+class CredentialFailureSetupAutomation(FakeAutomation):
+    async def detect_store_setup(self, store_id: int, marketplace_codes):
+        self.calls.append(("credential_preflight", str(store_id)))
+        del marketplace_codes
+        raise ZiniaoCredentialError("紫鸟凭据元数据不一致，请重新保存")
 
 
 class FakeScheduleManager:
@@ -614,6 +627,45 @@ def test_unified_store_setup_api_runs_for_store_without_saved_identity(tmp_path:
         assert finished.json()["identity"]["seller_id"] == "SELLER"
 
 
+def test_unified_store_setup_returns_structured_credential_conflict(tmp_path: Path):
+    settings = Settings(
+        project_root=tmp_path,
+        data_dir=tmp_path / "data",
+        database_url=f"sqlite:///{(tmp_path / 'credential-preflight-api.db').as_posix()}",
+        testing=True,
+    )
+    fake = CredentialFailureSetupAutomation()
+    app = create_app(settings, automation_service=fake)
+    with TestClient(app) as client:
+        csrf = bootstrap(client)
+        headers = {"X-CSRF-Token": csrf}
+        store = client.post(
+            "/api/stores",
+            json={
+                "name": "Credential Fixture Store",
+                "selector_type": "id",
+                "selector_value": "credential-fixture-store",
+            },
+            headers=headers,
+        ).json()
+
+        response = client.post(
+            f"/api/stores/{store['id']}/detect-store-setup",
+            json={"marketplace_codes": ["CA", "UK"]},
+            headers=headers,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == {
+            "code": "ZINIAO_CREDENTIALS_INVALID",
+            "message": (
+                "紫鸟凭据预检未通过：紫鸟凭据元数据不一致，请重新保存。"
+                "请到“系统诊断”重新保存紫鸟公司、账号和密码后重试。"
+            ),
+        }
+        assert fake.calls == [("credential_preflight", str(store["id"]))]
+
+
 def test_identity_probe_api_returns_actionable_error_for_browser_failure(app_client):
     """A Playwright-style non-RuntimeError must never leak as an opaque 500."""
     app, client, fake = app_client
@@ -654,7 +706,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260821-diagnostics-styles" in page.text
+    assert "/static/app.js?v=20260826-bulk-queue-reconcile" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text
@@ -759,7 +811,89 @@ def test_reset_store_setup_rejects_live_process_probe_without_editing_db(app_cli
     assert persisted["expected_seller_id"] == "SELLER-LIVE"
 
 
-def test_changing_seller_id_revokes_confirmation_and_enabled(app_client):
+def test_saving_a_store_is_refused_while_a_probe_holds_it(app_client):
+    """「保存建档」 must obey the same gate as 「删除 / 重置建档」.
+
+    Only reset was ever checked, which made the gate theatre: the save button
+    sits directly above it, carries the same identity fields, and additionally
+    rewrites ``store_marketplaces`` — rows the reset deliberately leaves alone.
+    The blocked path was strictly gentler than the open one.
+    """
+
+    _, client, fake = app_client
+    csrf = bootstrap(client)
+    headers = {"X-CSRF-Token": csrf}
+    store = client.post(
+        "/api/stores",
+        json={
+            "name": "Save During Probe",
+            "selector_type": "id",
+            "selector_value": "save-during-probe",
+            "expected_seller_id": "SELLER-KEEP",
+        },
+        headers=headers,
+    ).json()
+    fake.active_store_setup = True
+
+    saved = client.patch(
+        f"/api/stores/{store['id']}",
+        json={
+            "expected_seller_id": "SELLER-STOMPED",
+            "enabled": False,
+            "marketplaces": [{"code": "CA", "enabled": False}],
+        },
+        headers=headers,
+    )
+
+    assert saved.status_code == 409, saved.text
+    assert "取消并关闭该店铺窗口" in saved.text
+    fake.active_store_setup = False
+    persisted = next(
+        item for item in client.get("/api/stores").json() if item["id"] == store["id"]
+    )
+    assert persisted["expected_seller_id"] == "SELLER-KEEP"
+    assert persisted["marketplaces"] == []
+
+
+def test_editor_can_find_a_running_probe_without_knowing_its_id(app_client):
+    """The server answers "what is running on this store", id not required.
+
+    ``probe_id`` only ever lived in the browser's DOM, so a reload or a
+    reopened editor lost the one handle that reaches the cancel endpoint while
+    the backend kept holding the store's Ziniao window.
+    """
+
+    _, client, fake = app_client
+    csrf = bootstrap(client)
+    headers = {"X-CSRF-Token": csrf}
+    store = client.post(
+        "/api/stores",
+        json={
+            "name": "Probe Lookup",
+            "selector_type": "id",
+            "selector_value": "probe-lookup",
+        },
+        headers=headers,
+    ).json()
+
+    idle = client.get(f"/api/stores/{store['id']}/store-setup-probe")
+    assert idle.status_code == 204
+    assert idle.content == b""
+
+    fake.active_store_setup_probe = {
+        "status": "CHECKING",
+        "probe_id": "unified-probe-9",
+        "store_id": store["id"],
+        "marketplaces": [{"code": "CA", "status": "CHECKING"}],
+    }
+    live = client.get(f"/api/stores/{store['id']}/store-setup-probe")
+
+    assert live.status_code == 200
+    assert live.json()["probe_id"] == "unified-probe-9"
+    assert live.json()["status"] == "CHECKING"
+
+
+def test_changing_seller_id_revokes_confirmation_but_keeps_store_available(app_client):
     _, client, _ = app_client
     csrf = bootstrap(client)
     headers = {"X-CSRF-Token": csrf}
@@ -786,7 +920,7 @@ def test_changing_seller_id_revokes_confirmation_and_enabled(app_client):
     )
     assert changed.status_code == 200, changed.text
     assert changed.json()["identity_confirmed"] is False
-    assert changed.json()["enabled"] is False
+    assert changed.json()["enabled"] is True
 
 
 def test_production_sync_persists_each_new_profile_only_once(tmp_path: Path):
@@ -1013,7 +1147,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
     assert "应用版本 / 构建" in page.text
     assert "0.2.0" in page.text
     assert "数据库迁移版本" in page.text
-    assert "0005" in page.text
+    assert "0006" in page.text
 
 
 def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):

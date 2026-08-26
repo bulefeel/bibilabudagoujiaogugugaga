@@ -4,7 +4,12 @@ from types import SimpleNamespace
 import pytest
 
 from ziniao_automation.ziniao.controller import ZiniaoController, ZiniaoControllerConfig
-from ziniao_automation.ziniao.errors import AuthWaitExpired, CdpHealthError, ZiniaoLaunchError
+from ziniao_automation.ziniao.errors import (
+    AuthWaitExpired,
+    CdpHealthError,
+    ZiniaoCredentialError,
+    ZiniaoLaunchError,
+)
 from ziniao_automation.ziniao.locks import ExecutionLocks
 from ziniao_automation.ziniao.models import CdpHealth, ProfileSelector, ZiniaoBrowserHandle
 
@@ -157,6 +162,28 @@ async def test_launch_is_bounded_at_four_attempts() -> None:
     assert [a for a in client.actions if a[0] == "start"] == [("start", "bad")] * 4
     # Exactly one per-store cleanup stop for each failed start.
     assert len([a for a in client.actions if a[0] == "stop"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_global_credential_error_is_not_retried_or_stopped_per_store() -> None:
+    class CredentialFailClient(FakeClient):
+        async def start_browser(self, selector):
+            self.actions.append(("start", selector.value))
+            raise ZiniaoCredentialError("紫鸟凭据引用已失效")
+
+    client = CredentialFailClient([9001, 9002, 9003, 9004])
+    controller = ZiniaoController(
+        client,
+        config=ZiniaoControllerConfig(max_start_attempts=4),
+        health_checker=SequencedHealth([True] * 4),
+        sessions=FakeSessions(),
+        process_running=lambda: True,
+    )
+
+    with pytest.raises(ZiniaoCredentialError, match="凭据引用已失效"):
+        await controller.open_store(ProfileSelector("oauth", "store-a"))
+
+    assert client.actions == [("start", "store-a")]
 
 
 @pytest.mark.asyncio

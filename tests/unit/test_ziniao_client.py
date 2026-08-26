@@ -5,8 +5,60 @@ import httpx
 import pytest
 
 from ziniao_automation.ziniao.client import ZiniaoClient, ZiniaoClientConfig
-from ziniao_automation.ziniao.errors import ZiniaoApiError
+from ziniao_automation.ziniao.errors import ZiniaoApiError, ZiniaoCredentialError
 from ziniao_automation.ziniao.models import ProfileSelector
+
+
+@pytest.mark.asyncio
+async def test_credential_preflight_resolves_once_without_network_or_returning_secrets() -> None:
+    resolver_calls = 0
+    network_calls = 0
+
+    def resolver() -> dict[str, str]:
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return {
+            "company": "fixture-company",
+            "username": "fixture-user",
+            "password": "fixture-secret",
+        }
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        raise AssertionError("credential preflight must not use HTTP")
+
+    client = ZiniaoClient(
+        ZiniaoClientConfig(),
+        transport=httpx.MockTransport(handler),
+        credential_resolver=resolver,
+        credential_resolver_authoritative=True,
+    )
+
+    assert client.preflight_credentials() is None
+    assert resolver_calls == 1
+    assert network_calls == 0
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_credential_preflight_rejects_incomplete_static_snapshot_without_network() -> None:
+    network_calls = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal network_calls
+        network_calls += 1
+        raise AssertionError("credential preflight must not use HTTP")
+
+    client = ZiniaoClient(
+        ZiniaoClientConfig(company="fixture-company", username="fixture-user"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(ZiniaoCredentialError, match="凭据不完整"):
+        client.preflight_credentials()
+    assert network_calls == 0
+    await client.close()
 
 
 @pytest.mark.asyncio
