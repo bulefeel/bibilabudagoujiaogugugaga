@@ -1941,6 +1941,79 @@ def create_app(
         db.commit()
         return {"status": "acknowledged", "marketplace_code": marketplace_code}
 
+    @api.post("/runs/{run_id}/settle", status_code=200)
+    async def api_settle_run(run_id: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
+        """End a run whose money questions have all been answered by hand.
+
+        ``UNCERTAIN_FINANCIAL`` had no way out. Read-back can reach a terminal
+        status only if Amazon has published the transfer, which it often does
+        not do until the next day, and the two per-guard actions — release and
+        acknowledge — settle a guard row without ever writing ``Run.status``.
+        So an operator could resolve every last funds question and still be left
+        with a run pinned open, blocking its schedule from creating anything new.
+
+        Cancelling is not the answer and stays refused: a run that armed an
+        operation must never be written off as if nothing had happened. This
+        instead reads the outcome back off the guards the operator just settled.
+        """
+
+        repository = WorkflowRepository(db)
+        run = repository.get_run(run_id, full=True)
+        if run.status != "UNCERTAIN_FINANCIAL":
+            raise HTTPException(
+                409, f"任务当前为 {run.status}，只有「资金结果待确认」的任务需要人工收尾"
+            )
+        guards = list(
+            db.scalars(select(OperationGuard).where(OperationGuard.run_id == run_id))
+        )
+        unsettled = sorted(
+            {
+                guard.marketplace_code
+                for guard in guards
+                if guard.state in {"ARMED", "SUBMITTED", "UNCERTAIN"}
+            }
+        )
+        if unsettled:
+            raise HTTPException(
+                409,
+                "还有资金记录没有裁定：" + "、".join(unsettled)
+                + "。请先对每一条使用「只回读，不重提」，或按核对结果选择"
+                "「确认未发出，释放」/「我已在亚马逊核对，结案」。",
+            )
+        # Guards are deleted on release and only ever reach CONFIRMED otherwise,
+        # so what survives here is exactly the set of transfers a human vouched
+        # for. Never report SUCCEEDED unless every site of this run is among
+        # them — a released site got no money, and green would say it did.
+        confirmed = [guard for guard in guards if guard.state == "CONFIRMED"]
+        site_count = len(run.site_runs)
+        if not confirmed:
+            status = "FAILED"
+        elif site_count and len(confirmed) == site_count:
+            status = "SUCCEEDED"
+        else:
+            status = "PARTIAL"
+        changed = repository.set_run_status(
+            run_id, status, allowed_from=("UNCERTAIN_FINANCIAL",)
+        )
+        if not changed:
+            db.rollback()
+            raise HTTPException(409, "任务状态已变化，未执行收尾")
+        repository.append_event(
+            run_id,
+            "run_settled_by_operator",
+            message=(
+                f"操作员在每条资金记录都已裁定后人工收尾，任务标记为 {status}；"
+                "系统没有重新提交任何转账，也没有删除任何资金记录"
+            ),
+            details={
+                "closed_by": "operator",
+                "confirmed_guards": len(confirmed),
+                "site_runs": site_count,
+            },
+        )
+        db.commit()
+        return {"status": status}
+
     app.include_router(api)
     return app
 

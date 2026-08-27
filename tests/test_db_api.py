@@ -15,6 +15,7 @@ from ziniao_automation.config import Settings
 from ziniao_automation.models import (
     ApprovalRequest,
     OperationGuard,
+    Run,
     RunEvent,
     RunQueueEntry,
     Schedule,
@@ -512,6 +513,135 @@ def test_acknowledge_endpoint_settles_a_dispatch_amazon_never_published(app_clie
         assert "系统本身并未回读到该记录" in events[0].message
 
 
+def _pin_run_uncertain(sessions, run_id: str) -> None:
+    with sessions() as db:
+        WorkflowRepository(db).set_run_status(
+            run_id, "UNCERTAIN_FINANCIAL", allowed_from=("QUEUED",)
+        )
+        db.commit()
+
+
+def test_settle_refuses_while_any_guard_is_still_undecided(app_client):
+    """Closing a run must never be a way to skip the money questions.
+
+    The whole point of the block is that a recorded payout has not been read
+    back. Ending the run while a guard is still ARMED/SUBMITTED/UNCERTAIN would
+    let an operator clear the schedule without ever deciding what happened to
+    the transfer.
+    """
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, guard_id, _ = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        repo = WorkflowRepository(db)
+        repo.transition_guard(guard_id, expected_states=("ARMED",), to_state="SUBMITTED")
+        repo.transition_guard(
+            guard_id, expected_states=("SUBMITTED",), to_state="UNCERTAIN"
+        )
+        db.commit()
+    _pin_run_uncertain(sessions, run_id)
+
+    response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 409, response.text
+    assert "还有资金记录没有裁定" in response.text
+    assert "UK" in response.text, "要点名是哪个站点，否则操作员不知道去哪一条上处理"
+    with sessions() as db:
+        assert db.get(Run, run_id).status == "UNCERTAIN_FINANCIAL"
+        assert db.get(OperationGuard, guard_id).state == "UNCERTAIN"
+
+
+def test_settle_ends_a_run_once_every_guard_has_been_decided(app_client):
+    """The exit that was missing entirely.
+
+    Release and acknowledge each settle one guard row and neither writes
+    ``Run.status``, so an operator could answer every funds question by hand and
+    still be left with a run pinned in UNCERTAIN_FINANCIAL — which blocks its
+    schedule from creating any new run, on the timer and via 「立即执行」 alike.
+    """
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, guard_id, guard_key = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        repo = WorkflowRepository(db)
+        repo.transition_guard(guard_id, expected_states=("ARMED",), to_state="SUBMITTED")
+        repo.transition_guard(
+            guard_id, expected_states=("SUBMITTED",), to_state="UNCERTAIN"
+        )
+        db.commit()
+    _pin_run_uncertain(sessions, run_id)
+    acknowledged = client.post(
+        f"/api/runs/{run_id}/guards/{guard_key}/acknowledge",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert acknowledged.status_code == 200, acknowledged.text
+    # Settling the guard alone leaves the run — and therefore its schedule — stuck.
+    with sessions() as db:
+        assert db.get(Run, run_id).status == "UNCERTAIN_FINANCIAL"
+
+    response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 200, response.text
+    # One site, one confirmed guard: every site of this run did get its money.
+    assert response.json()["status"] == "SUCCEEDED"
+    with sessions() as db:
+        run = db.get(Run, run_id)
+        assert run.status == "SUCCEEDED"
+        assert run.finished_at is not None
+        # Never a delete, never a resubmit: the guard is exactly as acknowledged.
+        assert db.get(OperationGuard, guard_id).state == "CONFIRMED"
+        events = db.scalars(
+            select(RunEvent).where(
+                RunEvent.run_id == run_id,
+                RunEvent.event_type == "run_settled_by_operator",
+            )
+        ).all()
+        assert len(events) == 1
+        assert "没有重新提交任何转账" in events[0].message
+
+
+def test_settle_reports_failed_when_every_guard_was_released(app_client):
+    """Released means the click never happened, so no money moved.
+
+    Reporting 「已完成」 in green here would tell an operator a payout succeeded
+    on a site that still has its full balance sitting there.
+    """
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, _, guard_key = _guard_store_with_one_armed_guard(sessions)
+    released = client.post(
+        f"/api/runs/{run_id}/guards/{guard_key}/release",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert released.status_code == 200, released.text
+    _pin_run_uncertain(sessions, run_id)
+
+    response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "FAILED"
+
+
+def test_settle_only_applies_to_a_run_waiting_on_a_funds_verdict(app_client):
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, _, _ = _guard_store_with_one_armed_guard(sessions)
+
+    response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 409, response.text
+    assert "只有「资金结果待确认」的任务需要人工收尾" in response.text
+    with sessions() as db:
+        assert db.get(Run, run_id).status == "QUEUED"
+
+
 def test_acknowledge_endpoint_refuses_a_guard_that_never_dispatched(app_client):
     """Never let the two exits blur: this one must not invent a payout.
 
@@ -706,7 +836,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260826-bulk-queue-reconcile" in page.text
+    assert "/static/app.js?v=20260827-run-settle-and-dead-end-statuses" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text

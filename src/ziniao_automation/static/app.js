@@ -1290,7 +1290,7 @@
       return;
     }
     if (runAction) {
-      const map = {approve:"approve", cancel:"cancel", reconcile:"reconcile", "continue-auth":"continue-auth"};
+      const map = {approve:"approve", cancel:"cancel", reconcile:"reconcile", "continue-auth":"continue-auth", settle:"settle"};
       const message = target.dataset.confirm || (runAction === "cancel" ? "确认取消这个任务？资金锁定后的任务仍只会进入回读。" : "确认执行此操作？");
       if (!(await confirmAction(message))) return;
       target.disabled = true; try { await api(`/api/runs/${target.dataset.runId}/${map[runAction]}`, {method:"POST", body:"{}"}); toast("请求已进入队列"); setTimeout(() => location.reload(), 800); } catch (exc) { toast(exc.message, true); target.disabled = false; }

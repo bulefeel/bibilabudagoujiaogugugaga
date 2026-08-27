@@ -44,6 +44,32 @@ class ConflictError(RuntimeError):
     pass
 
 
+# One vocabulary for "may this run stop something else", because four copies of
+# it drifted apart three separate times. The rule that matters is not which
+# statuses sound alarming, it is which ones an operator can still get out of.
+#
+# Still going: holds a queue slot, a browser or a lock. Anything that follows
+# genuinely has to wait, and waiting ends by itself.
+ACTIVE_RUN_STATUSES = frozenset(
+    {"QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_AUTH", "RECONCILING"}
+)
+# The money is genuinely in doubt: a payout click was recorded and never read
+# back, so starting another run against the same store could send it twice.
+# Worth blocking on — and now escapable, via the manual close-out on the run
+# detail page once every guard has been settled by hand.
+UNRESOLVED_FUNDS_RUN_STATUSES = frozenset({"UNCERTAIN_FINANCIAL"})
+# Dead ends: ``finished_at`` is already stamped, no lock or browser is held, and
+# nothing will ever move them along on its own. Blocking on one of these is a
+# permanent veto, and it lands precisely when the operator most needs to act.
+# ``NEEDS_HUMAN_AUTH`` only means an assisted login ran out of time.
+#
+# This has now been reintroduced three times — on 建档重置, on schedule-driven
+# creation, and on manual 「立即执行」 — because each rule kept its own literal
+# list and the reasoning lived in a comment attached to only one of them.
+# ``test_no_blocking_rule_ever_vetoes_on_a_dead_end_status`` is the guard.
+DEAD_END_RUN_STATUSES = frozenset({"NEEDS_HUMAN_AUTH"})
+
+
 def canonical_hash(value: Any) -> str:
     body = json.dumps(
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
@@ -66,15 +92,7 @@ class StoreRepository:
     # operator needs precisely when a site got stuck.  Observed in the field:
     # run RUN_EXAMPLE_A sat in UNCERTAIN_FINANCIAL after its only guard had already
     # reached CONFIRMED, and no sequence of operator actions could clear it.
-    SETUP_RESET_BLOCKING_RUN_STATUSES = frozenset(
-        {
-            "QUEUED",
-            "RUNNING",
-            "WAITING_APPROVAL",
-            "WAITING_AUTH",
-            "RECONCILING",
-        }
-    )
+    SETUP_RESET_BLOCKING_RUN_STATUSES = ACTIVE_RUN_STATUSES
     # Guard states no longer block a reset, and there is no set to relax back
     # into.  The rule they enforced protected a locally stored payout-account
     # baseline that ``reset_setup`` used to clear; migration 0005 deleted that
@@ -362,12 +380,22 @@ class StoreRepository:
 
 
 class ScheduleRepository:
-    ACTIVE_RUN_STATUSES = frozenset(
-        {"QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_AUTH", "RECONCILING"}
-    )
-    BLOCKING_NEW_RUN_STATUSES = frozenset(
-        {"NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL"}
-    )
+    # Only money still in doubt may stop a schedule. ``UNCERTAIN_FINANCIAL``
+    # means a payout click was recorded but never read back, so producing more
+    # runs against the same store risks a second transfer; that is worth
+    # blocking on, and the run detail page offers a manual close-out once every
+    # guard has been settled by hand.
+    #
+    # ``NEEDS_HUMAN_AUTH`` deliberately does NOT belong here. It only means the
+    # assisted login ran out of time — it holds no funds lock and no browser,
+    # and it has no automatic exit. Blocking on it killed the whole schedule
+    # over one failed login: every later occurrence produced SKIPPED and even
+    # 「立即执行」 was refused, with nothing in the UI to clear it. This is the
+    # same call already made for 建档重置 on 2026-08-19; the decision was
+    # documented only in the SETUP_RESET_BLOCKING_* comment, which is a
+    # different constant, so it got reintroduced here. Before adding any status
+    # to a blocking set, ask what it would cost the operator to be wrong.
+    BLOCKING_NEW_RUN_STATUSES = UNRESOLVED_FUNDS_RUN_STATUSES
 
     def __init__(self, session: Session, workflow_registry: Any | None = None) -> None:
         self.session = session
@@ -647,7 +675,7 @@ class ScheduleRepository:
             select(Run.id)
             .where(
                 Run.schedule_id == schedule.id,
-                Run.status.in_(self.ACTIVE_RUN_STATUSES),
+                Run.status.in_(ACTIVE_RUN_STATUSES),
             )
             .limit(1)
         )
@@ -833,15 +861,7 @@ class WorkflowRepository:
                 select(Run.id).where(
                     Run.schedule_id == schedule_id,
                     Run.status.in_(
-                        (
-                            "QUEUED",
-                            "RUNNING",
-                            "WAITING_APPROVAL",
-                            "WAITING_AUTH",
-                            "RECONCILING",
-                            "NEEDS_HUMAN_AUTH",
-                            "UNCERTAIN_FINANCIAL",
-                        )
+                        ACTIVE_RUN_STATUSES | UNRESOLVED_FUNDS_RUN_STATUSES
                     ),
                 ).limit(1)
             )

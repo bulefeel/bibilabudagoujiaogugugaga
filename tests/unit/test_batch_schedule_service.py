@@ -442,3 +442,129 @@ def test_queue_snapshots_workflow_priority_then_batch_target_order(database):
         assert queue.finish(entry.id)
     assert claimed == [runs[0].id, runs[1].id, runs[2].id]
     assert snapshots == [(1, 1), (1, 2), (2, 3)]
+
+
+@pytest.mark.parametrize(
+    ("prior_status", "blocked"),
+    [("UNCERTAIN_FINANCIAL", True), ("NEEDS_HUMAN_AUTH", False)],
+)
+def test_only_unresolved_money_blocks_a_schedule_from_creating_runs(
+    database, prior_status, blocked
+):
+    """Only a run whose money is still in doubt may stop its schedule.
+
+    ``UNCERTAIN_FINANCIAL`` means a payout click was recorded and never read
+    back, so producing another run against the same store risks a second
+    transfer — worth blocking on, and the run detail page can now close it out
+    by hand once every guard is settled.
+
+    ``NEEDS_HUMAN_AUTH`` only means the assisted login ran out of time. It holds
+    no funds lock and no browser, yet blocking on it killed the schedule
+    outright: every later occurrence produced SKIPPED, 「立即执行」 was refused
+    too, and no UI action existed to clear it. The same call was already made
+    for 建档重置 on 2026-08-19, but that decision lived in a comment on a
+    different constant, so it came back here.
+    """
+
+    with database() as session:
+        store = _seed_store(session, 1)
+        session.commit()
+        registry = WorkflowRegistry((build_amazon_disbursement_definition(),))
+        schedules = ScheduleRepository(session, registry)
+        schedule = schedules.create(
+            store_id=store.id,
+            name="工作日提现",
+            workflow="amazon_disbursement",
+            mode="dry_run",
+            workflow_config={"marketplace_codes": ["CA", "UK"]},
+            marketplace_codes=["CA", "UK"],
+            local_time="09:00",
+            days_of_week="mon,tue,wed,thu,fri",
+            timezone="Asia/Singapore",
+            enabled=True,
+        )
+        session.commit()
+
+        first = schedules.create_run_from_schedule(
+            schedule.id, require_enabled=True, trigger="schedule", requested_by="scheduler"
+        )
+        WorkflowRepository(session).set_run_status(
+            first.id, prior_status, allowed_from=("QUEUED",)
+        )
+        session.commit()
+
+        if blocked:
+            with pytest.raises(ConflictError, match="需要人工处理"):
+                schedules.create_run_from_schedule(
+                    schedule.id,
+                    require_enabled=True,
+                    trigger="schedule",
+                    requested_by="scheduler",
+                )
+        else:
+            second = schedules.create_run_from_schedule(
+                schedule.id,
+                require_enabled=True,
+                trigger="schedule",
+                requested_by="scheduler",
+            )
+            session.commit()
+            assert second.id != first.id
+            # The stalled run is left exactly as it was; it simply stops being a
+            # reason to refuse everything that comes after it.
+            assert session.get(Run, first.id).status == prior_status
+
+
+def test_no_blocking_rule_ever_vetoes_on_a_dead_end_status():
+    """A status nobody can leave must never be a reason to refuse work.
+
+    This exact mistake has shipped three times — on 建档重置, on schedule-driven
+    run creation, and on manual 「立即执行」 — because each rule carried its own
+    literal list of statuses while the reasoning lived in a comment attached to
+    only one of them. The sets are shared now; this asserts nobody re-inlines a
+    fourth list.
+    """
+
+    import ast
+    import inspect
+
+    from ziniao_automation import repositories as module
+
+    for rule in (
+        module.ACTIVE_RUN_STATUSES,
+        module.UNRESOLVED_FUNDS_RUN_STATUSES,
+        module.StoreRepository.SETUP_RESET_BLOCKING_RUN_STATUSES,
+        module.ScheduleRepository.BLOCKING_NEW_RUN_STATUSES,
+    ):
+        assert not rule & module.DEAD_END_RUN_STATUSES, (
+            f"{sorted(rule & module.DEAD_END_RUN_STATUSES)} 是死胡同状态，"
+            "写了 finished_at、不持有任何资源、没有自动出口，不能用作阻断依据"
+        )
+
+    # A dead-end status may still be written, read, and listed among the
+    # statuses that stamp ``finished_at`` — that last one is in fact the proof
+    # it IS terminal. What it may not appear in is a literal handed to
+    # ``Run.status.in_(...)``, which is how every one of the three regressions
+    # was written: a query that refuses to do something while such a run exists.
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not node.args:
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "in_"):
+            continue
+        owner = func.value
+        if not (isinstance(owner, ast.Attribute) and owner.attr == "status"):
+            continue
+        argument = node.args[0]
+        if not isinstance(argument, (ast.Tuple, ast.Set, ast.List)):
+            continue  # a named constant — already covered by the checks above
+        offenders = {
+            element.value
+            for element in argument.elts
+            if isinstance(element, ast.Constant)
+        } & module.DEAD_END_RUN_STATUSES
+        assert not offenders, (
+            f"repositories.py 第 {node.lineno} 行内联了一份状态列表来阻断查询，"
+            f"其中含 {sorted(offenders)}；请改用文件顶部的共享常量"
+        )

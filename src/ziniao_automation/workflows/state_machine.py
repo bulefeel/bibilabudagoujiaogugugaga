@@ -66,7 +66,17 @@ RUN_TRANSITIONS: Mapping[RunStatus, Set[RunStatus]] = {
     RunStatus.PARTIAL: set(),
     RunStatus.FAILED: set(),
     RunStatus.CANCELLED: set(),
-    RunStatus.UNCERTAIN_FINANCIAL: {RunStatus.RECONCILING},
+    RunStatus.UNCERTAIN_FINANCIAL: {
+        RunStatus.RECONCILING,
+        # Manual close-out. Read-back is bounded to about a minute while Amazon
+        # often publishes a disbursement only the next day, so a run could stay
+        # here for ever: it kept blocking its schedule, and settling each guard
+        # by hand fixed the money question without ever touching the run. These
+        # three are reachable only once every guard on the run is terminal.
+        RunStatus.SUCCEEDED,
+        RunStatus.PARTIAL,
+        RunStatus.FAILED,
+    },
     RunStatus.SKIPPED: set(),
 }
 
