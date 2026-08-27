@@ -17,7 +17,7 @@ import re
 import subprocess
 
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 _COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
 

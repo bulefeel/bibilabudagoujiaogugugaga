@@ -15,7 +15,7 @@ def test_release_number_has_one_hand_edited_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     installer = (ROOT / "installer/ziniao-automation.iss").read_text(encoding="utf-8")
 
-    assert __version__ == "0.2.0"
+    assert __version__ == "0.3.0"
     assert project["project"]["dynamic"] == ["version"]
     assert project["tool"]["setuptools"]["dynamic"]["version"] == {
         "attr": "ziniao_automation.version.__version__"
