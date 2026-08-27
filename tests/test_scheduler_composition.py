@@ -31,6 +31,12 @@ from ziniao_automation.workflows.registry import (
 from ziniao_automation.workflows.types import RunMode
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 class FakeAutomation:
     def __init__(self) -> None:
         self.enqueued: list[str] = []
@@ -149,8 +155,8 @@ async def _schedule_rebuild_options_and_api_refresh_projection(db_env):
             name="工作日检查",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:30",
-            days_of_week="mon,tue,wed,thu,fri",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             enabled=True,
@@ -198,8 +204,8 @@ async def _schedule_projection_normalizes_zoned_occurrence_to_utc(db_env):
             name="UTC projection",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:30",
-            days_of_week="mon,tue,wed,thu,fri",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             enabled=True,
@@ -241,8 +247,8 @@ async def _schedule_trigger_is_single_instance(db_env):
             name="每日检查",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:00",
-            days_of_week="*",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             enabled=True,
@@ -311,8 +317,8 @@ def _seed_two_store_batch(factory):
                 name="same batch",
                 workflow="amazon_disbursement",
                 mode="dry_run",
-                local_time="09:00",
-                days_of_week="*",
+                first_run_at=SCHEDULE_ANCHOR,
+                interval_minutes=1440,
                 timezone="Asia/Singapore",
                 marketplace_codes=["CA"],
                 workflow_config={"marketplace_codes": ["CA"]},
@@ -375,8 +381,8 @@ def test_scheduler_identity_gate_follows_generic_workflow_definition(db_env):
             name="read-only",
             workflow="future_report",
             mode="dry_run",
-            local_time="09:00",
-            days_of_week="*",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=[],
             workflow_config={},
@@ -437,7 +443,8 @@ def test_auto_mode_no_longer_requires_prior_approval_successes(db_env):
             name="无历史也可自动",
             workflow="amazon_disbursement",
             mode="auto",
-            local_time="10:00",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             marketplace_codes=["CA"],
             enabled=True,
         )
@@ -462,7 +469,8 @@ def test_auto_mode_no_longer_requires_prior_approval_successes(db_env):
             name="上一轮 PARTIAL 也不再阻挡",
             workflow="amazon_disbursement",
             mode="auto",
-            local_time="10:00",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             marketplace_codes=["CA"],
             enabled=True,
         )
@@ -471,7 +479,8 @@ def test_auto_mode_no_longer_requires_prior_approval_successes(db_env):
             name="草稿可以直接启用",
             workflow="amazon_disbursement",
             mode="auto",
-            local_time="10:00",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             marketplace_codes=["CA"],
             enabled=False,
         )
@@ -498,7 +507,8 @@ def test_auto_mode_still_requires_a_confirmed_seller_identity(db_env):
                 name="身份未确认",
                 workflow="amazon_disbursement",
                 mode="auto",
-                local_time="10:00",
+                first_run_at=SCHEDULE_ANCHOR,
+                interval_minutes=1440,
                 marketplace_codes=["CA"],
                 enabled=True,
             )

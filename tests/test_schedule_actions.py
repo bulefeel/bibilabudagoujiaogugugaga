@@ -16,6 +16,12 @@ from ziniao_automation.scheduler import ScheduleManager
 from ziniao_automation.web import create_app
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 class Automation:
     def __init__(self) -> None:
         self.enqueued: list[str] = []
@@ -70,7 +76,8 @@ def seed(factory, *, mode: str = "dry_run", enabled: bool = False) -> int:
             store_id=store.id,
             name="Saved test rule",
             mode=mode,
-            local_time="09:00",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             marketplace_codes=["CA"],
             enabled=enabled,
         )
@@ -145,7 +152,8 @@ def test_schedule_requires_an_explicit_marketplace_selection(database):
                 name="Ambiguous rule",
                 workflow="amazon_disbursement",
                 mode="dry_run",
-                local_time="09:00",
+                first_run_at=SCHEDULE_ANCHOR,
+                interval_minutes=1440,
                 marketplace_codes=[],
                 enabled=False,
             )

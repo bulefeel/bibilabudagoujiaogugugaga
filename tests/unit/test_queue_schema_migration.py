@@ -168,7 +168,7 @@ def test_0006_upgrades_real_legacy_shape_without_rebuilding_schedule_audit_links
     with upgraded.connect() as connection:
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar() == "0006"
+        ).scalar() == _head_revision()
         assert connection.exec_driver_sql(
             "SELECT workflow_config FROM schedules WHERE id=1"
         ).scalar() == '{"marketplace_codes": ["UK"]}'
@@ -224,11 +224,11 @@ def test_0006_downgrade_upgrade_round_trip_preserves_rows_and_constraints(
         connection.exec_driver_sql(
             "INSERT INTO schedules "
             "(id, store_id, batch_id, batch_order, name, workflow, mode, "
-            " local_time, days_of_week, timezone, marketplace_codes, "
+            " first_run_at, interval_minutes, timezone, marketplace_codes, "
             " workflow_config, workflow_config_version, enabled, "
             " misfire_grace_seconds, created_at, updated_at) "
             "VALUES (11, 2, 7, 1, 'schedule', 'amazon_disbursement', "
-            "'dry_run', '09:00', 'mon', 'Asia/Singapore', '[\"CA\",\"UK\"]', "
+            "'dry_run', '2026-01-01 01:00:00+00:00', 1440, 'Asia/Singapore', '[\"CA\",\"UK\"]', "
             "'{\"marketplace_codes\":[\"CA\",\"UK\"]}', 1, 1, 1800, "
             "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
         )
@@ -451,11 +451,11 @@ def test_0006_upgraded_checks_reject_invalid_values(
         connection.exec_driver_sql(
             "INSERT INTO schedules "
             "(id, store_id, batch_id, batch_order, name, workflow, mode, "
-            "local_time, days_of_week, timezone, marketplace_codes, "
+            "first_run_at, interval_minutes, timezone, marketplace_codes, "
             "workflow_config, workflow_config_version, enabled, "
             "misfire_grace_seconds, created_at, updated_at) VALUES "
             "(11, 1, 1, 1, 'schedule', 'amazon_disbursement', 'dry_run', "
-            "'09:00', 'mon', 'Asia/Singapore', '[\"CA\"]', "
+            "'2026-01-01 01:00:00+00:00', 1440, 'Asia/Singapore', '[\"CA\"]', "
             "'{\"marketplace_codes\":[\"CA\"]}', 1, 1, 1800, "
             "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
         )
@@ -536,6 +536,10 @@ def test_0006_failed_downgrade_rolls_back_every_schema_change(tmp_path: Path) ->
         item["name"] for item in inspector.get_check_constraints("stores")
     }
     with unchanged.connect() as connection:
+        # 0006, not head: downgrading to 0005 runs 0007's downgrade first and
+        # that one succeeds, so the stamp has legitimately moved back one step
+        # before 0006's downgrade fails and rolls itself back. The value is the
+        # same as before 0007 existed, for a different reason.
         assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0006"
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").all()
         assert connection.scalar(sa.text("PRAGMA integrity_check")) == "ok"
@@ -656,7 +660,7 @@ def test_queue_active_item_and_schedule_occurrence_are_unique(tmp_path: Path) ->
         )
         connection.exec_driver_sql(
             "INSERT INTO schedules "
-            "(id, store_id, name, workflow, mode, local_time, days_of_week, timezone, "
+            "(id, store_id, name, workflow, mode, first_run_at, interval_minutes, timezone, "
             "marketplace_codes, enabled, misfire_grace_seconds, created_at, updated_at) "
             "VALUES (1, 1, 'schedule', 'amazon_disbursement', 'dry_run', '09:00', "
             "'mon', 'Asia/Singapore', '[]', 1, 1800, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
@@ -759,15 +763,18 @@ def test_0003_converts_legacy_local_next_run_to_utc(tmp_path: Path) -> None:
         )
         connection.exec_driver_sql(
             "INSERT INTO schedules "
-            "(id, store_id, name, workflow, mode, local_time, days_of_week, timezone, "
+            "(id, store_id, name, workflow, mode, first_run_at, interval_minutes, timezone, "
             "marketplace_codes, enabled, misfire_grace_seconds, next_run_at, "
             "created_at, updated_at) "
-            "VALUES (1, 1, 'schedule', 'amazon_disbursement', 'dry_run', '09:10', "
-            "'mon,tue,wed,thu,fri', 'Asia/Singapore', '[]', 1, 1800, "
+            "VALUES (1, 1, 'schedule', 'amazon_disbursement', 'dry_run', "
+            "'2026-01-01 01:00:00+00:00', 1440, 'Asia/Singapore', '[]', 1, 1800, "
             "'2026-08-17 09:10:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
         )
 
-    _upgrade(database)
+    # Stops at 0006 on purpose. 0003 is what this test is about, and 0007 clears
+    # next_run_at for every row — running to head would erase the very value
+    # being measured. 0007's own handling of it is covered separately.
+    _upgrade(database, "0006")
 
     with engine.connect() as connection:
         value = connection.scalar(
@@ -777,7 +784,7 @@ def test_0003_converts_legacy_local_next_run_to_utc(tmp_path: Path) -> None:
         assert parsed == datetime(2026, 8, 17, 1, 10)
         assert connection.scalar(
             sa.text("SELECT version_num FROM alembic_version")
-        ) == _head_revision()
+        ) == "0006"
 
 
 def _database_with_cycle_wide_guard_unique(database: Path) -> sa.Engine:
@@ -1033,3 +1040,131 @@ def test_0005_drops_the_baseline_and_adds_the_observed_tail(tmp_path: Path) -> N
         )
         assert "payout_account_tail" in guards
         assert connection.scalar(sa.text("PRAGMA integrity_check")) == "ok"
+
+
+def test_0007_backfills_an_anchor_from_the_old_wall_clock_and_clears_projections(
+    tmp_path: Path,
+) -> None:
+    """Every existing rule keeps the time of day it already ran at.
+
+    Changing the period to something that clears Amazon's rolling 24-hour cap is
+    a per-schedule decision an operator makes deliberately; a migration must not
+    make it for them. So the anchor becomes the next occurrence of the rule's
+    own ``local_time`` and the period starts at the daily cadence it already had.
+
+    ``next_run_at`` is wiped because startup projection recomputes it — and
+    because that also retires the pre-0003 rows that stored a local wall clock
+    in a UTC column, whose detection keyed on the ``local_time`` being dropped.
+    """
+
+    database = tmp_path / "cron-to-interval.db"
+    # 0001 builds tables from live model metadata, so a fresh database is
+    # already the new shape. Use 0007's own downgrade to produce a genuine
+    # pre-migration cron table rather than hand-rolling one that might drift
+    # from what a real installation looks like.
+    _upgrade(database)
+    _downgrade(database, "0006")
+    engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO ziniao_accounts "
+            "(id, display_name, enabled, created_at, updated_at) "
+            "VALUES (1, 'account', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO stores "
+            "(id, account_id, name, selector_type, selector_value, "
+            "identity_confirmed, enabled, raw_profile, created_at, updated_at) "
+            "VALUES (1, 1, 'store', 'id', 'profile', 1, 1, '{}', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO schedules "
+            "(id, store_id, name, workflow, mode, local_time, days_of_week, "
+            "timezone, marketplace_codes, workflow_config, "
+            "workflow_config_version, enabled, misfire_grace_seconds, "
+            "next_run_at, created_at, updated_at) "
+            "VALUES (1, 1, 'daily', 'amazon_disbursement', 'dry_run', '14:30', "
+            "'mon,tue,wed,thu,fri', 'Asia/Singapore', '[]', '{}', 1, 1, 1800, "
+            "'2020-01-01 00:00:00', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    engine.dispose()
+
+    _upgrade(database)
+
+    upgraded = sa.create_engine(f"sqlite:///{database.as_posix()}")
+    with upgraded.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql("PRAGMA table_info(schedules)")
+        }
+        assert "local_time" not in columns
+        assert "days_of_week" not in columns
+        assert {"first_run_at", "interval_minutes"} <= columns
+
+        anchor_text, interval, next_run = connection.exec_driver_sql(
+            "SELECT first_run_at, interval_minutes, next_run_at FROM schedules WHERE id=1"
+        ).one()
+        anchor = datetime.fromisoformat(str(anchor_text))
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=timezone.utc)
+
+        assert interval == 1440
+        assert next_run is None, "陈旧的投影必须清掉，由启动时重算"
+        assert anchor > datetime.now(timezone.utc), "锚点必须落在未来，否则一升级就立刻补跑"
+        # 14:30 Asia/Singapore == 06:30 UTC — same time of day as before.
+        assert (anchor.hour, anchor.minute) == (6, 30)
+        assert connection.exec_driver_sql("PRAGMA integrity_check").scalar() == "ok"
+    upgraded.dispose()
+
+
+def test_0007_round_trips_back_to_the_cron_shape(tmp_path: Path) -> None:
+    """Downgrade restores the wall clock the anchor came from.
+
+    Weekday selection cannot be recovered — an interval rule has been firing on
+    weekends too, so it comes back as '*' rather than silently narrowing to the
+    old mon-fri default and skipping runs.
+    """
+
+    database = tmp_path / "interval-downgrade.db"
+    _upgrade(database)
+    engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "INSERT INTO ziniao_accounts "
+            "(id, display_name, enabled, created_at, updated_at) "
+            "VALUES (1, 'account', 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO stores "
+            "(id, account_id, name, selector_type, selector_value, "
+            "identity_confirmed, enabled, raw_profile, created_at, updated_at) "
+            "VALUES (1, 1, 'store', 'id', 'profile', 1, 1, '{}', "
+            "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO schedules "
+            "(id, store_id, name, workflow, mode, first_run_at, interval_minutes, "
+            "timezone, marketplace_codes, workflow_config, "
+            "workflow_config_version, enabled, misfire_grace_seconds, "
+            "created_at, updated_at) "
+            "VALUES (1, 1, 'interval', 'amazon_disbursement', 'dry_run', "
+            "'2026-01-01 06:30:00+00:00', 1500, 'Asia/Singapore', '[]', '{}', "
+            "1, 1, 1800, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+        )
+    engine.dispose()
+
+    _downgrade(database, "0006")
+
+    with sa.create_engine(f"sqlite:///{database.as_posix()}").connect() as connection:
+        local_time, days = connection.exec_driver_sql(
+            "SELECT local_time, days_of_week FROM schedules WHERE id=1"
+        ).one()
+        assert local_time == "14:30"  # 06:30 UTC in Asia/Singapore
+        assert days == "*"
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql("PRAGMA table_info(schedules)")
+        }
+        assert "first_run_at" not in columns
+        assert "interval_minutes" not in columns

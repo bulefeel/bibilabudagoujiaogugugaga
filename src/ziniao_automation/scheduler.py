@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import logging
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -102,13 +101,9 @@ class ScheduleManager:
             for row in schedules:
                 try:
                     job_id = self.job_id(row.id)
-                    hour, minute = _parse_local_time(row.local_time)
-                    timezone_value = _zone(row.timezone)
-                    trigger = _cron_trigger(
-                        day_of_week=row.days_of_week,
-                        hour=hour,
-                        minute=minute,
-                        timezone_value=timezone_value,
+                    trigger = _interval_trigger(
+                        interval_minutes=row.interval_minutes,
+                        first_run_at=row.first_run_at,
                     )
                     job = self.scheduler.add_job(
                         self.trigger_schedule,
@@ -579,8 +574,8 @@ class _ScheduleSnapshot:
         return cls(
             id=row.id,
             name=row.name,
-            local_time=row.local_time,
-            days_of_week=row.days_of_week,
+            interval_minutes=row.interval_minutes,
+            first_run_at=row.first_run_at,
             timezone=row.timezone,
             misfire_grace_seconds=row.misfire_grace_seconds,
             created_at=row.created_at,
@@ -598,35 +593,46 @@ def _default_scheduler() -> Any:
     return AsyncIOScheduler(timezone=timezone.utc)
 
 
-def _cron_trigger(*, day_of_week: str, hour: int, minute: int, timezone_value: ZoneInfo) -> Any:
+def _interval_trigger(*, interval_minutes: int, first_run_at: datetime) -> Any:
+    """Fire on the grid ``first_run_at + k × interval``.
+
+    Anchored to an absolute instant rather than a wall clock, so the grid is
+    immune to DST and a period above 24 hours genuinely stays above 24 hours —
+    which is the whole reason this replaced a cron: Amazon measures its payout
+    cap from the previous request, not from midnight.
+
+    An anchor in the past is legitimate and common (editing a running rule).
+    APScheduler advances to the next future point on the same grid rather than
+    replaying the backlog.
+    """
+
     try:
-        from apscheduler.triggers.cron import CronTrigger
+        from apscheduler.triggers.interval import IntervalTrigger
     except ImportError as exc:  # pragma: no cover
         raise RuntimeError("缺少 APScheduler 依赖，请先完成本地安装") from exc
-    return CronTrigger(
-        day_of_week=day_of_week,
-        hour=hour,
-        minute=minute,
-        timezone=timezone_value,
+    minutes = _validated_interval(interval_minutes)
+    return IntervalTrigger(
+        minutes=minutes,
+        start_date=_as_utc(first_run_at),
+        timezone=timezone.utc,
     )
 
 
-def _parse_local_time(value: str) -> tuple[int, int]:
+def _validated_interval(value: Any) -> int:
     try:
-        hour_text, minute_text = value.split(":", 1)
-        hour, minute = int(hour_text), int(minute_text)
-    except (ValueError, AttributeError) as exc:
-        raise ValueError(f"计划时间格式不合法：{value}") from exc
-    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
-        raise ValueError(f"计划时间超出范围：{value}")
-    return hour, minute
+        minutes = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"运行间隔不是整数分钟：{value!r}") from exc
+    if minutes < 1:
+        raise ValueError(f"运行间隔必须至少 1 分钟：{minutes}")
+    return minutes
 
 
-def _zone(value: str) -> ZoneInfo:
-    try:
-        return ZoneInfo(value)
-    except ZoneInfoNotFoundError as exc:
-        raise ValueError(f"计划时区不存在：{value}") from exc
+def _anchor_of(schedule: Any) -> datetime:
+    value = schedule.first_run_at
+    if value is None:
+        raise ValueError("排期没有首次运行时间")
+    return _as_utc(value)
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -638,42 +644,33 @@ def _as_utc(value: datetime) -> datetime:
 
 
 def _persisted_next_run_as_utc(schedule: Any) -> datetime:
-    """Read both current UTC and pre-fix local-wall-clock projections.
+    """Normalise a stored projection to aware UTC.
 
-    Older builds assigned APScheduler's zoned ``next_run_time`` directly to a
-    SQLite column.  SQLite discarded the offset and retained e.g. ``09:10``
-    instead of the intended ``01:10 UTC``.  The cron minute/hour provide a
-    narrow, deterministic signature for that legacy representation.  New
-    values are persisted as UTC and therefore normally do not match that wall
-    clock signature.
+    Migration 0007 clears ``next_run_at`` for every row, and the heuristic that
+    used to recognise pre-0003 local-wall-clock values keyed on ``local_time``,
+    which no longer exists.  A naive value can now only be a plain UTC timestamp
+    SQLite stripped the offset from.
     """
 
     value = schedule.next_run_at
     if value is None:
         raise ValueError("排期没有下次运行时间")
-    if value.tzinfo is not None:
-        return _as_utc(value)
-    hour, minute = _parse_local_time(schedule.local_time)
-    if (value.hour, value.minute) == (hour, minute):
-        return value.replace(tzinfo=_zone(schedule.timezone)).astimezone(timezone.utc)
-    return value.replace(tzinfo=timezone.utc)
+    return _as_utc(value)
 
 
 def _latest_occurrence(schedule: Any, *, now: datetime) -> datetime | None:
-    """Return the latest cron occurrence, without generating an old backlog."""
+    """Latest grid point at or before ``now``, without generating a backlog.
 
-    hour, minute = _parse_local_time(schedule.local_time)
-    trigger = _cron_trigger(
-        day_of_week=schedule.days_of_week,
-        hour=hour,
-        minute=minute,
-        timezone_value=_zone(schedule.timezone),
-    )
+    Pure arithmetic on ``first_run_at + k × interval``.  The cron version had to
+    walk the trigger forward from an eight-day cursor; an evenly spaced grid
+    gives the same answer with a division, and without that window silently
+    capping how far back recovery could see.
+    """
+
+    anchor = _anchor_of(schedule)
+    interval = timedelta(minutes=_validated_interval(schedule.interval_minutes))
     cutoff = _as_utc(now)
-    cursor = cutoff - timedelta(days=8)
-    previous: datetime | None = None
-    candidate = trigger.get_next_fire_time(None, cursor)
-    while candidate is not None and _as_utc(candidate) <= cutoff:
-        previous = _as_utc(candidate)
-        candidate = trigger.get_next_fire_time(candidate, candidate)
-    return previous
+    if cutoff < anchor:
+        return None
+    elapsed = (cutoff - anchor) // interval
+    return anchor + elapsed * interval

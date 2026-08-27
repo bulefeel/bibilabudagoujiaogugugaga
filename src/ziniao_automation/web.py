@@ -127,6 +127,27 @@ class AutomationService(Protocol):
     async def reconcile_run(self, run_id: str) -> None: ...
 
 
+def _interval_label(minutes: Any) -> str:
+    """Render a schedule period the way an operator would say it.
+
+    Whole hours read as hours because that is how the 24-hour cap is discussed;
+    anything else keeps its minutes rather than being rounded into a lie.
+    """
+
+    try:
+        total = int(minutes)
+    except (TypeError, ValueError):
+        return "—"
+    if total < 1:
+        return "—"
+    hours, remainder = divmod(total, 60)
+    if hours and not remainder:
+        return f"每 {hours} 小时"
+    if hours:
+        return f"每 {hours} 小时 {remainder} 分"
+    return f"每 {remainder} 分钟"
+
+
 class UnconfiguredAutomationService:
     async def sync_ziniao(self) -> dict[str, Any]:
         raise RuntimeError("紫鸟运行服务尚未配置")
@@ -314,6 +335,7 @@ def create_app(
     templates.env.filters["queue_state_label"] = lambda value: QUEUE_STATE_LABELS.get(str(value), str(value))
     templates.env.filters["queue_action_label"] = lambda value: QUEUE_ACTION_LABELS.get(str(value), str(value))
     templates.env.filters["money"] = lambda value: "—" if value is None else f"{value:,.2f}"
+    templates.env.filters["interval_label"] = _interval_label
     # Datetimes stay UTC in SQLite and APIs.  Jinja alone converts them to the
     # operator timezone so changing presentation never changes queue ordering
     # or financial audit timestamps.

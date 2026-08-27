@@ -148,3 +148,13 @@
 .settings-card-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:4px}
 .settings-card-actions .form-error{flex:1;min-width:160px;margin:0}
 @media(max-width:760px){.diagnostic-actions,.diagnostic-settings{padding:18px 16px}.settings-card{padding:16px}}
+
+/* 运行间隔：数字与单位是一组，必须并排。dialog 里的 input/select 默认 width:100%，
+   不给容器定义网格的话两者会各占一行、看起来像两个不相干的控件。 */
+.interval-row{display:grid;grid-template-columns:1fr 118px;gap:10px;align-items:center}
+.interval-row input,.interval-row select{margin-top:0}
+.fieldset-help.warn{background:#eadfc7;color:#89601e;padding:9px 11px;margin-top:9px;border-left:3px solid #c69a3f}
+@media(max-width:760px){.interval-row{grid-template-columns:1fr}}
+/* 「我已在亚马逊核对，结案」——和同排的「确认未发出，释放」是一对人工出口，
+   外观必须一致，否则看起来像两种不同分量的操作。 */
+.guard-acknowledge{border-color:#b97065;color:#8e2f24}

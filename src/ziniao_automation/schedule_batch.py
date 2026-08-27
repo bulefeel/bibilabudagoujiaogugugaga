@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import json
-import re
 from types import SimpleNamespace
 from typing import Any
 from uuid import UUID
@@ -23,8 +23,6 @@ from .models import Schedule, ScheduleBatch, Store
 from .repositories import ConflictError, ScheduleRepository, canonical_hash
 
 
-WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class BatchScheduleValidationError(ValueError):
@@ -158,8 +156,10 @@ class BatchScheduleService:
                 # Keep the V1 column populated while readers migrate to the
                 # versioned workflow_config snapshot.
                 marketplace_codes=list(marketplace_codes),
-                local_time=prepared.template["local_time"],
-                days_of_week=prepared.template["days_of_week"],
+                first_run_at=datetime.fromisoformat(
+                    prepared.template["first_run_at"]
+                ),
+                interval_minutes=prepared.template["interval_minutes"],
                 timezone=prepared.template["timezone"],
                 enabled=prepared.template["enabled"],
                 misfire_grace_seconds=prepared.template[
@@ -226,10 +226,13 @@ class BatchScheduleService:
         name = str(template.get("name") or "").strip()
         if not name or len(name) > 160:
             raise ValueError("排期名称长度必须是 1 到 160 个字符")
-        local_time = str(template.get("local_time") or "09:00")
-        if not TIME_PATTERN.fullmatch(local_time):
-            raise ValueError("运行时间必须使用 HH:MM 格式")
-        days_of_week = _normalize_days(template.get("days_of_week"))
+        first_run_at = _coerce_first_run_at(template.get("first_run_at"))
+        try:
+            interval_minutes = int(template.get("interval_minutes", 1440))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("运行间隔必须是整数分钟") from exc
+        if interval_minutes < 1:
+            raise ValueError("运行间隔必须至少 1 分钟")
         timezone_name = str(template.get("timezone") or "Asia/Singapore")
         try:
             ZoneInfo(timezone_name)
@@ -247,8 +250,11 @@ class BatchScheduleService:
             "workflow_config_version": int(
                 getattr(definition, "config_version", 1)
             ),
-            "local_time": local_time,
-            "days_of_week": days_of_week,
+            # Serialised, not a datetime: this dict is hashed by canonical_hash
+            # into the batch idempotency key, so it has to round-trip through
+            # JSON identically on a retry.
+            "first_run_at": first_run_at.isoformat(),
+            "interval_minutes": interval_minutes,
             "timezone": timezone_name,
             "enabled": bool(template.get("enabled", False)),
             "misfire_grace_seconds": misfire,
@@ -395,30 +401,27 @@ class BatchScheduleService:
         }
 
 
-def _normalize_days(value: object) -> str:
-    if value is None:
-        items = list(WEEKDAYS[:5])
-    elif isinstance(value, str):
-        items = [item.strip().lower() for item in value.split(",") if item.strip()]
-    elif isinstance(value, Sequence):
-        items = [str(item).strip().lower() for item in value if str(item).strip()]
+
+def _coerce_first_run_at(value: object) -> datetime:
+    """Accept a datetime or an ISO string, always return aware UTC.
+
+    The batch template travels as JSON on the wire and is hashed into the
+    idempotency key, so the same request has to normalise to the same instant
+    whether it arrives parsed or as text.
+    """
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("首次运行时间格式不合法") from exc
     else:
-        raise ValueError("运行日必须是星期数组或逗号分隔文本")
-    if not items:
-        raise ValueError("请至少选择一个运行日")
-    if items == ["*"]:
-        return "*"
-    if "*" in items:
-        raise ValueError("全天运行标记 * 不可与具体星期混用")
-    unknown = set(items) - set(WEEKDAYS)
-    if unknown:
-        raise ValueError("运行日无效：" + "、".join(sorted(unknown)))
-    if len(items) != len(set(items)):
-        raise ValueError("运行日不可重复")
-    selected = set(items)
-    if selected == set(WEEKDAYS):
-        return "*"
-    return ",".join(day for day in WEEKDAYS if day in selected)
+        raise ValueError("请填写首次运行时间")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _json_copy(value: Mapping[str, Any]) -> dict[str, Any]:

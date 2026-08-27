@@ -836,7 +836,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260827-run-settle-and-dead-end-statuses" in page.text
+    assert "/static/app.js?v=20260827-interval-minutes-css" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text
@@ -1277,7 +1277,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
     assert "应用版本 / 构建" in page.text
     assert "0.3.0" in page.text
     assert "数据库迁移版本" in page.text
-    assert "0006" in page.text
+    assert "0007" in page.text
 
 
 def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):
@@ -1383,3 +1383,63 @@ def test_the_new_diagnostics_sections_have_styles(app_client):
         "settings-card-actions",
     ):
         assert f".{klass}" in css, f"{klass} 没有样式"
+
+
+def test_schedules_page_renders_a_real_row_not_just_an_empty_list(app_client):
+    """A page smoke test with no rows never runs the per-row template code.
+
+    That is exactly how /stores once shipped a 500: the template read columns a
+    migration had dropped, and the test that "covered" it rendered an empty
+    list. The schedule card now calls two filters per row — ``interval_label``
+    on the period and ``local_datetime`` on the anchor — so there has to be a
+    row on the page for either of them to be exercised.
+    """
+
+    _, client, _ = app_client
+    csrf = bootstrap(client)
+    headers = {"X-CSRF-Token": csrf}
+    store = client.post(
+        "/api/stores",
+        json={
+            "name": "Schedule Render Store",
+            "selector_type": "id",
+            "selector_value": "schedule-render",
+            "expected_seller_id": "SELLER-RENDER",
+        },
+        headers=headers,
+    ).json()
+    client.patch(
+        f"/api/stores/{store['id']}",
+        json={
+            "identity_confirmed": True,
+            "enabled": True,
+            "marketplaces": [{"code": "CA", "enabled": True}],
+        },
+        headers=headers,
+    )
+    created = client.post(
+        "/api/schedules",
+        json={
+            "store_id": store["id"],
+            "name": "每 25 小时提现",
+            "first_run_at": "2026-01-01T01:00:00+00:00",
+            "interval_minutes": 1500,
+            "marketplace_codes": ["CA"],
+            "workflow_config": {"marketplace_codes": ["CA"]},
+            "enabled": False,
+        },
+        headers=headers,
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["interval_minutes"] == 1500
+
+    page = client.get("/schedules")
+
+    assert page.status_code == 200, page.text
+    assert "每 25 小时" in page.text, "间隔要按操作员的说法渲染，而不是 1500 分钟"
+    assert "每 25 小时 0 分" not in page.text
+    assert "首次" in page.text
+    # The edit button carries the row back to the form; datetime-local needs the
+    # 'T' form, and the period must survive the round trip.
+    assert "2026-01-01T09:00" in page.text, "编辑按钮里的首次时间要按 UTC+8 回填"
+    assert '"interval_minutes": 1500' in page.text

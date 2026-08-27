@@ -14,7 +14,16 @@ def test_schedule_template_exposes_crud_and_run_now_actions() -> None:
     assert 'data-action="delete-schedule"' in template
     assert "立即执行" in template
     assert "删除" in template
-    assert "执行时间（UTC+8）" in template
+    # The form is an anchor plus a period now, not a wall clock plus weekdays:
+    # Amazon counts its 24-hour payout cap from the previous request, so a daily
+    # wall-clock rule always fell a few seconds short and was refused.
+    assert "首次运行时间（UTC+8）" in template
+    assert 'name="first_run_at"' in template
+    assert "data-schedule-interval-value" in template
+    assert "data-schedule-interval-unit" in template
+    assert "滑动 24 小时" in template, "表单要说明限流是从上一次请求起算的"
+    assert "执行时间（UTC+8）" not in template
+    assert 'name="run_days"' not in template
     assert "至少选择一个" in template
     assert "只读检查（dry_run）" in template
     assert "人工审核（approval）" in template
@@ -54,8 +63,13 @@ def test_schedule_frontend_uses_expected_api_contracts_and_validates_choices() -
     assert 'method:"DELETE"' in script
     assert 'method:editingId ? "PATCH" : "POST"' in script
     assert "请至少勾选一个站点" in script
-    assert "请至少勾选一个每周运行日" in script
-    assert 'data.days_of_week = runDays.length === 7 ? "*" : runDays.join(",")' in script
+    assert "请选择首次运行时间。" in script
+    assert "运行间隔必须至少 1 分钟。" in script
+    # datetime-local yields a bare wall clock; the label promises UTC+8, so the
+    # offset is pinned rather than left for the server to guess.
+    assert 'return raw?raw+":00+08:00":""' in script
+    assert "days_of_week" not in script
+    assert "run_days" not in script
     assert "当前模式：${modeLabel}" in script
     assert "已有运行记录不会被删除" in script
 

@@ -25,6 +25,12 @@ from ziniao_automation.notifications import NotificationDeliveryService
 from ziniao_automation.queue import DurableRunQueue, PersistentQueueWorker
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 @pytest.fixture()
 def queue_env(tmp_path: Path):
     settings = Settings(
@@ -165,8 +171,8 @@ def _add_batch(factory, store_id: int, *, count: int, created_at: datetime):
                 name=f"batch-{count}-{order}",
                 workflow="amazon_disbursement",
                 mode="dry_run",
-                local_time="09:00",
-                days_of_week="*",
+                first_run_at=SCHEDULE_ANCHOR,
+                interval_minutes=1440,
                 timezone="Asia/Singapore",
                 marketplace_codes=["CA"],
                 workflow_config={"marketplace_codes": ["CA"]},
@@ -359,8 +365,8 @@ def _add_cross_day_run(factory, store_id: int) -> str:
             name="cross-day",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:00",
-            days_of_week="*",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="UTC",
             marketplace_codes=["CA"],
             workflow_config={"marketplace_codes": ["CA"]},

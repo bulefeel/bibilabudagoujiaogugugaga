@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from pathlib import Path
 
 import pytest
@@ -8,6 +10,12 @@ from ziniao_automation.config import Settings
 from ziniao_automation.db import create_sqlite_engine, init_database, make_session_factory
 from ziniao_automation.models import StoreMarketplace
 from ziniao_automation.repositories import ScheduleRepository, StoreRepository
+
+
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
 
 
 @pytest.fixture()
@@ -43,7 +51,10 @@ def _schedule_values(store_id: int, codes: list[str]) -> dict[str, object]:
         "name": "Guarded schedule",
         "workflow": "amazon_disbursement",
         "mode": "dry_run",
-        "local_time": "09:00",
+        # Goes straight into the ORM, so a datetime — not the ISO string the
+        # HTTP/batch templates carry.
+        "first_run_at": SCHEDULE_ANCHOR,
+        "interval_minutes": 1440,
         "marketplace_codes": codes,
         "enabled": False,
     }

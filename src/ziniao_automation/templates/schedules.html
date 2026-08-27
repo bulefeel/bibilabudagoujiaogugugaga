@@ -5,10 +5,6 @@
   'approval': '人工审核',
   'auto': '全自动'
 } %}
-{% set day_labels = {
-  'mon': '周一', 'tue': '周二', 'wed': '周三', 'thu': '周四',
-  'fri': '周五', 'sat': '周六', 'sun': '周日', '*': '每天'
-} %}
 
 <div class="toolbar">
   <p class="lead">同时到期的任务会按计划时间持久排队，前面的任务完成后再逐家执行。任务一旦入队就不会因等待超时而丢失；即使轮到时已经跨日，也会继续执行。</p>
@@ -31,8 +27,8 @@
   {% set run_blocked = (not workflow_meta) or (not item.store.enabled) or (requires_targets and ((not configured_codes) or validity.invalid)) or (requires_identity and ((not item.store.identity_confirmed) or (not item.store.expected_seller_id))) %}
   <article class="schedule-row">
     <div class="time-block">
-      <strong>{{ item.local_time }}</strong>
-      <small>北京时间（UTC+8）</small>
+      <strong>{{ item.interval_minutes|interval_label }}</strong>
+      <small>每隔这么久跑一次</small>
     </div>
     <div class="schedule-main">
       <span class="mode-tag mode-{{ item.mode }}">{{ workflow_labels.get(item.workflow, item.workflow) }} · {{ mode_labels.get(item.mode, item.mode) }}</span>
@@ -56,12 +52,8 @@
         {% endif %}
       </p>
     </div>
-    <div class="weekdays" aria-label="运行日">
-      {% if item.days_of_week == '*' %}
-        每天
-      {% else %}
-        {% for day in item.days_of_week.split(',') %}{{ day_labels.get(day|trim, day|trim) }}{% if not loop.last %}、{% endif %}{% endfor %}
-      {% endif %}
+    <div class="weekdays" aria-label="首次运行时间">
+      首次<br>{{ item.first_run_at|local_datetime('%m-%d %H:%M') }}
     </div>
     <div class="schedule-state">
       <span class="switch-label {{ 'on' if item.enabled else '' }}">{{ '已启用' if item.enabled else '已停用' }}</span>
@@ -78,8 +70,8 @@
           "name": item.name,
           "workflow": item.workflow,
           "mode": item.mode,
-          "local_time": item.local_time,
-          "days_of_week": item.days_of_week,
+          "first_run_at": item.first_run_at|local_datetime('%Y-%m-%dT%H:%M'),
+          "interval_minutes": item.interval_minutes,
           "timezone": item.timezone,
           "marketplace_codes": item.marketplace_codes,
           "workflow_config": item.workflow_config|default({}, true),
@@ -143,9 +135,9 @@
 
       <div class="field-pair">
         <label>
-          执行时间（UTC+8）
-          <input name="local_time" type="time" value="09:00" required>
-          <small>北京时间和新加坡时间相同，例如 09:00 就是上午 9 点。</small>
+          首次运行时间（UTC+8）
+          <input name="first_run_at" type="datetime-local" required data-schedule-first-run>
+          <small>之后的每一次都从这一刻按下面的间隔往后推。填过去的时间也可以，会自动跳到下一个间隔点。</small>
         </label>
         <label>
           运行模式
@@ -157,18 +149,17 @@
       <div class="mode-guide" data-workflow-guide aria-label="运行模式说明"></div>
       <div class="workflow-config" data-workflow-config></div>
 
-      <fieldset data-run-days-group>
-        <legend>每周运行日（至少选择一天）</legend>
-        <div class="weekday-checks">
-          <label class="mini-check"><input type="checkbox" name="run_days" value="mon" checked> 周一</label>
-          <label class="mini-check"><input type="checkbox" name="run_days" value="tue" checked> 周二</label>
-          <label class="mini-check"><input type="checkbox" name="run_days" value="wed" checked> 周三</label>
-          <label class="mini-check"><input type="checkbox" name="run_days" value="thu" checked> 周四</label>
-          <label class="mini-check"><input type="checkbox" name="run_days" value="fri" checked> 周五</label>
-          <label class="mini-check"><input type="checkbox" name="run_days" value="sat"> 周六</label>
-          <label class="mini-check"><input type="checkbox" name="run_days" value="sun"> 周日</label>
+      <fieldset data-run-interval-group>
+        <legend>运行间隔</legend>
+        <div class="interval-row">
+          <input name="interval_value" type="number" min="1" step="1" value="25" required data-schedule-interval-value>
+          <select name="interval_unit" data-schedule-interval-unit>
+            <option value="60" selected>小时</option>
+            <option value="1">分钟</option>
+          </select>
         </div>
-        <small class="fieldset-help">例如勾选周一至周五，就是每个工作日到点运行。</small>
+        <small class="fieldset-help">亚马逊按<strong>滑动 24 小时</strong>限流：从上一次请求那一刻起算，不是按自然日。所以「每天同一时刻」实际上每次都差几秒不够 24 小时，会被拒掉一半。默认 25 小时，运行时刻每天往后挪一小时。</small>
+        <small class="fieldset-help warn" data-interval-warning hidden></small>
       </fieldset>
 
       <label class="check-row">

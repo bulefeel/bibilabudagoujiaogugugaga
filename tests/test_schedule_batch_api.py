@@ -16,6 +16,12 @@ from ziniao_automation.web import create_app
 from tests.test_db_api import FakeAutomation, bootstrap
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 class _RefreshCounter:
     def __init__(self) -> None:
         self.calls = 0
@@ -114,8 +120,8 @@ def _payload(store_ids: list[int], *, request_id: str) -> dict:
             "workflow": "amazon_disbursement",
             "mode": "dry_run",
             "workflow_config": {"marketplace_codes": ["CA"]},
-            "local_time": "09:00",
-            "days_of_week": ["mon", "tue", "wed", "thu", "fri"],
+            "first_run_at": SCHEDULE_ANCHOR_ISO,
+            "interval_minutes": 1440,
             "timezone": "Asia/Singapore",
             "enabled": True,
         },
@@ -190,7 +196,10 @@ def test_batch_preview_create_and_idempotent_retry(batch_client) -> None:
     changed = _payload(
         [first, second], request_id="12345678-1234-4234-9234-123456789abc"
     )
-    changed["template"]["local_time"] = "10:00"
+    # Same request_id, different definition. The period is part of the hashed
+    # template, so changing it must read as a conflicting retry rather than an
+    # idempotent one.
+    changed["template"]["interval_minutes"] = 1500
     conflict = client.post("/api/schedules/batch", json=changed, headers=headers)
     assert conflict.status_code == 409
 
@@ -280,8 +289,8 @@ def test_unrelated_projection_failure_does_not_mark_new_batch_unrefreshed(
             workflow_config={"marketplace_codes": ["CA"]},
             workflow_config_version=1,
             marketplace_codes=["CA"],
-            local_time="09:00",
-            days_of_week="mon,tue,wed,thu,fri",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             enabled=True,
         )
@@ -394,6 +403,7 @@ def test_legacy_single_schedule_patch_updates_canonical_marketplaces(
         json={
             "store_id": store_id,
             "name": "旧客户端排期",
+            "first_run_at": SCHEDULE_ANCHOR_ISO,
             "mode": "dry_run",
             "marketplace_codes": ["CA"],
             "enabled": False,
@@ -431,6 +441,7 @@ def test_equivalent_legacy_and_versioned_marketplaces_are_normalized(
         json={
             "store_id": store_id,
             "name": "normalized marketplace inputs",
+            "first_run_at": SCHEDULE_ANCHOR_ISO,
             "workflow": "amazon_disbursement",
             "mode": "dry_run",
             "marketplace_codes": ["CA"],

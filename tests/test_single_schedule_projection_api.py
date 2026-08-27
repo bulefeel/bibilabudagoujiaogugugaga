@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from datetime import datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +14,12 @@ from ziniao_automation.scheduler import ScheduleProjectionReport
 from ziniao_automation.web import create_app
 
 from tests.test_db_api import FakeAutomation, bootstrap
+
+
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
 
 
 class _MutationProjectionManager:
@@ -92,8 +99,8 @@ def _seed_schedule(app, store_id: int, *, name: str = "Existing schedule") -> in
             name=name,
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:00",
-            days_of_week="mon,tue,wed,thu,fri",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             workflow_config={"marketplace_codes": ["CA"]},
@@ -140,8 +147,8 @@ def test_single_create_reports_projection_without_rolling_back_durable_row(
             "name": "Created once",
             "workflow": "amazon_disbursement",
             "mode": "dry_run",
-            "local_time": "09:00",
-            "days_of_week": ["mon", "tue", "wed", "thu", "fri"],
+            "first_run_at": SCHEDULE_ANCHOR_ISO,
+            "interval_minutes": 1440,
             "timezone": "Asia/Singapore",
             "marketplace_codes": ["CA"],
             "workflow_config": {"marketplace_codes": ["CA"]},

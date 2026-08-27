@@ -25,28 +25,6 @@ class StrictApiModel(ApiModel):
     model_config = ConfigDict(from_attributes=True, extra="forbid")
 
 
-def _normalise_days(value: Any) -> str:
-    if isinstance(value, (list, tuple)):
-        days = [str(item).strip().lower() for item in value]
-    elif isinstance(value, str):
-        stripped = value.strip().lower()
-        if stripped == "*":
-            return "*"
-        days = [item.strip() for item in stripped.split(",") if item.strip()]
-    else:
-        raise ValueError("运行日必须是星期列表或逗号分隔文本")
-    allowed = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-    if not days:
-        raise ValueError("请至少选择一个运行日")
-    if len(days) != len(set(days)):
-        raise ValueError("运行日不可重复")
-    unknown = [item for item in days if item not in allowed]
-    if unknown:
-        raise ValueError("运行日仅支持 mon 至 sun")
-    ordered = [item for item in allowed if item in days]
-    return "*" if len(ordered) == 7 else ",".join(ordered)
-
-
 class MarketplaceInput(ApiModel):
     code: MarketplaceCode
     domain: str | None = None
@@ -134,34 +112,29 @@ class ScheduleCreate(StrictApiModel):
     name: str = Field(min_length=1, max_length=160)
     workflow: str = Field(default="amazon_disbursement", min_length=1, max_length=80)
     mode: str = Field(default="dry_run", min_length=1, max_length=24)
-    local_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    days_of_week: str = "mon,tue,wed,thu,fri"
+    # Amazon measures its once-per-24-hours payout cap from the previous
+    # request, so a wall-clock schedule always falls a few seconds short. An
+    # absolute anchor plus a period lets the operator pick one that clears it.
+    first_run_at: datetime
+    interval_minutes: int = Field(default=1440, ge=1)
     timezone: str = Field(default="Asia/Singapore", max_length=64)
     marketplace_codes: list[MarketplaceCode] = Field(default_factory=list)
     workflow_config: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = False
     misfire_grace_seconds: int = Field(default=1800, ge=0, le=1800)
 
-    @field_validator("days_of_week", mode="before")
-    @classmethod
-    def valid_days(cls, value: Any) -> str:
-        return _normalise_days(value)
 
 
 class SchedulePatch(StrictApiModel):
     name: str | None = Field(None, min_length=1, max_length=160)
     mode: str | None = Field(None, min_length=1, max_length=24)
-    local_time: str | None = Field(None, pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    days_of_week: str | None = None
+    first_run_at: datetime | None = None
+    interval_minutes: int | None = Field(None, ge=1)
     timezone: str | None = Field(None, max_length=64)
     marketplace_codes: list[MarketplaceCode] | None = None
     workflow_config: dict[str, Any] | None = None
     enabled: bool | None = None
 
-    @field_validator("days_of_week", mode="before")
-    @classmethod
-    def valid_days(cls, value: Any) -> str | None:
-        return None if value is None else _normalise_days(value)
 
 
 class ScheduleView(ApiModel):
@@ -170,8 +143,8 @@ class ScheduleView(ApiModel):
     name: str
     workflow: str
     mode: str
-    local_time: str
-    days_of_week: str
+    first_run_at: datetime
+    interval_minutes: int
     timezone: str
     marketplace_codes: list[str]
     workflow_config: dict[str, Any] = Field(default_factory=dict)
@@ -211,16 +184,15 @@ class BatchScheduleTemplate(StrictApiModel):
     workflow: str = Field(default="amazon_disbursement", min_length=1, max_length=80)
     mode: str = Field(default="dry_run", min_length=1, max_length=24)
     workflow_config: dict[str, Any] = Field(default_factory=dict)
-    local_time: str = Field(default="09:00", pattern=r"^(?:[01]\d|2[0-3]):[0-5]\d$")
-    days_of_week: str = "mon,tue,wed,thu,fri"
+    # Amazon measures its once-per-24-hours payout cap from the previous
+    # request, so a wall-clock schedule always falls a few seconds short. An
+    # absolute anchor plus a period lets the operator pick one that clears it.
+    first_run_at: datetime
+    interval_minutes: int = Field(default=1440, ge=1)
     timezone: str = Field(default="Asia/Singapore", min_length=1, max_length=64)
     enabled: bool = False
     misfire_grace_seconds: int = Field(default=1800, ge=0, le=1800)
 
-    @field_validator("days_of_week", mode="before")
-    @classmethod
-    def valid_days(cls, value: Any) -> str:
-        return _normalise_days(value)
 
 
 class BatchSchedulePreviewInput(StrictApiModel):

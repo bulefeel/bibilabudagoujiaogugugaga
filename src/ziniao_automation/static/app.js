@@ -845,10 +845,11 @@
     auto: "全自动（检查通过后执行）",
   };
   const scheduleModeShortLabels = {dry_run:"只读检查（dry_run）", approval:"人工审核（approval）", auto:"全自动（auto）"};
-  const defaultScheduleDays = ["mon","tue","wed","thu","fri"];
+  // 25 hours, not 24: Amazon measures its payout cap from the previous request,
+  // so a whole-day period always lands a few seconds short and gets refused.
+  const defaultIntervalMinutes = 1500;
   // Compatibility notes for the original single-store editor:
   // method:editingId ? "PATCH" : "POST"
-  // data.days_of_week = runDays.length === 7 ? "*" : runDays.join(",")
   // 当前模式：${modeLabel}；已有运行记录不会被删除
   // input.disabled = !available; 旧排期包含当前未启用的站点
   // 旧提示：请至少勾选一个站点；请至少勾选一个每周运行日
@@ -939,12 +940,42 @@
   async function loadScheduleWorkflows(form,selectedKey){if(!scheduleWorkflowReady){scheduleWorkflowReady=api("/api/workflows").then(data=>{const list=Array.isArray(data)?data:(Array.isArray(data?.workflows)?data.workflows:[]);scheduleWorkflows=list.filter(item=>item&&item.key).map(item=>({...item,key:safeWorkflowKey(item.key)}));if(!scheduleWorkflows.length)scheduleWorkflows=fallbackScheduleWorkflows;return scheduleWorkflows;}).catch(()=>{scheduleWorkflows=fallbackScheduleWorkflows;return scheduleWorkflows;});}await scheduleWorkflowReady;const liveKey=selectedKey||$('[name="workflow"]',form)?.value,liveConfig=collectWorkflowConfig(form);renderWorkflowOptions(form,liveKey);if(Object.keys(liveConfig).length&&!form.dataset.scheduleEditing)setWorkflowConfig(form,liveConfig);}
   function setScheduleStep(form,step){const editing=form.dataset.scheduleEditing==="true";$$("[data-schedule-step]",form).forEach(section=>{section.hidden=editing?section.dataset.scheduleStep!=="1":section.dataset.scheduleStep!==String(step);});$$("[data-step-indicator]",form).forEach(item=>item.classList.toggle("active",item.dataset.stepIndicator===String(step)));const summary=$("[data-schedule-step-summary]",form);if(summary&&step===2&&!editing){const meta=workflowMeta(form),sites=collectWorkflowConfig(form).marketplace_codes||[];summary.textContent=(meta?.display_name||meta?.key||"已注册流程")+" · "+($('[name="mode"]',form)?.value||"dry_run")+" · "+sites.join(" / ")+"。下面选择要创建相同排期的店铺，提交前会逐家预检。";}form.dataset.scheduleStep=String(step);}
   function setScheduleRefreshPending(form,pending){if(pending)form.dataset.schedulerRefreshPending="true";else delete form.dataset.schedulerRefreshPending;$$('input,select,textarea,button',form).forEach(control=>{control.disabled=pending&&!control.matches('[data-schedule-submit]');});}
-  function resetScheduleForm(form){setScheduleRefreshPending(form,false);form.reset();delete form.dataset.scheduleId;delete form.dataset.scheduleEditing;delete form.dataset.batchRequestId;invalidateSchedulePreview(form);const hiddenStore=$('[name="store_id"]',form);if(hiddenStore)hiddenStore.value="";$("[data-schedule-dialog-title]",form).textContent="新建任务排期";const submit=$("[data-schedule-submit]",form);if(submit){submit.disabled=false;submit.textContent="预检并创建排期";}const createNext=$("[data-schedule-create-next]",form);if(createNext)createNext.hidden=false;const editSubmit=$("[data-schedule-edit-submit]",form);if(editSubmit){editSubmit.hidden=true;editSubmit.disabled=false;}const indicator=$("[data-schedule-step-indicator]",form);if(indicator)indicator.hidden=false;const workflow=$('[name="workflow"]',form);if(workflow){workflow.disabled=false;workflow.value="amazon_disbursement";}renderWorkflowOptions(form,"amazon_disbursement");setCheckedValues(form,"run_days",defaultScheduleDays);$$('input[name="target_store_ids"]',form).forEach(input=>{input.checked=false;});const search=$('[data-store-search]',form);if(search)search.value="";$$('[data-store-option]',form).forEach(row=>{row.hidden=false;});refreshScheduleStoreEligibility(form);const preview=$("[data-batch-preview]",form);if(preview)preview.hidden=true;$("[data-form-error]",form).textContent="";setScheduleStep(form,1);loadScheduleWorkflows(form);}
-  function openScheduleEditor(data){const dialog=$("#schedule-dialog"),form=$("[data-schedule-form]",dialog);resetScheduleForm(form);form.dataset.scheduleId=String(data.id);form.dataset.scheduleEditing="true";const lockedWorkflow=$('[name="workflow"]',form);if(lockedWorkflow)lockedWorkflow.disabled=true;const hiddenStore=$('[name="store_id"]',form);if(hiddenStore)hiddenStore.value=String(data.store_id||"");$("[data-schedule-dialog-title]",form).textContent="编辑任务排期";const createNext=$("[data-schedule-create-next]",form);if(createNext)createNext.hidden=true;const editSubmit=$("[data-schedule-edit-submit]",form);if(editSubmit){editSubmit.hidden=false;editSubmit.disabled=false;editSubmit.textContent="保存修改";}const indicator=$("[data-schedule-step-indicator]",form);if(indicator)indicator.hidden=true;for(const key of ["name","local_time","mode"]){const input=$('[name="'+key+'"]',form);if(input)input.value=data[key]??"";}$('[name="enabled"]',form).checked=!!data.enabled;const days=data.days_of_week==="*" ? ["mon","tue","wed","thu","fri","sat","sun"] : String(data.days_of_week||"").split(",").map(value=>value.trim()).filter(Boolean);setCheckedValues(form,"run_days",days);loadScheduleWorkflows(form,data.workflow||"amazon_disbursement").then(()=>{const meta=scheduleWorkflows.find(item=>item.key===String(data.workflow||"amazon_disbursement"));if(!meta){$("[data-form-error]",form).textContent="该排期使用的流程已不在代码白名单中，已禁止修改。";if(editSubmit)editSubmit.disabled=true;return;}const workflow=$('[name="workflow"]',form);if(workflow){workflow.value=data.workflow||"amazon_disbursement";workflow.disabled=true;}updateScheduleModeHelp(form);const description=$("[data-workflow-description]",form);if(description)description.textContent=(meta.description||meta.display_name||meta.key)+"（流程创建后不可更换）";setWorkflowConfig(form,data.workflow_config||{marketplace_codes:data.marketplace_codes||[]});});setScheduleStep(form,1);dialog.showModal();}
+  function resetScheduleForm(form){setScheduleRefreshPending(form,false);form.reset();delete form.dataset.scheduleId;delete form.dataset.scheduleEditing;delete form.dataset.batchRequestId;invalidateSchedulePreview(form);const hiddenStore=$('[name="store_id"]',form);if(hiddenStore)hiddenStore.value="";$("[data-schedule-dialog-title]",form).textContent="新建任务排期";const submit=$("[data-schedule-submit]",form);if(submit){submit.disabled=false;submit.textContent="预检并创建排期";}const createNext=$("[data-schedule-create-next]",form);if(createNext)createNext.hidden=false;const editSubmit=$("[data-schedule-edit-submit]",form);if(editSubmit){editSubmit.hidden=true;editSubmit.disabled=false;}const indicator=$("[data-schedule-step-indicator]",form);if(indicator)indicator.hidden=false;const workflow=$('[name="workflow"]',form);if(workflow){workflow.disabled=false;workflow.value="amazon_disbursement";}renderWorkflowOptions(form,"amazon_disbursement");writeScheduleInterval(form,defaultIntervalMinutes);refreshIntervalWarning(form);$$('input[name="target_store_ids"]',form).forEach(input=>{input.checked=false;});const search=$('[data-store-search]',form);if(search)search.value="";$$('[data-store-option]',form).forEach(row=>{row.hidden=false;});refreshScheduleStoreEligibility(form);const preview=$("[data-batch-preview]",form);if(preview)preview.hidden=true;$("[data-form-error]",form).textContent="";setScheduleStep(form,1);loadScheduleWorkflows(form);}
+  function openScheduleEditor(data){const dialog=$("#schedule-dialog"),form=$("[data-schedule-form]",dialog);resetScheduleForm(form);form.dataset.scheduleId=String(data.id);form.dataset.scheduleEditing="true";const lockedWorkflow=$('[name="workflow"]',form);if(lockedWorkflow)lockedWorkflow.disabled=true;const hiddenStore=$('[name="store_id"]',form);if(hiddenStore)hiddenStore.value=String(data.store_id||"");$("[data-schedule-dialog-title]",form).textContent="编辑任务排期";const createNext=$("[data-schedule-create-next]",form);if(createNext)createNext.hidden=true;const editSubmit=$("[data-schedule-edit-submit]",form);if(editSubmit){editSubmit.hidden=false;editSubmit.disabled=false;editSubmit.textContent="保存修改";}const indicator=$("[data-schedule-step-indicator]",form);if(indicator)indicator.hidden=true;for(const key of ["name","first_run_at","mode"]){const input=$('[name="'+key+'"]',form);if(input)input.value=data[key]??"";}$('[name="enabled"]',form).checked=!!data.enabled;writeScheduleInterval(form,data.interval_minutes);refreshIntervalWarning(form);loadScheduleWorkflows(form,data.workflow||"amazon_disbursement").then(()=>{const meta=scheduleWorkflows.find(item=>item.key===String(data.workflow||"amazon_disbursement"));if(!meta){$("[data-form-error]",form).textContent="该排期使用的流程已不在代码白名单中，已禁止修改。";if(editSubmit)editSubmit.disabled=true;return;}const workflow=$('[name="workflow"]',form);if(workflow){workflow.value=data.workflow||"amazon_disbursement";workflow.disabled=true;}updateScheduleModeHelp(form);const description=$("[data-workflow-description]",form);if(description)description.textContent=(meta.description||meta.display_name||meta.key)+"（流程创建后不可更换）";setWorkflowConfig(form,data.workflow_config||{marketplace_codes:data.marketplace_codes||[]});});setScheduleStep(form,1);dialog.showModal();}
+  function readScheduleInterval(form){
+    const value=Number($('[data-schedule-interval-value]',form)?.value||0);
+    const unit=Number($('[data-schedule-interval-unit]',form)?.value||60);
+    if(!Number.isFinite(value)||value<1||!Number.isFinite(unit)||unit<1)return 0;
+    return Math.round(value*unit);
+  }
+  function writeScheduleInterval(form,minutes){
+    const total=Number(minutes)>0?Math.round(Number(minutes)):defaultIntervalMinutes;
+    const valueInput=$('[data-schedule-interval-value]',form),unitInput=$('[data-schedule-interval-unit]',form);
+    if(!valueInput||!unitInput)return;
+    // Show hours when it divides evenly; an operator thinking in hours should
+    // not be handed "1500 分钟".
+    if(total%60===0){unitInput.value="60";valueInput.value=String(total/60);}
+    else{unitInput.value="1";valueInput.value=String(total);}
+  }
+  // Never blocks the save — other workflows may legitimately want a short
+  // period, and Amazon owns this rule, not us.
+  function refreshIntervalWarning(form){
+    const note=$("[data-interval-warning]",form);
+    if(!note)return;
+    const minutes=readScheduleInterval(form);
+    const financial=workflowMeta(form)?.requires_marketplace_targets!==false;
+    if(financial&&minutes>0&&minutes<1440){
+      note.textContent="亚马逊对同一账户按滑动 24 小时限流一次；小于 24 小时的间隔会有部分次数被拒绝。仍可保存。";
+      note.hidden=false;
+    }else{note.hidden=true;note.textContent="";}
+  }
   function selectedScheduleStoreIds(form){return $$('input[name="target_store_ids"]:checked',form).map(input=>Number(input.value)).filter(validPositiveId);}
   function scheduleStoreRow(form, storeId){return $$("[data-store-option]", form).find(row => String(row.dataset.storeId || "") === String(storeId));}
   function updateSelectedStoreCount(form){const count=selectedScheduleStoreIds(form),node=$("[data-selected-store-count]",form);if(node)node.textContent="已选择 "+count.length+" 家";}
-  function buildScheduleTemplate(form){const runDays=selectedValues(form,"run_days");return{name:String($('[name="name"]',form)?.value||"").trim(),workflow:String($('[name="workflow"]',form)?.value||""),mode:String($('[name="mode"]',form)?.value||""),workflow_config:collectWorkflowConfig(form),local_time:String($('[name="local_time"]',form)?.value||""),days_of_week:runDays.length===7?"*":runDays.join(","),timezone:"Asia/Singapore",enabled:Boolean($('[name="enabled"]',form)?.checked),misfire_grace_seconds:1800};}
+  function buildScheduleTemplate(form){return{name:String($('[name="name"]',form)?.value||"").trim(),workflow:String($('[name="workflow"]',form)?.value||""),mode:String($('[name="mode"]',form)?.value||""),workflow_config:collectWorkflowConfig(form),first_run_at:scheduleFirstRunIso(form),interval_minutes:readScheduleInterval(form),timezone:"Asia/Singapore",enabled:Boolean($('[name="enabled"]',form)?.checked),misfire_grace_seconds:1800};}
+  // datetime-local yields a bare wall clock. The operator is told UTC+8 on the
+  // label, so pin that offset rather than letting the server guess.
+  function scheduleFirstRunIso(form){const raw=String($('[name="first_run_at"]',form)?.value||"").trim();return raw?raw+":00+08:00":"";}
   function buildBatchPayload(form){let requestId=form.dataset.batchRequestId;if(!requestId){requestId=window.crypto?.randomUUID?.()||"xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g,c=>{const r=Math.random()*16|0,v=c==="x"?r:(r&3)|8;return v.toString(16);});form.dataset.batchRequestId=requestId;}const template=buildScheduleTemplate(form),storeIds=selectedScheduleStoreIds(form);return{request_id:requestId,store_ids:storeIds,template};}
   function renderBatchPreview(form,data){
     const panel=$("[data-batch-preview]",form);if(!panel)return;const targets=Array.isArray(data?.targets)?data.targets:[],eligible=data?.eligible===true,eligibleCount=Number(data?.eligible_count??targets.filter(item=>item?.eligible===true).length),count=eligible?Number(data?.created_count??targets.length):0,meta=workflowMeta(form),sites=collectWorkflowConfig(form).marketplace_codes||[];panel.hidden=false;
@@ -1192,11 +1223,11 @@
     if (action === "schedule-next-step") {
       const form = target.closest("[data-schedule-form]"); if (!form) return;
       const error = $("[data-form-error]", form); error.textContent = "";
-      const runDays = selectedValues(form, "run_days"), config = collectWorkflowConfig(form);
+      const config = collectWorkflowConfig(form);
       if (!workflowMeta(form)?.key) { error.textContent = "请选择一个已注册的自动化流程。"; return; }
       if (!String($('[name="name"]', form)?.value || "").trim()) { error.textContent = "请填写排期名称。"; return; }
-      if (!String($('[name="local_time"]', form)?.value || "")) { error.textContent = "请选择执行时间。"; return; }
-      if (!runDays.length) { error.textContent = "请至少选择一个每周运行日。"; return; }
+      if (!scheduleFirstRunIso(form)) { error.textContent = "请选择首次运行时间。"; return; }
+      if (readScheduleInterval(form) < 1) { error.textContent = "运行间隔必须至少 1 分钟。"; return; }
       const configError = workflowConfigError(form, config);
       if (configError) { error.textContent = configError; return; }
       if (workflowMeta(form)?.requires_marketplace_targets !== false && (!Array.isArray(config.marketplace_codes) || !config.marketplace_codes.length)) { error.textContent = "请至少勾选一个站点。"; return; }
@@ -1317,12 +1348,23 @@
     const data = formData(form); data.store_id = Number(data.store_id);
     try { const run = await api("/api/runs", {method:"POST", body:JSON.stringify(data)}); location.href = `/runs/${run.id}`; } catch (exc) { error.textContent = exc.message; }
   });
+  // Optional chaining, and only ever reached on the schedules page: app.js is
+  // one bundle for every page, and a top-level throw here would silently unbind
+  // every handler registered after it.
+  for (const eventName of ["input", "change"]) {
+    $("[data-schedule-form]")?.addEventListener(eventName, event => {
+      if (event.target?.matches?.('[data-schedule-interval-value], [data-schedule-interval-unit], [name="workflow"]')) {
+        refreshIntervalWarning(event.currentTarget);
+      }
+    });
+  }
   $("[data-schedule-form]")?.addEventListener("submit", async event => {
     event.preventDefault(); const form = event.currentTarget, error = $("[data-form-error]", form); error.textContent = "";
     const editingId = Number(form.dataset.scheduleId || 0);
     if (!editingId && form.dataset.schedulerRefreshPending === "true") { const savedPayload = form.dataset.batchPreviewPayload; if (!savedPayload) { error.textContent = "已保存批次的重试信息丢失，请刷新页面；数据库不会重复创建。"; return; } await createBatchSchedule(form, savedPayload); return; }
-    const runDays = selectedValues(form, "run_days"), config = collectWorkflowConfig(form);
-    if (!runDays.length) { error.textContent = "请至少选择一个每周运行日。"; setScheduleStep(form, 1); return; }
+    const config = collectWorkflowConfig(form);
+    if (!scheduleFirstRunIso(form)) { error.textContent = "请选择首次运行时间。"; setScheduleStep(form, 1); return; }
+    if (readScheduleInterval(form) < 1) { error.textContent = "运行间隔必须至少 1 分钟。"; setScheduleStep(form, 1); return; }
     const configError = workflowConfigError(form, config);
     if (configError) { error.textContent = configError; setScheduleStep(form, 1); return; }
     if (workflowMeta(form)?.requires_marketplace_targets !== false && (!Array.isArray(config.marketplace_codes) || !config.marketplace_codes.length)) { error.textContent = "请至少勾选一个站点。"; setScheduleStep(form, 1); return; }
@@ -1336,7 +1378,7 @@
       await createBatchSchedule(form, payloadJson);
       return;
     }
-    const data = {name:String($("[name=name]",form)?.value || "").trim(), mode:String($("[name=mode]",form)?.value || ""), workflow_config:config, marketplace_codes:config.marketplace_codes || [], days_of_week:runDays.length===7?"*":runDays.join(","), local_time:$('[name="local_time"]',form).value, timezone:"Asia/Singapore", enabled:Boolean($('[name="enabled"]',form).checked)};
+    const data = {name:String($("[name=name]",form)?.value || "").trim(), mode:String($("[name=mode]",form)?.value || ""), workflow_config:config, marketplace_codes:config.marketplace_codes || [], first_run_at:scheduleFirstRunIso(form), interval_minutes:readScheduleInterval(form), timezone:"Asia/Singapore", enabled:Boolean($('[name="enabled"]',form).checked)};
     const button = $("[data-schedule-edit-submit]", form); if (button) button.disabled = true;
     try {
       const result = await api(`/api/schedules/${editingId}`, {method:"PATCH", body:JSON.stringify(data)});

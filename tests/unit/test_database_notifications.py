@@ -32,6 +32,12 @@ from ziniao_automation.notifications import (
 from ziniao_automation.workflows.types import RunStatus, WorkflowReport
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 @pytest.fixture()
 def database(tmp_path: Path):
     settings = Settings(
@@ -82,7 +88,8 @@ def seed(
             name="工作日余额检查",
             workflow="amazon_disbursement",
             mode="approval",
-            local_time="09:00",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             enabled=True,

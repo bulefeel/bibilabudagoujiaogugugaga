@@ -515,7 +515,7 @@ class ScheduleRepository:
         schedule = self.get(schedule_id)
         definition = self._definition(schedule.workflow)
         allowed = {
-            "name", "mode", "local_time", "days_of_week", "timezone",
+            "name", "mode", "first_run_at", "interval_minutes", "timezone",
             "marketplace_codes", "workflow_config", "workflow_config_version", "enabled",
         }
         if set(changes) - allowed:

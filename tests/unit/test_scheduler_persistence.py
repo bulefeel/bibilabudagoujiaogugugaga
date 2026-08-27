@@ -16,6 +16,12 @@ from ziniao_automation.models import Run, Schedule, Store, StoreMarketplace
 from ziniao_automation.scheduler import ScheduleManager
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 class RecordingAutomation:
     def __init__(self) -> None:
         self.run_ids: list[str] = []
@@ -91,8 +97,8 @@ def seed_daily_schedule(factory, *, created_at: datetime) -> int:
             name="Daily 09:00",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:00",
-            days_of_week="*",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             enabled=True,
@@ -131,8 +137,8 @@ def seed_valid_and_corrupt_schedules(factory, *, created_at: datetime) -> tuple[
             name="Valid schedule",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="09:00",
-            days_of_week="*",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             workflow_config={"marketplace_codes": ["CA"]},
@@ -148,8 +154,8 @@ def seed_valid_and_corrupt_schedules(factory, *, created_at: datetime) -> tuple[
             name="Corrupt schedule",
             workflow="amazon_disbursement",
             mode="dry_run",
-            local_time="not-a-time",
-            days_of_week="*",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=0,
             timezone="Asia/Singapore",
             marketplace_codes=["CA"],
             workflow_config={"marketplace_codes": ["CA"]},
@@ -312,18 +318,32 @@ def test_saved_next_run_survives_projection_updated_at_noise(database):
     asyncio.run(scenario())
 
 
-def test_legacy_local_wall_clock_next_run_does_not_hide_missed_occurrence(database):
+def test_a_naive_stored_next_run_is_read_as_utc_not_as_a_wall_clock(database):
+    """SQLite hands back naive datetimes; that must not shift the grid.
+
+    This replaces a test for a heuristic that no longer exists. Pre-0003 rows
+    stored APScheduler's 09:00 +08:00 wall clock after SQLite stripped the
+    offset, and the scheduler used to recognise them by comparing against the
+    cron's hour and minute. There is no cron to compare against any more, and
+    0007 clears next_run_at for every row precisely so that ambiguity is gone —
+    a naive value can now only be a UTC instant that lost its marker.
+
+    What still has to hold is that a stored projection does not hide a genuinely
+    missed occurrence, which is what the old test was really protecting.
+    """
+
     async def scenario() -> None:
-        now = datetime(2026, 8, 14, 2, 0, tzinfo=timezone.utc)
+        now = SCHEDULE_ANCHOR + timedelta(days=20, hours=2)
         schedule_id = seed_daily_schedule(
             database,
-            created_at=now - timedelta(days=20),
+            created_at=SCHEDULE_ANCHOR - timedelta(days=1),
         )
         with database() as session:
             schedule = session.get(Schedule, schedule_id)
-            # Pre-fix versions stored APScheduler's 09:00 +08:00 wall clock
-            # after SQLite stripped the offset.  Its real instant is 01:00Z.
-            schedule.next_run_at = datetime(2026, 8, 14, 9, 0)
+            # Naive, as SQLite returns it: the grid point 20 days in.
+            schedule.next_run_at = (SCHEDULE_ANCHOR + timedelta(days=20)).replace(
+                tzinfo=None
+            )
             session.commit()
 
         automation = RecordingAutomation()
@@ -332,8 +352,8 @@ def test_legacy_local_wall_clock_next_run_does_not_hide_missed_occurrence(databa
 
         assert len(created) == 1
         with database() as session:
-            assert as_utc(session.get(Run, created[0]).scheduled_for_at) == datetime(
-                2026, 8, 14, 1, tzinfo=timezone.utc
+            assert as_utc(session.get(Run, created[0]).scheduled_for_at) == (
+                SCHEDULE_ANCHOR + timedelta(days=20)
             )
 
     asyncio.run(scenario())

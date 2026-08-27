@@ -157,8 +157,21 @@ class Schedule(TimestampMixin, Base):
         String(80), default="amazon_disbursement", nullable=False
     )
     mode: Mapped[str] = mapped_column(String(16), default="dry_run", nullable=False)
-    local_time: Mapped[str] = mapped_column(String(5), default="09:00", nullable=False)
-    days_of_week: Mapped[str] = mapped_column(String(32), default="mon,tue,wed,thu,fri")
+    # Amazon caps on-demand disbursement at once per ROLLING 24 hours, counted
+    # from the previous request. A daily wall-clock schedule therefore fires a
+    # few seconds short of the window every time and is refused, so it only
+    # succeeded every other day. An absolute anchor plus a fixed period lets the
+    # operator pick a period that actually clears the window (25h walks the
+    # firing time forward an hour a day, which is the point).
+    interval_minutes: Mapped[int] = mapped_column(
+        Integer, default=1440, server_default=text("1440"), nullable=False
+    )
+    first_run_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # Not a trigger input any more — the anchor above is an absolute instant, so
+    # the timer is immune to DST. Kept because notifications render a run's
+    # times in its schedule's zone (notifications/database.py).
     timezone: Mapped[str] = mapped_column(String(64), default="Asia/Singapore")
     marketplace_codes: Mapped[list[str]] = mapped_column(
         MutableList.as_mutable(JSON), default=list, nullable=False
@@ -184,6 +197,14 @@ class Schedule(TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint("mode IN ('dry_run','approval','auto')", name="ck_schedule_mode"),
         CheckConstraint("misfire_grace_seconds BETWEEN 0 AND 1800", name="ck_misfire_grace"),
+        # Deliberately no CHECK on ``interval_minutes``. Adding one to an
+        # existing database means rebuilding this table, and 0005 already
+        # documented why that is the worse path here: ``runs.schedule_id``
+        # references it, so a rebuild trips the foreign key. A constraint that
+        # only fresh installs carry would make upgraded and new databases behave
+        # differently — the exact divergence the migration tests exist to catch.
+        # An unusable period is rejected by ``_validated_interval`` (raising,
+        # per-row, so one bad rule cannot stop the others) and by Pydantic.
         CheckConstraint(
             "workflow_config_version >= 1", name="ck_schedule_workflow_config_version"
         ),

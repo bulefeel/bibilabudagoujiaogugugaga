@@ -33,6 +33,12 @@ from ziniao_automation.workflows.registry import (
 from ziniao_automation.workflows.types import RunMode
 
 
+# 09:00 Asia/Singapore. Amazon counts its 24-hour payout cap from the
+# previous request, so schedules are an absolute anchor plus a period now.
+SCHEDULE_ANCHOR = datetime(2026, 1, 1, 1, 0, tzinfo=timezone.utc)
+SCHEDULE_ANCHOR_ISO = "2026-01-01T01:00:00+00:00"
+
+
 @pytest.fixture()
 def database(tmp_path: Path):
     settings = Settings(
@@ -88,8 +94,8 @@ def _template(**changes):
         "workflow": "amazon_disbursement",
         "mode": "dry_run",
         "workflow_config": {"marketplace_codes": ["CA", "UK"]},
-        "local_time": "09:00",
-        "days_of_week": ["mon", "tue", "wed", "thu", "fri"],
+        "first_run_at": SCHEDULE_ANCHOR_ISO,
+        "interval_minutes": 1440,
         "timezone": "Asia/Singapore",
         "enabled": True,
     }
@@ -271,6 +277,8 @@ def test_stale_schedule_cannot_be_enabled_until_config_is_resaved(database):
             workflow_config={"limit": 10},
             workflow_config_version=2,
             marketplace_codes=[],
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             enabled=True,
         )
         session.add(schedule)
@@ -392,14 +400,34 @@ def test_run_keeps_an_immutable_copy_of_schedule_configuration(database):
         assert persisted.workflow_config == {"marketplace_codes": ["CA", "UK"]}
 
 
-def test_every_day_marker_is_accepted_and_normalized(database):
+def test_the_interval_anchor_is_normalised_to_utc_text_for_the_idempotency_key(database):
+    """The template is hashed into the batch idempotency key.
+
+    So the anchor has to reduce to one canonical form no matter how the client
+    spelled it — a datetime, UTC text, or the same instant written in another
+    offset must all produce the same normalized template, or an HTTP retry would
+    look like a different request and create a second batch.
+    """
+
     with database() as session:
         store = _seed_store(session, 1)
         session.commit()
-        preview = BatchScheduleService(session, _registry()).preview(
-            store_ids=[store.id], template=_template(days_of_week="*")
-        )
-        assert preview["normalized_template"]["days_of_week"] == "*"
+        service = BatchScheduleService(session, _registry())
+
+        spellings = [
+            SCHEDULE_ANCHOR_ISO,
+            SCHEDULE_ANCHOR,
+            "2026-01-01T09:00:00+08:00",   # same instant, Singapore offset
+            "2026-01-01T01:00:00Z",
+        ]
+        normalised = {
+            service.preview(
+                store_ids=[store.id], template=_template(first_run_at=value)
+            )["normalized_template"]["first_run_at"]
+            for value in spellings
+        }
+
+        assert normalised == {SCHEDULE_ANCHOR_ISO}
 
 
 def test_queue_snapshots_workflow_priority_then_batch_target_order(database):
@@ -478,8 +506,8 @@ def test_only_unresolved_money_blocks_a_schedule_from_creating_runs(
             mode="dry_run",
             workflow_config={"marketplace_codes": ["CA", "UK"]},
             marketplace_codes=["CA", "UK"],
-            local_time="09:00",
-            days_of_week="mon,tue,wed,thu,fri",
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1440,
             timezone="Asia/Singapore",
             enabled=True,
         )
