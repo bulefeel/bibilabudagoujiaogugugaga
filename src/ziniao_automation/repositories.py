@@ -53,21 +53,34 @@ class ConflictError(RuntimeError):
 ACTIVE_RUN_STATUSES = frozenset(
     {"QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_AUTH", "RECONCILING"}
 )
-# The money is genuinely in doubt: a payout click was recorded and never read
-# back, so starting another run against the same store could send it twice.
-# Worth blocking on — and now escapable, via the manual close-out on the run
-# detail page once every guard has been settled by hand.
-UNRESOLVED_FUNDS_RUN_STATUSES = frozenset({"UNCERTAIN_FINANCIAL"})
+# Nothing here any more, and that is the point: no run status blocks new work.
+# ``UNCERTAIN_FINANCIAL`` used to, on the theory that an unread-back payout
+# could be sent twice. It cannot. What actually makes a second payout
+# impossible is the per-site, per-day guard in the disbursement workflow:
+# ``guard_key`` hashes the operator-local day, and a site whose key already has
+# ANY guard — including UNCERTAIN — is skipped and never re-armed. Across days
+# the key legitimately differs, and by then Amazon's own rolling 24-hour cap has
+# also passed and the run re-reads the current payable balance, so yesterday's
+# money is simply not there to send again.
+#
+# So the run-level block never prevented a double payment. It only stopped the
+# schedule while a bookkeeping question was open, and made an operator open the
+# browser by hand to answer it. Removed on the operator's instruction: a payout
+# that silently failed is fixed by the next scheduled run succeeding.
+UNRESOLVED_FUNDS_RUN_STATUSES: frozenset[str] = frozenset()
 # Dead ends: ``finished_at`` is already stamped, no lock or browser is held, and
 # nothing will ever move them along on its own. Blocking on one of these is a
 # permanent veto, and it lands precisely when the operator most needs to act.
-# ``NEEDS_HUMAN_AUTH`` only means an assisted login ran out of time.
+# ``NEEDS_HUMAN_AUTH`` only means an assisted login ran out of time, and
+# ``UNCERTAIN_FINANCIAL`` only means the read-back could not see the payout —
+# neither costs anything to leave alone, and both are listed here so the guard
+# test below refuses any future attempt to block on them.
 #
 # This has now been reintroduced three times — on 建档重置, on schedule-driven
 # creation, and on manual 「立即执行」 — because each rule kept its own literal
 # list and the reasoning lived in a comment attached to only one of them.
 # ``test_no_blocking_rule_ever_vetoes_on_a_dead_end_status`` is the guard.
-DEAD_END_RUN_STATUSES = frozenset({"NEEDS_HUMAN_AUTH"})
+DEAD_END_RUN_STATUSES = frozenset({"NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL"})
 
 
 def canonical_hash(value: Any) -> str:
@@ -380,22 +393,6 @@ class StoreRepository:
 
 
 class ScheduleRepository:
-    # Only money still in doubt may stop a schedule. ``UNCERTAIN_FINANCIAL``
-    # means a payout click was recorded but never read back, so producing more
-    # runs against the same store risks a second transfer; that is worth
-    # blocking on, and the run detail page offers a manual close-out once every
-    # guard has been settled by hand.
-    #
-    # ``NEEDS_HUMAN_AUTH`` deliberately does NOT belong here. It only means the
-    # assisted login ran out of time — it holds no funds lock and no browser,
-    # and it has no automatic exit. Blocking on it killed the whole schedule
-    # over one failed login: every later occurrence produced SKIPPED and even
-    # 「立即执行」 was refused, with nothing in the UI to clear it. This is the
-    # same call already made for 建档重置 on 2026-08-19; the decision was
-    # documented only in the SETUP_RESET_BLOCKING_* comment, which is a
-    # different constant, so it got reintroduced here. Before adding any status
-    # to a blocking set, ask what it would cost the operator to be wrong.
-    BLOCKING_NEW_RUN_STATUSES = UNRESOLVED_FUNDS_RUN_STATUSES
 
     def __init__(self, session: Session, workflow_registry: Any | None = None) -> None:
         self.session = session
@@ -805,20 +802,9 @@ class ScheduleRepository:
                 require_payment_account=False,
             )
 
-        unresolved = self.session.execute(
-            select(Run.id, Run.status)
-            .where(
-                Run.schedule_id == schedule.id,
-                Run.status.in_(self.BLOCKING_NEW_RUN_STATUSES),
-            )
-            .order_by(Run.created_at.desc())
-            .limit(1)
-        ).first()
-        if unresolved is not None:
-            raise ConflictError(
-                "该排期仍有需要人工处理的任务，禁止创建新实例："
-                f"{unresolved.id}（{unresolved.status}）"
-            )
+        # 这里曾经按 run 状态拦过新实例。现在没有任何状态该拦：防重复付款靠的是
+        # 工作流里「每站每日一条 guard、绝不重新 arm」，不是这道闸。见文件顶部的
+        # UNRESOLVED_FUNDS_RUN_STATUSES。
 
         run = WorkflowRepository(self.session, self.workflow_registry).create_run(
             store_id=schedule.store_id,
@@ -922,7 +908,7 @@ class WorkflowRepository:
                 select(Run.id).where(
                     Run.schedule_id == schedule_id,
                     Run.status.in_(
-                        ACTIVE_RUN_STATUSES | UNRESOLVED_FUNDS_RUN_STATUSES
+                        ACTIVE_RUN_STATUSES
                     ),
                 ).limit(1)
             )

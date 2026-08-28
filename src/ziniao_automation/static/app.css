@@ -167,3 +167,6 @@
 .batch-preview-row.skip span{color:#89601e}
 /* 店铺列表右侧的「已有排期」：跳过是中性的，不该和「需处理」共用红色。 */
 .store-target-state.skip{color:#89601e}
+/* 回读跑过但仍没查到，和「压根没跑」在页面上必须能区分开——否则操作员只会反复点。 */
+.guard-reconciled{color:#5c6b62;font-weight:700}
+.guard-reason{flex-basis:100%;color:#765950}

@@ -55,5 +55,42 @@ def test_the_run_page_explains_the_state_not_just_the_buttons() -> None:
     assert "真的被点下去" in note
     assert "不会自己变好" in note, "必须写明它不会自动收尾，否则操作员会一直等"
     assert "永不重新提交" in note
-    # 收尾那一步要指出来，否则排期会一直被这条 run 卡住。
-    assert "资金记录已裁定完，结束这个任务" in note
+    # 最重要的一句：不处理也不会挡住下一次。否则操作员会为了对账天天来点一次。
+    assert "不处理也可以" in note
+    assert "不会挡住" in note
+    assert "同店同站同一天只允许一条资金记录" in note
+
+
+def test_the_guard_row_shows_that_a_read_back_actually_ran() -> None:
+    """跑过但没查到，和压根没跑，在页面上必须区分得开。
+
+    回读会写 last_reconciled_at、把原因写进 metadata、还追加 reconcile_attempt 事件——
+    数据一直都在，只是守卫行一个字都不显示。于是操作员点完看到的东西和点之前一模一样，
+    只能反复点。
+    """
+
+    note = _sources()["run_detail"]
+
+    assert "guard.last_reconciled_at" in note
+    assert "上次回读" in note
+    assert "仍未查到" in note
+    assert "guard.metadata_json" in note, "回读给出的原因要显示出来"
+
+
+def test_reconcile_waits_for_the_job_instead_of_reloading_immediately() -> None:
+    """回读是排队执行的，固定 800ms 后刷新只会看到原样。
+
+    它要开一个紫鸟窗口，几十秒起步。原来那个立即刷新让整个动作看起来毫无效果。
+    """
+
+    script = (
+        PROJECT_ROOT / "src/ziniao_automation/static/app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "async function waitForRunToSettle" in script
+    assert 'if (runAction === "reconcile")' in script
+    assert "await waitForRunToSettle(runId)" in script
+    assert '"正在回读…"' in script
+    # 观察不到 RECONCILING 时也要到点收手，不能把人永远晾着。
+    assert "attempts = 80" in script
+    assert "sawReconciling" in script

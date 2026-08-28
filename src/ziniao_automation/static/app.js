@@ -1006,6 +1006,21 @@
     catch (exc) { if (error) error.textContent = exc.message; else toast(exc.message, true); }
     finally { if (button) button.disabled = false; }
   }));
+  // 轮询到这次回读真的结束为止。判据是「进过 RECONCILING 再离开」；万一始终没观察到
+  // （队列很忙、或者跑得比一次轮询还快），到点也照样刷新，绝不把操作员永远晾在这里。
+  async function waitForRunToSettle(runId, {attempts = 80, intervalMs = 3000} = {}) {
+    let sawReconciling = false;
+    for (let index = 0; index < attempts; index += 1) {
+      await sleep(intervalMs);
+      let status = "";
+      try {
+        status = String((await api(`/api/runs/${encodeURIComponent(runId)}`)).status || "");
+      } catch (_) { continue; }   // 轮询失败不该把整个动作judged为失败
+      if (status === "RECONCILING") { sawReconciling = true; continue; }
+      if (sawReconciling) return status;
+    }
+    return "";
+  }
   document.addEventListener("click", async event => {
     const target = event.target.closest("[data-action],[data-run-action]"); if (!target) return;
     const action = target.dataset.action;
@@ -1352,7 +1367,22 @@
       const map = {approve:"approve", cancel:"cancel", reconcile:"reconcile", "continue-auth":"continue-auth", settle:"settle"};
       const message = target.dataset.confirm || (runAction === "cancel" ? "确认取消这个任务？资金锁定后的任务仍只会进入回读。" : "确认执行此操作？");
       if (!(await confirmAction(message))) return;
-      target.disabled = true; try { await api(`/api/runs/${target.dataset.runId}/${map[runAction]}`, {method:"POST", body:"{}"}); toast("请求已进入队列"); setTimeout(() => location.reload(), 800); } catch (exc) { toast(exc.message, true); target.disabled = false; }
+      target.disabled = true;
+      try {
+        const runId = target.dataset.runId;
+        await api(`/api/runs/${runId}/${map[runAction]}`, {method:"POST", body:"{}"});
+        // 回读是排队执行的：它要开一个紫鸟窗口，几十秒起步。原来固定 800ms 后刷新，
+        // 那时活儿还没开始，页面原样回来，看起来就像「点了什么都没发生」，操作员只能
+        // 反复点。改成等它真的跑完再刷新。
+        if (runAction === "reconcile") {
+          toast("已排队；正在打开紫鸟窗口回读，请稍候");
+          target.textContent = "正在回读…";
+          await waitForRunToSettle(runId);
+        } else {
+          toast("请求已进入队列");
+        }
+        setTimeout(() => location.reload(), runAction === "reconcile" ? 200 : 800);
+      } catch (exc) { toast(exc.message, true); target.disabled = false; }
     }
   });
   $("[data-store-form]")?.addEventListener("submit", async event => {
