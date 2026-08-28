@@ -64,7 +64,7 @@ powershell -File installer\build.ps1 -CertificatePath cert.pfx -CertificatePassw
 ## 静默安装（批量部署 / 自动化验证）
 
 ```powershell
-.\ZiniaoAutomation-Setup-0.4.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
+.\ZiniaoAutomation-Setup-0.4.1.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
     /DIR="C:\某个目录" /LOG=install.log
 ```
 
