@@ -358,7 +358,7 @@ def _default_title(kind: NotificationKind) -> str:
         NotificationKind.RUN_FAILED: "提现任务失败",
         NotificationKind.RUN_PARTIAL: "提现任务部分失败",
         NotificationKind.RUN_SKIPPED: "本次无站点可提现",
-        NotificationKind.UNCERTAIN_FINANCIAL: "已提交提现请求，等待平台审核",
+        NotificationKind.UNCERTAIN_FINANCIAL: "提现已发出，平台尚未显示结果",
         NotificationKind.CROSS_DAY_STARTED: "排队任务跨日开始",
     }[kind]
 
@@ -422,8 +422,8 @@ _OUTCOME_LABELS = {
     "WAITING_APPROVAL": "等待审核",
     "WAITING_AUTH": "等待验证",
     "NEEDS_HUMAN_AUTH": "验证超时",
-    "UNCERTAIN_FINANCIAL": "已提交，等待平台审核",
-    "UNCERTAIN": "已提交，等待平台审核",
+    "UNCERTAIN_FINANCIAL": "已发出，平台尚未显示",
+    "UNCERTAIN": "已发出，平台尚未显示",
     "FAILED": "执行失败",
     "SKIPPED": "已跳过",
     "CANCELLED": "已取消",

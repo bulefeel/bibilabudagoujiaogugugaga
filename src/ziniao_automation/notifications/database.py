@@ -561,7 +561,7 @@ def _title_for(kind: NotificationKind, store_name: str) -> str:
         NotificationKind.RUN_SKIPPED: "本次无站点可提现",
         # Not "待审核": that is WAITING_APPROVAL above, and it means the local
         # operator must act.  Here the request is already with Amazon.
-        NotificationKind.UNCERTAIN_FINANCIAL: "已提交，等待平台审核",
+        NotificationKind.UNCERTAIN_FINANCIAL: "已发出，平台尚未显示",
         NotificationKind.CROSS_DAY_STARTED: "跨日任务开始",
     }[kind]
     return f"紫鸟提现 · {store_name} · {label}"

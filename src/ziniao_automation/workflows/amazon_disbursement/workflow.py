@@ -100,7 +100,7 @@ class DisbursementPolicy:
     # because the statements row is occasionally already there.  Nothing about
     # the ARMED barrier, the single-dispatch guard or the "never resubmit"
     # rule changes: a miss just lands in UNCERTAIN, which now says
-    # "已提交，等待平台审核".
+    # "已发出，平台尚未显示".
     reconcile_attempts: int = 1
     reconcile_interval_seconds: float = 30.0
 
