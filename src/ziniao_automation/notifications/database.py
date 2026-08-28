@@ -289,6 +289,7 @@ class DatabaseNoticeBuilder:
             summary=summary,
             run_short_id=run_row.id[:8],
             store_name=run_row.store_name,
+            workflow=run_row.workflow or "",
             mode=run_row.mode,
             trigger=run_row.trigger,
             schedule_name=run_row.schedule_name or "",

@@ -265,7 +265,7 @@ def _message(notice: SafeRunNotice) -> str:
     lines = [
         f"**任务：** `{_code(notice.run_short_id or '未知')}`",
         f"**店铺：** {_md(notice.store_name or '未知店铺')}",
-        f"**状态：** {_md(_kind_label(notice.kind))}",
+        f"**状态：** {_md(_kind_label(notice.kind, notice.workflow))}",
     ]
     if notice.schedule_name:
         lines.append(f"**排期：** {_md(notice.schedule_name)}")
@@ -292,7 +292,7 @@ def _message(notice: SafeRunNotice) -> str:
     if notice.sites:
         lines.extend(("", "**站点明细**"))
         lines.extend(_site_line(site) for site in notice.sites)
-    action = notice.next_action or _default_next_action(notice.kind)
+    action = notice.next_action or _default_next_action(notice.kind, notice.workflow)
     if action:
         lines.extend(("", f"**下一步：** {_md(action)}"))
     return "\n".join(lines)
@@ -363,11 +363,41 @@ def _default_title(kind: NotificationKind) -> str:
     }[kind]
 
 
-def _kind_label(kind: NotificationKind) -> str:
+# A feedback run never reads a balance, so the payout wording below would be a
+# false statement about it on three separate lines of the card.
+_FEEDBACK_WORKFLOW_KEY = "amazon_feedback_removal"
+
+_FEEDBACK_KIND_LABELS: dict[NotificationKind, str] = {
+    NotificationKind.RUN_COMPLETED: "反馈处理已完成",
+    NotificationKind.RUN_FAILED: "反馈处理失败",
+    NotificationKind.RUN_PARTIAL: "反馈处理部分失败",
+    NotificationKind.RUN_SKIPPED: "本次没有可处理的反馈",
+}
+
+_FEEDBACK_NEXT_ACTIONS: dict[NotificationKind, str] = {
+    NotificationKind.RUN_COMPLETED: (
+        "无需操作。逐条结果在本地后台的「反馈处理台」；"
+        "标为「待人工」的需要你选一个请求原因，下次运行才会提交。"
+    ),
+    NotificationKind.RUN_FAILED: "请进入本地后台查看已清洗的失败原因。",
+    NotificationKind.RUN_PARTIAL: "请进入本地后台的「反馈处理台」查看哪些站点没跑完。",
+    NotificationKind.RUN_SKIPPED: "无需操作。本次没有新的中差评需要处理。",
+}
+
+
+def _kind_label(kind: NotificationKind, workflow: str = "") -> str:
+    if workflow == _FEEDBACK_WORKFLOW_KEY:
+        label = _FEEDBACK_KIND_LABELS.get(kind)
+        if label is not None:
+            return label
     return _default_title(kind)
 
 
-def _default_next_action(kind: NotificationKind) -> str:
+def _default_next_action(kind: NotificationKind, workflow: str = "") -> str:
+    if workflow == _FEEDBACK_WORKFLOW_KEY:
+        action = _FEEDBACK_NEXT_ACTIONS.get(kind)
+        if action is not None:
+            return action
     return {
         NotificationKind.WAITING_APPROVAL: "请进入本地后台核对金额并批准或取消。",
         NotificationKind.WAITING_AUTH: "自动尝试已停止；请在对应紫鸟店铺窗口处理验证，再回到本地后台继续。",

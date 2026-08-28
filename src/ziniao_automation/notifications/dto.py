@@ -73,6 +73,11 @@ class SafeRunNotice:
     summary: str
     run_short_id: str
     store_name: str
+    # The code-registered workflow key.  Renderers need it because the default
+    # card copy is written for payouts; a run that moves no money must not be
+    # told to "以绿色提现结果已确认通知为准".  It is a fixed identifier from the
+    # registry, never operator or page data.
+    workflow: str = ""
     mode: str = ""
     trigger: str = ""
     schedule_name: str = ""

@@ -210,10 +210,15 @@ def test_the_feishu_card_for_a_feedback_run_never_mentions_payouts(client) -> No
     )
 
     assert notice is not None
-    assert "提现" not in notice.title
-    assert "提现" not in notice.summary
     assert "反馈" in notice.title
     assert "请求审核" in notice.summary
+    # 整段正文都要查：标题和摘要来自 database.py，而「状态」「下一步」两行是
+    # feishu.py 自己按 kind 填的默认提现文案，只测前两者会漏掉它们。
+    from ziniao_automation.notifications.feishu import _message
+
+    body = _message(notice)
+    assert "提现" not in body, body
+    assert "反馈处理台" in body
 
 
 def test_a_payout_run_still_gets_the_payout_card(client) -> None:
@@ -229,6 +234,9 @@ def test_a_payout_run_still_gets_the_payout_card(client) -> None:
         run_id, NotificationKind.RUN_COMPLETED
     )
 
+    from ziniao_automation.notifications.feishu import _message
+
     assert notice is not None
     assert "紫鸟提现" in notice.title
     assert "提现" in notice.summary
+    assert "提现结果已确认" in _message(notice)
