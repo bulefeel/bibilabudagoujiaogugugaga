@@ -124,9 +124,13 @@ def test_a_reason_amazon_does_not_offer_is_refused(client) -> None:
     assert response.status_code == 422
 
 
-@pytest.mark.parametrize("state", ["SUBMITTED", "UNCERTAIN"])
+@pytest.mark.parametrize("state", ["SUBMITTED", "UNCERTAIN", "ALREADY_REQUESTED"])
 def test_an_already_submitted_feedback_can_never_be_requeued(client, state) -> None:
-    """这是整个页面上最重要的一条：提交过的绝不能被重新排上。"""
+    """这是整个页面上最重要的一条：提交过的绝不能被重新排上。
+
+    ``ALREADY_REQUESTED`` 同样在内：入口消失意味着亚马逊那边已经有一条请求，
+    给它选原因只会排出一次注定提交不掉的重试。
+    """
 
     app, test_client, csrf = client
     review_id = seed(app, state=state, category="not-listed", reason="301")
@@ -153,3 +157,78 @@ def test_the_ai_key_card_explains_where_the_comment_goes(client) -> None:
     assert page.status_code == 200
     assert 'data-settings-form="ai"' in page.text
     assert "唯一的对外网络请求" in page.text
+
+
+# --------------------------------------------------------------------------
+# 不能用提现的语言描述一个不碰钱的流程
+# --------------------------------------------------------------------------
+def _seed_run(app, workflow: str, mode: str = "auto") -> str:
+    from ziniao_automation.models import Run
+
+    with app.state.sessions() as session:
+        if not session.query(FeedbackReview).count():
+            StoreRepository(session).create(
+                name="测试店铺", selector_type="oauth", selector_value="oauth-1"
+            )
+            session.flush()
+        run = Run(
+            id=f"run-{workflow}-{mode}",
+            store_id=1,
+            workflow=workflow,
+            mode=mode,
+            status="SUCCEEDED",
+        )
+        session.add(run)
+        session.commit()
+        return str(run.id)
+
+
+def test_a_feedback_run_detail_is_not_dressed_as_a_payout(client) -> None:
+    app, test_client, _ = client
+    run_id = _seed_run(app, "amazon_feedback_removal")
+
+    page = test_client.get(f"/runs/{run_id}")
+
+    assert page.status_code == 200
+    assert "站点与反馈处理" in page.text
+    # 「可提现 PAYABLE 0.00」 for a workflow that never reads a balance reads as
+    # "this store cannot withdraw anything".
+    assert "可提现 PAYABLE" not in page.text
+    assert "延迟资金" not in page.text
+    assert 'href="/feedback"' in page.text
+
+
+def test_the_feishu_card_for_a_feedback_run_never_mentions_payouts(client) -> None:
+    from ziniao_automation.notifications.database import DatabaseNoticeBuilder
+    from ziniao_automation.notifications.dto import NotificationKind
+
+    app, _, _ = client
+    run_id = _seed_run(app, "amazon_feedback_removal")
+
+    notice = DatabaseNoticeBuilder(app.state.sessions).build(
+        run_id, NotificationKind.RUN_COMPLETED
+    )
+
+    assert notice is not None
+    assert "提现" not in notice.title
+    assert "提现" not in notice.summary
+    assert "反馈" in notice.title
+    assert "请求审核" in notice.summary
+
+
+def test_a_payout_run_still_gets_the_payout_card(client) -> None:
+    """反馈的改动不能把提现的文案改掉——它才是这些措辞的正主。"""
+
+    from ziniao_automation.notifications.database import DatabaseNoticeBuilder
+    from ziniao_automation.notifications.dto import NotificationKind
+
+    app, _, _ = client
+    run_id = _seed_run(app, "amazon_disbursement")
+
+    notice = DatabaseNoticeBuilder(app.state.sessions).build(
+        run_id, NotificationKind.RUN_COMPLETED
+    )
+
+    assert notice is not None
+    assert "紫鸟提现" in notice.title
+    assert "提现" in notice.summary

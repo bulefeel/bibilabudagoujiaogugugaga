@@ -39,6 +39,12 @@ class FeedbackRow:
     order_date: str | None
     comment: str
     removal_available: bool
+    # False when the action menu itself could not be inspected (element absent,
+    # or its shadow root not attached yet).  Without this, a row whose menu was
+    # merely slow to render is indistinguishable from one Amazon has withdrawn
+    # the action from — and the latter is recorded as a terminal, irreversible
+    # "already requested".  An unreadable menu must never make that claim.
+    menu_readable: bool = True
 
     @property
     def is_low_star(self) -> bool:
@@ -113,7 +119,10 @@ _READ_ROWS = (
     const rows = deepAll(contract.rows);
     return rows.map((row) => {
         const menu = row.querySelector(contract.actions_menu);
-        const removal = menu && menu.shadowRoot
+        // The option list lives in the component's shadow root; if that is not
+        // attached yet we know nothing about this row's availability.
+        const menuReadable = Boolean(menu && menu.shadowRoot);
+        const removal = menuReadable
             ? menu.shadowRoot.querySelector(contract.action_request_removal)
             : null;
         const cells = Array.from(row.children);
@@ -127,6 +136,7 @@ _READ_ROWS = (
             order_date: dateCell ? textOf(dateCell) : null,
             comment: commentCell ? textOf(commentCell) : '',
             removal_available: Boolean(removal),
+            menu_readable: menuReadable,
         };
     }).filter((row) => row.order_id && row.rating !== null);
 }
@@ -396,9 +406,33 @@ class AmazonFeedbackPage:
                     order_date=item.get("order_date") or None,
                     comment=str(item.get("comment") or ""),
                     removal_available=bool(item.get("removal_available")),
+                    menu_readable=bool(item.get("menu_readable", True)),
                 )
             )
         return rows
+
+    async def wait_until_action_gone(
+        self, page: Any, order_id: str, *, timeout_seconds: float = 12.0
+    ) -> bool:
+        """Poll until the row stops offering 「请求审核」.
+
+        Amazon withdraws the action once a review has been requested, but the
+        Angular list re-renders asynchronously, so a single read right after the
+        click reports the old state and turns a successful submission into
+        「未确认」.  Returns False on timeout, which the caller treats as
+        unconfirmed — never as a reason to submit again.
+        """
+
+        waited = 0.0
+        step = self.settle_seconds
+        while waited < timeout_seconds:
+            rows = {row.order_id: row for row in await self.read_rows(page)}
+            row = rows.get(order_id)
+            if row is not None and row.menu_readable and not row.removal_available:
+                return True
+            await page.wait_for_timeout(int(step * 1000))
+            waited += step
+        return False
 
     async def open_removal_panel(self, page: Any, order_id: str) -> dict[str, Any]:
         """Open the inline removal panel and advance past 继续.

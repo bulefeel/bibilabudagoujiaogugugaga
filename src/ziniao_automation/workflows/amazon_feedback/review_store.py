@@ -21,12 +21,19 @@ from ...workflows.types import utc_now
 # State machine for one feedback entry.
 PENDING = "PENDING"          # reason decided, not yet submitted
 NEEDS_HUMAN = "NEEDS_HUMAN"  # classifier declined; an operator must choose
-SKIPPED = "SKIPPED"          # Amazon offers no removal request for this entry
+# Amazon no longer offers 「请求审核」 on the row.  Per the seller: that means a
+# review has ALREADY been requested for this feedback, or it was already
+# reviewed and removed — not that Amazon provides no entry point.  Either way
+# the one request this feedback gets has been used.
+ALREADY_REQUESTED = "ALREADY_REQUESTED"
 SUBMITTED = "SUBMITTED"      # request accepted by the page
 UNCERTAIN = "UNCERTAIN"      # clicked, but the outcome could not be confirmed
 FAILED = "FAILED"            # could not get as far as submitting
 
-TERMINAL_STATES = frozenset({SUBMITTED, UNCERTAIN})
+# States from which nothing may re-arm a submission.  ALREADY_REQUESTED belongs
+# here for the same reason SUBMITTED does: Amazon has the request either way,
+# so letting an operator assign a reason would only queue a doomed retry.
+TERMINAL_STATES = frozenset({SUBMITTED, UNCERTAIN, ALREADY_REQUESTED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,14 +115,24 @@ class FeedbackReviewStore:
                 return None
             return str(review.id)
 
-    async def pending_for_run(
-        self, run_id: str, marketplace_code: str
+    async def pending_for_store(
+        self, store_id: int, marketplace_code: str
     ) -> list[ReviewItem]:
+        """Every entry waiting to be submitted for this store and site.
+
+        Deliberately NOT scoped to the current run.  PENDING means "a reason is
+        decided, the request has not been sent" — it does not matter whether
+        that reason came from an earlier dry run or from an operator on the
+        Feedback page.  Scoping this to ``run_id`` stranded both: a dry run's
+        entries and every manually decided one could never be picked up again,
+        because the unique constraint also stops them being re-recorded.
+        """
+
         with self.session_factory() as session:
             rows = session.scalars(
                 select(FeedbackReview)
                 .where(
-                    FeedbackReview.run_id == run_id,
+                    FeedbackReview.store_id == store_id,
                     FeedbackReview.marketplace_code == marketplace_code,
                     FeedbackReview.state == PENDING,
                 )
@@ -138,6 +155,7 @@ class FeedbackReviewStore:
         review_id: str,
         state: str,
         *,
+        run_id: str | None = None,
         submitted_at: datetime | None = None,
         details: dict[str, Any] | None = None,
     ) -> None:
@@ -150,6 +168,11 @@ class FeedbackReviewStore:
             if row.state in TERMINAL_STATES:
                 return
             row.state = state
+            # Re-attribute the entry to the run that actually acted on it, so a
+            # carried-over item appears in the report of the run that sent it
+            # rather than the one that merely wrote it down.
+            if run_id is not None:
+                row.run_id = run_id
             if submitted_at is not None:
                 row.submitted_at = submitted_at
             if details:
@@ -217,11 +240,12 @@ def _to_item(row: FeedbackReview) -> ReviewItem:
 
 
 __all__ = [
+    "ALREADY_REQUESTED",
     "FAILED",
     "NEEDS_HUMAN",
     "PENDING",
-    "SKIPPED",
     "SUBMITTED",
+    "TERMINAL_STATES",
     "UNCERTAIN",
     "FeedbackReviewStore",
     "ReviewItem",

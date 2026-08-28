@@ -258,7 +258,9 @@ STATUS_LABELS = {
 FEEDBACK_STATE_LABELS = {
     "PENDING": "待提交",
     "NEEDS_HUMAN": "待人工",
-    "SKIPPED": "已跳过",
+    # Amazon withdraws the action once a review has been requested, so its
+    # absence means the request already exists — not that we chose to skip.
+    "ALREADY_REQUESTED": "此前已请求",
     "SUBMITTED": "已提交",
     "UNCERTAIN": "未确认",
     "FAILED": "失败",

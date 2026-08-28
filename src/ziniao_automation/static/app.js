@@ -963,11 +963,20 @@
     const note=$("[data-interval-warning]",form);
     if(!note)return;
     const minutes=readScheduleInterval(form);
-    const financial=workflowMeta(form)?.requires_marketplace_targets!==false;
+    // 24 小时限流是**提现**的规则，判据必须是 requires_financial_lock。
+    // 原来用 requires_marketplace_targets，而反馈流程同样按站点执行，于是它也被
+    // 警告「间隔小于 24 小时会被拒」——反馈清扫本来就该跑得比这勤。
+    const financial=workflowMeta(form)?.requires_financial_lock===true;
     if(financial&&minutes>0&&minutes<1440){
       note.textContent="亚马逊对同一账户按滑动 24 小时限流一次；小于 24 小时的间隔会有部分次数被拒绝。仍可保存。";
       note.hidden=false;
     }else{note.hidden=true;note.textContent="";}
+    const help=$("[data-interval-help]",form);
+    if(help){
+      help.innerHTML=financial
+        ?'亚马逊按<strong>滑动 24 小时</strong>限流：从上一次请求那一刻起算，不是按自然日。所以「每天同一时刻」实际上每次都差几秒不够 24 小时，会被拒掉一半。默认 25 小时，运行时刻每天往后挪一小时。'
+        :'该流程不受提现的 24 小时限流约束，间隔按需要设置即可。';
+    }
   }
   function selectedScheduleStoreIds(form){return $$('input[name="target_store_ids"]:checked',form).map(input=>Number(input.value)).filter(validPositiveId);}
   function scheduleStoreRow(form, storeId){return $$("[data-store-option]", form).find(row => String(row.dataset.storeId || "") === String(storeId));}

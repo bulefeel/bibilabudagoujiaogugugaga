@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from ..db import utc_now
 from ..models import (
     ApprovalRequest,
+    FeedbackReview,
     NotificationDelivery,
     OperationGuard,
     Run,
@@ -36,6 +37,10 @@ from .dto import NotificationKind, SafeRunNotice, SafeSiteNotice
 logger = logging.getLogger(__name__)
 
 _ALLOWED_KINDS = frozenset(NotificationKind)
+
+# A run of this workflow moves no money, so every payout phrase in this module
+# would be a false statement about it.
+FEEDBACK_WORKFLOW_KEY = "amazon_feedback_removal"
 
 
 class SafeNoticeSender(Protocol):
@@ -79,6 +84,7 @@ class DatabaseNoticeBuilder:
                     Run.started_at,
                     Run.auth_deadline,
                     Run.error,
+                    Run.workflow,
                     Store.name.label("store_name"),
                     Schedule.name.label("schedule_name"),
                     Schedule.timezone.label("schedule_timezone"),
@@ -201,8 +207,25 @@ class DatabaseNoticeBuilder:
         ):
             return None
 
+        # A run that moves no money must not be described in payout language.
+        # Counting here rather than in the card builder keeps the notice a
+        # plain data object with no database access of its own.
+        feedback_counts: dict[str, int] | None = None
+        if run_row.workflow == FEEDBACK_WORKFLOW_KEY:
+            with self.session_factory() as session:
+                feedback_counts = {}
+                for (state,) in session.execute(
+                    select(FeedbackReview.state).where(
+                        FeedbackReview.run_id == run_id
+                    )
+                ):
+                    key = str(state)
+                    feedback_counts[key] = feedback_counts.get(key, 0) + 1
+
         summary = _summary_for(
             kind,
+            workflow=run_row.workflow,
+            feedback_counts=feedback_counts,
             run_mode=run_row.mode,
             run_error=run_row.error,
             site_payables=[row.payable_amount for row in site_rows],
@@ -221,12 +244,17 @@ class DatabaseNoticeBuilder:
             # guard moved no money and therefore has no destination to report.
             account = (guard.payout_account_tail if guard else "") or ""
             earlier_tail = previous_tail.get(row.id, "")
+            is_feedback = run_row.workflow == FEEDBACK_WORKFLOW_KEY
             sites.append(
                 SafeSiteNotice(
                     code=row.marketplace_code,
-                    currency=(guard.currency if guard else row.currency) or "",
-                    payable=(guard.amount if guard else row.payable_amount),
-                    delayed=row.delayed_amount,
+                    currency=""
+                    if is_feedback
+                    else ((guard.currency if guard else row.currency) or ""),
+                    payable=None
+                    if is_feedback
+                    else (guard.amount if guard else row.payable_amount),
+                    delayed=None if is_feedback else row.delayed_amount,
                     outcome=(guard.state if guard else row.status) or "",
                     account_tail=account,
                     # Platform references live in free-form guard metadata and
@@ -257,7 +285,7 @@ class DatabaseNoticeBuilder:
 
         return SafeRunNotice(
             kind=kind,
-            title=_title_for(kind, run_row.store_name),
+            title=_title_for(kind, run_row.store_name, run_row.workflow),
             summary=summary,
             run_short_id=run_row.id[:8],
             store_name=run_row.store_name,
@@ -485,6 +513,37 @@ def _without_exception_prefix(value: str | None) -> str:
     return _EXCEPTION_PREFIX.sub("", " ".join(str(value or "").split()))
 
 
+def _feedback_summary(
+    kind: NotificationKind,
+    counts: dict[str, int],
+    *,
+    run_mode: str,
+    run_error: str | None,
+    site_errors: list[str],
+    event_message: str | None,
+) -> str:
+    submitted = counts.get("SUBMITTED", 0)
+    pending = counts.get("PENDING", 0)
+    needs_human = counts.get("NEEDS_HUMAN", 0)
+    uncertain = counts.get("UNCERTAIN", 0)
+    already = counts.get("ALREADY_REQUESTED", 0)
+
+    if kind in (NotificationKind.RUN_FAILED, NotificationKind.RUN_PARTIAL):
+        reason = run_error or (site_errors[0] if site_errors else None) or event_message
+        if reason:
+            return f"反馈处理异常：{_without_exception_prefix(reason)}"
+        return "反馈处理未能完成。"
+    if str(run_mode).lower() == "dry_run":
+        return (
+            f"只读检查已完成，未提交任何请求审核。"
+            f"待提交 {pending} 条，待人工 {needs_human} 条，此前已请求 {already} 条。"
+        )
+    tail = f"待人工 {needs_human} 条，未确认 {uncertain} 条，此前已请求 {already} 条。"
+    if submitted:
+        return f"已提交 {submitted} 条请求审核；亚马逊是否采纳由其决定。{tail}"
+    return f"本次没有提交任何请求审核。{tail}"
+
+
 def _summary_for(
     kind: NotificationKind,
     *,
@@ -494,7 +553,18 @@ def _summary_for(
     site_errors: list[str],
     site_skip_reasons: list[str],
     event_message: str | None,
+    workflow: str = "",
+    feedback_counts: dict[str, int] | None = None,
 ) -> str:
+    if feedback_counts is not None or workflow == FEEDBACK_WORKFLOW_KEY:
+        return _feedback_summary(
+            kind,
+            feedback_counts or {},
+            run_mode=run_mode,
+            run_error=run_error,
+            site_errors=site_errors,
+            event_message=event_message,
+        )
     if kind is NotificationKind.RUN_SKIPPED:
         # Lead with the reason, not the outcome.  "已跳过" alone is what sent
         # the operator looking for a fault that does not exist; the sentence
@@ -547,7 +617,21 @@ def _summary_for(
     }[kind]
 
 
-def _title_for(kind: NotificationKind, store_name: str) -> str:
+def _title_for(
+    kind: NotificationKind, store_name: str, workflow: str = ""
+) -> str:
+    if workflow == FEEDBACK_WORKFLOW_KEY:
+        label = {
+            NotificationKind.WAITING_AUTH: "等待登录验证",
+            NotificationKind.AUTH_TIMEOUT: "登录验证超时",
+            NotificationKind.RUN_COMPLETED: "反馈处理已完成",
+            NotificationKind.RUN_FAILED: "反馈处理失败",
+            NotificationKind.RUN_PARTIAL: "反馈处理部分失败",
+            NotificationKind.RUN_SKIPPED: "本次没有可处理的反馈",
+            NotificationKind.CROSS_DAY_STARTED: "跨日任务开始",
+        }.get(kind)
+        if label is not None:
+            return f"反馈删除 · {store_name} · {label}"
     label = {
         NotificationKind.WAITING_APPROVAL: "待审核",
         NotificationKind.WAITING_AUTH: "等待登录验证",

@@ -199,5 +199,13 @@
 /* 已提交＝请求已送出但亚马逊未必采纳，用金色而不是绿色，避免读成「已删除」。 */
 .status-submitted:before{background:var(--gold)}
 .status-needs_human:before{background:#bd7630}
-.status-skipped:before{background:#8b938a}
+/* 「此前已请求」是终态且是个正常结果（亚马逊那边已经有这条请求了），
+   不是失败也不是待办——用中性灰，别用红色让人去排查一个不存在的问题。 */
+.status-already_requested:before{background:#8b938a}
 @media(max-width:760px){.feedback-intro{grid-template-columns:1fr}.feedback-intro>p{margin-top:20px}.feedback-comment{max-width:200px}.feedback-table-wrap{margin-left:-17px;margin-right:-17px;border-left:0;border-right:0}}
+/* 反馈台上的「已提交」是终态。全局规则给 .status-submitted 配了金色 + 呼吸动画
+   （那是提现「已提交待确认」的语义），一屏几十条终态记录一起闪，会读成还在处理。 */
+.feedback-table .status-submitted:before{background:var(--green);animation:none}
+.feedback-table .status-pending:before{background:#7d8880}
+.feedback-detail-link{margin:14px 0 0;font-size:11px;color:var(--muted);line-height:1.7}
+.site-ledger.feedback-site{grid-template-columns:38px 1fr auto}

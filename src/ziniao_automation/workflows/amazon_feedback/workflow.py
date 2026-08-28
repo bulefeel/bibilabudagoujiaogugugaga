@@ -38,10 +38,10 @@ from .config import MAX_RATING_ELIGIBLE_FOR_REMOVAL, FeedbackDomContract, reason
 from .classifier import FeedbackReasonClassifier
 from .page import AmazonFeedbackPage, FeedbackRow
 from .review_store import (
+    ALREADY_REQUESTED,
     FAILED,
     NEEDS_HUMAN,
     PENDING,
-    SKIPPED,
     SUBMITTED,
     UNCERTAIN,
     FeedbackReviewStore,
@@ -145,8 +145,13 @@ class AmazonFeedbackWorkflow:
 
         seen = len(rows)
         low_star = [row for row in rows if row.is_low_star]
-        fresh = [row for row in low_star if row.order_id not in known]
-        actionable = 0
+        # A row whose action menu could not be inspected tells us nothing, so it
+        # is left un-recorded for a later run rather than being written down
+        # under a guess.  Recording is one-way: the unique constraint means a
+        # wrong verdict here can never be revisited.
+        unreadable = [row for row in low_star if not row.menu_readable]
+        readable = [row for row in low_star if row.menu_readable]
+        fresh = [row for row in readable if row.order_id not in known]
 
         for row in fresh:
             state, category, reason_code, source, note = await self._decide(row)
@@ -168,23 +173,41 @@ class AmazonFeedbackWorkflow:
                 # Lost a race with a concurrent run; the other one owns it.
                 _log_item(marketplace.code, "SKIPPED", "already_recorded")
                 continue
-            if state == PENDING:
-                actionable += 1
             _log_item(marketplace.code, state, reason_code or "none")
+
+        # Everything still waiting to be sent for this store and site — not just
+        # what this run just wrote down.  Entries decided by an earlier dry run,
+        # or by an operator on the Feedback page, are exactly as actionable.
+        actionable = len(
+            await self.review_store.pending_for_store(
+                int(run.store.id), marketplace.code
+            )
+        )
 
         await self.repository.append_event(
             run.id,
             "feedback_scanned",
-            f"读取 {seen} 条反馈，其中中差评 {len(low_star)} 条，本次新增 {len(fresh)} 条",
+            f"读取 {seen} 条反馈，其中中差评 {len(low_star)} 条，"
+            f"本次新增 {len(fresh)} 条，待提交合计 {actionable} 条",
             marketplace_code=marketplace.code,
             details={
                 "seen": seen,
                 "low_star": len(low_star),
                 "fresh": len(fresh),
                 "actionable": actionable,
-                "already_known": len(low_star) - len(fresh),
+                "already_known": len(readable) - len(fresh),
+                "menu_unreadable": len(unreadable),
             },
         )
+        if unreadable:
+            await self.repository.append_event(
+                run.id,
+                "feedback_menu_unreadable",
+                f"{len(unreadable)} 条的操作菜单没读出来，本次不记录，留待下次",
+                marketplace_code=marketplace.code,
+                details={"count": len(unreadable), "reason_code": "menu_unreadable"},
+            )
+            _log_item(marketplace.code, "DEFERRED", "menu_unreadable", count=len(unreadable))
         return actionable
 
     async def _decide(
@@ -197,8 +220,17 @@ class AmazonFeedbackWorkflow:
         """
 
         if not row.removal_available:
-            # Amazon simply does not offer the request for this entry.
-            return (SKIPPED, None, None, None, "亚马逊未对该条提供「请求审核」入口")
+            # The action is gone, which per the seller means this feedback has
+            # already had a review requested — or was already reviewed and
+            # removed.  Its one request is spent either way, so there is nothing
+            # to classify and no point paying for a model call.
+            return (
+                ALREADY_REQUESTED,
+                None,
+                None,
+                None,
+                "亚马逊已不提供「请求审核」：此前已发起过请求，或已审核完成",
+            )
 
         decision = await self.classifier.classify(
             comment=row.comment, rating=row.rating, order_date=row.order_date
@@ -231,6 +263,13 @@ class AmazonFeedbackWorkflow:
                     run, page, marketplace, budget - submitted
                 )
             except Exception as exc:  # noqa: BLE001 - one site must not sink the rest
+                # Isolating a site is deliberate; hiding a defect is not.  The
+                # traceback goes to the log, because a broad catch here once
+                # turned an AttributeError into a plausible-looking "this site
+                # failed" and the tests still passed.
+                logger.exception(
+                    "feedback site failed", extra={"marketplace": marketplace.code}
+                )
                 await self.repository.set_site_status(
                     run.id,
                     marketplace.code,
@@ -254,10 +293,12 @@ class AmazonFeedbackWorkflow:
         marketplace: MarketplaceRef,
         remaining: int,
     ) -> int:
-        pending = await self.review_store.pending_for_run(run.id, marketplace.code)
+        pending = await self.review_store.pending_for_store(
+            int(run.store.id), marketplace.code
+        )
         if not pending:
             await self.repository.set_site_status(
-                run.id, marketplace.code, SiteStatus.SUCCEEDED
+                run.id, marketplace.code, SiteStatus.SKIPPED
             )
             return 0
 
@@ -267,14 +308,17 @@ class AmazonFeedbackWorkflow:
         submitted = 0
         for item in pending:
             if submitted >= remaining:
-                await self._note_budget_stop(run, marketplace, submitted, remaining)
+                await self._note_budget_stop(run, marketplace, submitted, _max_submissions(run))
                 break
             outcome = await self._submit_one(run, page, marketplace, item, rows)
             if outcome == SUBMITTED:
                 submitted += 1
 
+        # CONFIRMED is this enum's terminal success; SiteStatus has no SUCCEEDED
+        # member, and referring to one raised AttributeError at the very end of
+        # a site that had already submitted its requests.
         await self.repository.set_site_status(
-            run.id, marketplace.code, SiteStatus.SUCCEEDED
+            run.id, marketplace.code, SiteStatus.CONFIRMED
         )
         return submitted
 
@@ -288,14 +332,15 @@ class AmazonFeedbackWorkflow:
     ) -> str:
         category, reason_code = item.category, item.reason_code
         if not category or not reason_code:
-            await self.review_store.mark(item.id, NEEDS_HUMAN)
+            await self.review_store.mark(item.id, NEEDS_HUMAN, run_id=run.id)
             _log_item(marketplace.code, NEEDS_HUMAN, "no_reason_recorded")
             return NEEDS_HUMAN
 
         row = rows.get(item.order_id)
         if row is None:
             await self.review_store.mark(
-                item.id, FAILED, details={"reason_code": "row_disappeared"}
+                item.id, FAILED, run_id=run.id,
+                details={"reason_code": "row_disappeared"},
             )
             _log_item(marketplace.code, FAILED, "row_disappeared")
             return FAILED
@@ -303,7 +348,8 @@ class AmazonFeedbackWorkflow:
             # The list changed underneath us.  Never act on a row that is no
             # longer a 1–3 star entry.
             await self.review_store.mark(
-                item.id, FAILED, details={"reason_code": "rating_changed"}
+                item.id, FAILED, run_id=run.id,
+                details={"reason_code": "rating_changed"},
             )
             _log_item(marketplace.code, FAILED, "rating_changed", rating=row.rating)
             return FAILED
@@ -312,7 +358,7 @@ class AmazonFeedbackWorkflow:
             opened = await self.page_adapter.open_removal_panel(page, item.order_id)
             if not opened.get("ok"):
                 return await self._abort_item(
-                    marketplace, item, str(opened.get("reason") or "panel_failed")
+                    run, marketplace, item, str(opened.get("reason") or "panel_failed")
                 )
 
             chosen = await self.page_adapter.select_reason(
@@ -320,7 +366,7 @@ class AmazonFeedbackWorkflow:
             )
             if not chosen.get("ok"):
                 return await self._abort_item(
-                    marketplace, item, str(chosen.get("reason") or "reason_failed")
+                    run, marketplace, item, str(chosen.get("reason") or "reason_failed")
                 )
 
             result = await self.page_adapter.submit_removal(
@@ -328,7 +374,7 @@ class AmazonFeedbackWorkflow:
             )
             if not result.get("ok"):
                 return await self._abort_item(
-                    marketplace, item, str(result.get("reason") or "submit_blocked")
+                    run, marketplace, item, str(result.get("reason") or "submit_blocked")
                 )
         finally:
             # Always return the table to its resting state, whatever happened.
@@ -341,6 +387,7 @@ class AmazonFeedbackWorkflow:
         await self.review_store.mark(
             item.id,
             state,
+            run_id=run.id,
             submitted_at=utc_now(),
             details={
                 "category": category,
@@ -359,20 +406,27 @@ class AmazonFeedbackWorkflow:
         return state
 
     async def _confirm_submitted(self, page: Any, order_id: str) -> bool:
-        rows = {row.order_id: row for row in await self.page_adapter.read_rows(page)}
-        row = rows.get(order_id)
-        if row is None:
-            return False
-        return not row.removal_available
+        """Confirm from the page, not from the fact that we clicked.
+
+        Amazon withdraws 「请求审核」 from a feedback once a review has been
+        requested for it, so the action being gone is a positive signal that the
+        request landed.  A row that has vanished, or one that still offers the
+        action, is left UNCERTAIN — and UNCERTAIN is never retried either.
+        """
+
+        return await self.page_adapter.wait_until_action_gone(page, order_id)
 
     async def _abort_item(
-        self, marketplace: MarketplaceRef, item: Any, reason_code: str
+        self, run: WorkflowRun, marketplace: MarketplaceRef, item: Any, reason_code: str
     ) -> str:
         # Nothing was submitted, but the entry is never handed back to a later
         # run: it stays visible on the Feedback page for a human to decide.
-        state = SKIPPED if reason_code == "removal_not_offered" else FAILED
+        # The action disappearing between planning and execution means someone
+        # requested a review in the meantime — the same terminal fact, not a
+        # transient failure to retry.
+        state = ALREADY_REQUESTED if reason_code == "removal_not_offered" else FAILED
         await self.review_store.mark(
-            item.id, state, details={"reason_code": reason_code}
+            item.id, state, run_id=run.id, details={"reason_code": reason_code}
         )
         _log_item(marketplace.code, state, reason_code)
         return state
@@ -404,7 +458,7 @@ class AmazonFeedbackWorkflow:
         needs_human = counts.get(NEEDS_HUMAN, 0)
         summary = (
             f"提交 {submitted} 条，待人工 {needs_human} 条，"
-            f"跳过 {counts.get(SKIPPED, 0)} 条"
+            f"此前已请求 {counts.get(ALREADY_REQUESTED, 0)} 条"
         )
         if run.mode.value == "dry_run":
             summary = f"空跑：本次不提交。可提交 {counts.get(PENDING, 0)} 条，" + summary

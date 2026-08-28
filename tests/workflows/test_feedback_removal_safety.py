@@ -35,7 +35,7 @@ from ziniao_automation.workflows.amazon_feedback.page import FeedbackRow
 from ziniao_automation.workflows.amazon_feedback.review_store import (
     NEEDS_HUMAN,
     PENDING,
-    SKIPPED,
+    ALREADY_REQUESTED,
     SUBMITTED,
 )
 from ziniao_automation.workflows.types import (
@@ -107,6 +107,12 @@ class FakePage:
     async def close_panels(self, page: Any) -> int:
         self.closed += 1
         return 1
+
+    async def wait_until_action_gone(
+        self, page: Any, order_id: str, *, timeout_seconds: float = 12.0
+    ) -> bool:
+        row = next((r for r in self._rows if r.order_id == order_id), None)
+        return row is not None and not row.removal_available
 
 
 class FakeClassifier:
@@ -322,10 +328,14 @@ async def test_an_unsure_classifier_queues_for_a_human(session_factory) -> None:
     assert plan.lines == ()
 
 
-async def test_amazon_not_offering_the_action_is_a_skip_not_a_submit(
+async def test_a_feedback_amazon_already_has_a_request_for_is_terminal(
     session_factory,
 ) -> None:
-    """1 星但亚马逊没给「请求审核」入口——跳过，且不该白白问一次模型。"""
+    """入口消失＝亚马逊那边已经有一条请求了（卖家确认过的口径）。
+
+    机会已经用掉，所以既不提交、也不该白白问一次模型，更不能落成「待人工」
+    让操作员去选一个永远提交不出去的原因。
+    """
 
     page = FakePage([row("702-6", 1, available=False)])
     classifier = FakeClassifier(DECISION)
@@ -341,7 +351,7 @@ async def test_amazon_not_offering_the_action_is_a_skip_not_a_submit(
     await workflow.execute(run, object(), plan)
 
     assert page.submitted == []
-    assert states(session_factory)["702-6"] == SKIPPED
+    assert states(session_factory)["702-6"] == ALREADY_REQUESTED
     assert classifier.calls == 0
 
 
@@ -455,3 +465,115 @@ async def test_the_engine_only_locks_funds_for_financial_workflows() -> None:
         pass
 
     assert sessions.used == ["session", "financial_session"]
+
+
+# --------------------------------------------------------------------------
+# 6. 跨运行的交接 —— 三条 blocker 的回归钉子
+#
+# 这三条都是「看起来一切正常，但功能永久失效」的形状：运行是绿色的、页面有数据、
+# 日志没有报错，只是那批反馈再也提交不出去，而且唯一约束让它们无法被重新收录。
+# --------------------------------------------------------------------------
+async def test_a_dry_run_hands_its_decisions_to_the_next_real_run(session_factory) -> None:
+    """空跑也会落库。那批「待提交」必须能被后续的 auto 运行接手。
+
+    最初 execute 只看 ``pending_for_run(run_id)``，于是空跑写下的条目对之后的任何
+    运行都不可见；而 ``known_order_ids`` 又把它们算作「见过了」，唯一约束再挡住重新
+    收录——用户按习惯先空跑一次，就把整店的中差评永久废掉了，且运行显示已完成。
+    """
+
+    rows = [row("702-20", 2), row("702-21", 1)]
+    workflow, page, _ = build(session_factory, rows)
+
+    dry = make_run("run-1", mode=RunMode.DRY_RUN)
+    await workflow.plan(dry, object())
+    assert page.submitted == []
+    assert set(states(session_factory).values()) == {PENDING}
+
+    # A different run, in auto mode, must pick them up.
+    workflow2, page2, _ = build(session_factory, [row("702-20", 2), row("702-21", 1)])
+    live = make_run("run-2", mode=RunMode.AUTO)
+    plan = await workflow2.plan(live, object())
+    assert plan.lines, "空跑遗留的待提交条目必须让本次运行有事可做"
+    await workflow2.execute(live, object(), plan)
+
+    assert sorted(item[0] for item in page2.submitted) == ["702-20", "702-21"]
+    assert set(states(session_factory).values()) == {SUBMITTED}
+
+
+async def test_a_reason_chosen_by_a_human_is_submitted_by_the_next_run(
+    session_factory,
+) -> None:
+    """人工在反馈处理台选完原因后，下次运行必须真的提交——页面就是这么承诺的。"""
+
+    workflow, page, _ = build(session_factory, [row("702-30", 1)], decision=None)
+    first = make_run("run-1")
+    plan = await workflow.plan(first, object())
+    await workflow.execute(first, object(), plan)
+    assert states(session_factory)["702-30"] == NEEDS_HUMAN
+    assert page.submitted == []
+
+    # Exactly what POST /api/feedback-reviews/{id}/decision writes.
+    with session_factory() as session:
+        review = session.query(FeedbackReview).filter_by(order_id="702-30").one()
+        review.category = "delivery-related-feedback"
+        review.reason_code = "402"
+        review.decision_source = "human"
+        review.state = PENDING
+        session.commit()
+
+    workflow2, page2, _ = build(session_factory, [row("702-30", 1)])
+    second = make_run("run-2")
+    plan2 = await workflow2.plan(second, object())
+    await workflow2.execute(second, object(), plan2)
+
+    assert [item[0] for item in page2.submitted] == ["702-30"]
+    assert states(session_factory)["702-30"] == SUBMITTED
+
+
+async def test_an_unreadable_action_menu_is_never_written_down(session_factory) -> None:
+    """读不到操作菜单 ≠ 亚马逊已经有请求了。
+
+    列表是异步渲染的，菜单的 shadowRoot 可能还没挂上。把这种情况记成
+    ALREADY_REQUESTED 会用一个**假事实**永久废掉整店的中差评——那是终态，
+    唯一约束又挡住重新收录。宁可这次不记，留给下一次。
+    """
+
+    unreadable = FeedbackRow(
+        order_id="702-40", rating=1, order_date="2026/08/04",
+        comment="包裹延迟", removal_available=False, menu_readable=False,
+    )
+    workflow, page, repo = build(session_factory, [unreadable])
+    run = make_run()
+
+    await workflow.plan(run, object())
+
+    assert states(session_factory) == {}, "读不出来的行绝不能落库"
+    assert any(event[0] == "feedback_menu_unreadable" for event in repo.events)
+
+    # Next run reads it properly and records the truth.
+    readable = FeedbackRow(
+        order_id="702-40", rating=1, order_date="2026/08/04",
+        comment="包裹延迟", removal_available=False, menu_readable=True,
+    )
+    workflow2, _, _ = build(session_factory, [readable])
+    await workflow2.plan(make_run("run-2"), object())
+    assert states(session_factory)["702-40"] == ALREADY_REQUESTED
+
+
+async def test_a_finished_site_is_not_reported_as_failed(session_factory) -> None:
+    """站点收尾用的必须是真实存在的枚举成员。
+
+    原来写的是 ``SiteStatus.SUCCEEDED``——这个成员不存在，AttributeError 在所有请求
+    都已经提交出去之后才抛，被 execute 的宽 except 吞成「该站点失败」，操作员收到
+    的是一张红色的失败卡片。
+    """
+
+    workflow, page, repo = build(session_factory, [row("702-50", 2)])
+    run = make_run()
+
+    plan = await workflow.plan(run, object())
+    await workflow.execute(run, object(), plan)
+
+    assert len(page.submitted) == 1
+    assert repo.site_status.get("CA") != "FAILED"
+    assert not any(event[0] == "site_execution_failed" for event in repo.events)

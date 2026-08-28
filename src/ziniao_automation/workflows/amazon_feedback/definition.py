@@ -64,7 +64,14 @@ def build_amazon_feedback_definition(
         display_name="店铺 1-3 星 Feedback 自动删除",
         description="读取中差评，判定请求原因，并按所选模式生成清单或提交请求审核。",
         workflow=workflow,
-        supported_modes=(RunMode.DRY_RUN, RunMode.APPROVAL, RunMode.AUTO),
+        # APPROVAL is deliberately absent.  Its human gate is the 「资金审核台」,
+        # a page built entirely around an amount and a payout account; a
+        # feedback run parked there renders as a CAD 0.00 payout with no hint
+        # of which flow it belongs to or how many requests it would send.
+        # DRY_RUN already gives the same "show me first" loop honestly: it
+        # records the decisions on the Feedback page without submitting, and
+        # the operator switches the schedule to auto when satisfied.
+        supported_modes=(RunMode.DRY_RUN, RunMode.AUTO),
         # Submitting is irreversible and one-shot per feedback, so the default
         # is the mode that only reports what it would do.
         default_mode=RunMode.DRY_RUN,
