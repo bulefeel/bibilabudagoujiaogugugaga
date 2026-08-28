@@ -34,8 +34,14 @@ from .workflows.amazon_disbursement import (
     AmazonPaymentsPage,
     build_amazon_disbursement_definition,
 )
+from .workflows.amazon_feedback import (
+    AmazonFeedbackWorkflow,
+    FeedbackReasonClassifier,
+    FeedbackReviewStore,
+    build_amazon_feedback_definition,
+)
 from .ziniao.factory import build_controller
-from .ziniao.credentials import read_generic_credential
+from .ziniao.credentials import DEFAULT_AI_TARGET, read_generic_credential
 from .ziniao.errors import ZiniaoCredentialError
 
 logger = logging.getLogger(__name__)
@@ -107,7 +113,21 @@ def build_runtime(
         repository=workflow_repository,
         page_adapter=AmazonPaymentsPage(),
     )
-    registry = WorkflowRegistry((build_amazon_disbursement_definition(workflow),))
+    feedback_workflow = AmazonFeedbackWorkflow(
+        repository=workflow_repository,
+        review_store=FeedbackReviewStore(session_factory),
+        # Resolved per call, not snapshotted: re-saving the key in the console
+        # takes effect without restarting the service.
+        classifier=FeedbackReasonClassifier(
+            lambda: read_generic_credential(DEFAULT_AI_TARGET)
+        ),
+    )
+    registry = WorkflowRegistry(
+        (
+            build_amazon_disbursement_definition(workflow),
+            build_amazon_feedback_definition(feedback_workflow),
+        )
+    )
     if notifier is None:
         notification_adapter, delivery_service = _build_notifier(session_factory)
     else:
@@ -121,7 +141,13 @@ def build_runtime(
     )
     workflow_dispatcher = WorkflowDispatcher(
         registry=registry,
-        engines={WorkflowExecutionClass.FINANCIAL.value: workflow_engine},
+        # One engine serves both classes.  It only reaches for guards, the
+        # funds lock and UNCERTAIN_FINANCIAL when a workflow actually arms an
+        # operation, and the feedback workflow arms none.
+        engines={
+            WorkflowExecutionClass.FINANCIAL.value: workflow_engine,
+            WorkflowExecutionClass.STANDARD.value: workflow_engine,
+        },
         repository=workflow_repository,
     )
     run_loader = DatabaseRunLoader(

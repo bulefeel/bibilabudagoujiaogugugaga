@@ -58,6 +58,12 @@ _BUSINESS_EXACT_PATHS = frozenset(
         "/home",
         "/payments/dashboard/index.html",
         "/payments/allstatements/index.html",
+        # Feedback Manager.  A business page missing from this set makes a
+        # successful login look like "needs a human" — that has already cost
+        # one debugging session when the statements page was left out.  The
+        # Angular app appends a "#/" fragment, which urlparse keeps out of the
+        # path, so the exact match still holds.
+        "/feedback-manager/index.html",
     }
 )
 _PAYMENT_DETAILS_EXACT_PATH = "/payments/disburse/details"

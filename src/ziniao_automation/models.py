@@ -625,6 +625,52 @@ class AdminSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class FeedbackReview(TimestampMixin, Base):
+    """One seller-feedback entry considered for removal.
+
+    Amazon accepts a removal request for a given feedback exactly once, so this
+    table — not ``operation_guards`` — is what makes "never retry" physical.
+    Feedback carries no id of its own in the DOM (every row renders with
+    ``id="feedback-details"``), and Amazon files one feedback per order, so the
+    order id is the natural key.
+    """
+
+    __tablename__ = "feedback_reviews"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str | None] = mapped_column(
+        ForeignKey("runs.id", ondelete="SET NULL"), index=True
+    )
+    store_id: Mapped[int] = mapped_column(
+        ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    order_id: Mapped[str] = mapped_column(String(40), nullable=False)
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    order_date: Mapped[str | None] = mapped_column(String(20))
+    # Buyer wording is kept here for the operator to review.  It must never be
+    # written to the JSONL logs; see the redaction policy in the logging module.
+    comment: Mapped[str | None] = mapped_column(Text)
+    category: Mapped[str | None] = mapped_column(String(40))
+    reason_code: Mapped[str | None] = mapped_column(String(8))
+    decision_source: Mapped[str | None] = mapped_column(String(16))
+    decision_note: Mapped[str | None] = mapped_column(Text)
+    state: Mapped[str] = mapped_column(String(24), default="PENDING", nullable=False, index=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    details: Mapped[dict[str, Any]] = mapped_column(
+        MutableDict.as_mutable(JSON), default=dict, nullable=False
+    )
+
+    store: Mapped[Store] = relationship()
+
+    __table_args__ = (
+        UniqueConstraint(
+            "store_id", "marketplace_code", "order_id", name="uq_feedback_review_order"
+        ),
+        CheckConstraint("rating BETWEEN 1 AND 5", name="ck_feedback_review_rating"),
+    )
+
+
 class SystemSetting(Base):
     __tablename__ = "system_settings"
 

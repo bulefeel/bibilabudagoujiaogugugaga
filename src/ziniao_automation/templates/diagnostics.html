@@ -40,6 +40,12 @@
     <label>Chat ID<input name="chat_id" autocomplete="off" required placeholder="通常以 oc_ 开头" value="{{ diagnostics.feishu_chat_id }}"></label>
     <div class="settings-card-actions"><button class="button primary" type="button" data-settings-save="feishu">保存飞书配置</button><button class="button ghost" type="button" data-action="test-feishu" {{ '' if diagnostics.feishu_credential_readable else 'disabled' }}>发送测试消息</button><span class="form-error" data-form-error></span></div>
   </form>
+
+  <form class="settings-card" onsubmit="return false" data-settings-form="ai">
+    <div class="settings-card-head"><b>反馈原因自动判定</b><span class="verify-mark {{ 'ok' if diagnostics.ai_credential_readable else '' }}">{{ '已配置' if diagnostics.ai_credential_readable else '未配置' }}</span></div>
+    <label>API Key<input name="api_key" type="password" autocomplete="new-password" required placeholder="{{ '已配置，如需修改请重新输入' if diagnostics.ai_credential_readable else 'sk-ant-…' }}"><small>仅供「店铺 1-3 星 Feedback 自动删除」判断请求原因使用。<b>这是本服务唯一的对外网络请求</b>，买家留言会发送给该接口。未配置或调用失败时不会猜，全部转为「待人工」。</small></label>
+    <div class="settings-card-actions"><button class="button primary" type="button" data-settings-save="ai">保存 API Key</button><span class="form-error" data-form-error></span></div>
+  </form>
 </section>
 
 <aside class="diagnostic-note"><b>检查顺序</b><ol><li>紫鸟客户端路径存在</li><li>紫鸟与飞书凭据均显示“可读取”</li><li>16851 端口响应后同步店铺</li><li>建档卖家身份，再运行 dry_run</li></ol><p>凭据显示“引用已失效”时，在上方重新填写并保存即可；也可以用命令行 <code>configure ziniao</code> / <code>configure feishu</code>。</p></aside>

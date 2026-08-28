@@ -1293,6 +1293,25 @@
       } catch (exc) { toast(exc.message, true); target.disabled = false; target.textContent = "立即执行"; }
       return;
     }
+    if (action === "save-feedback-reason") {
+      // 只记录原因，不提交。提交仍由该店铺下一次排期运行完成，走同一套
+      // 单次上限和「一条反馈只提交一次」的约束。
+      const reviewId = target.dataset.reviewId || "";
+      const row = target.closest("tr");
+      const picker = row ? row.querySelector(".feedback-reason-picker") : null;
+      const chosen = picker ? picker.value : "";
+      if (!reviewId || !chosen) { toast("请先选择一个请求原因。", true); return; }
+      const [category, reasonCode] = chosen.split("|");
+      if (!category || !reasonCode) { toast("请求原因无效，请刷新页面。", true); return; }
+      target.disabled = true;
+      try {
+        await api(`/api/feedback-reviews/${encodeURIComponent(reviewId)}/decision`,
+          {method:"POST", body:JSON.stringify({category, reason_code: reasonCode})});
+        toast("原因已记录，下次该店铺运行时提交");
+        setTimeout(() => location.reload(), 600);
+      } catch (exc) { toast(exc.message, true); target.disabled = false; }
+      return;
+    }
     if (action === "toggle-schedule") {
       // 最小 PATCH：只发 enabled。不重发配置，所以站点状态变化不会把暂停这条路堵死，
       // 也不会在暂停时顺手把一份可能已经过期的配置写回去。
@@ -1581,6 +1600,7 @@
 
     bindSettings("ziniao", "/api/settings/ziniao", "紫鸟账号已保存到 Windows 凭据管理器");
     bindSettings("feishu", "/api/settings/feishu", "飞书配置已保存到 Windows 凭据管理器");
+    bindSettings("ai", "/api/settings/ai", "API Key 已保存到 Windows 凭据管理器");
 
     $('[data-action="test-feishu"]')?.addEventListener("click", async event => {
       const button = event.currentTarget;

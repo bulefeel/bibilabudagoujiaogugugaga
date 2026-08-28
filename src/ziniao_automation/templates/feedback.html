@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="feedback-intro">
+  <div><p class="eyebrow">ONE SHOT PER FEEDBACK</p><h2>每条中差评，<br>只有一次请求机会。</h2></div>
+  <p>亚马逊对同一条反馈只受理一次删除请求，所以这里的每条记录<b>只出现一次</b>，也<b>永不重试</b>。自动判定拿不准的会停在「待人工」，由你选原因，下次该店铺的定时运行再提交。</p>
+</div>
+
+<section class="feedback-criteria">
+  <b>亚马逊只在以下情况下审查反馈：</b>
+  <ul>{% for item in review_criteria %}<li>{{ item }}</li>{% endfor %}</ul>
+  <small>低分本身不是删除理由。不落在上述任何一类的反馈，即使提交了大概率也不会被受理。</small>
+</section>
+
+<div class="feedback-table-wrap">
+<table class="feedback-table">
+  <thead><tr><th>店铺 / 站点</th><th>评分</th><th>订单</th><th>买家留言</th><th>请求原因</th><th>状态</th><th></th></tr></thead>
+  <tbody>
+  {% for review in reviews %}
+  <tr data-review-id="{{ review.id }}">
+    <td><b>{{ store_names.get(review.store_id, review.store_id) }}</b><small>{{ review.marketplace_code }} · {{ review.order_date or '—' }}</small></td>
+    <td><span class="feedback-stars stars-{{ review.rating }}">{{ '★' * review.rating }}{{ '☆' * (5 - review.rating) }}</span></td>
+    <td><code>{{ review.order_id }}</code></td>
+    <td class="feedback-comment">{{ review.comment or '（无留言）' }}</td>
+    <td class="feedback-reason">
+      {% if review.category and review.reason_code %}
+        <b>{{ category_labels.get(review.category, review.category) }}</b>
+        <small>{{ reason_catalog.get(review.category, {}).get(review.reason_code, review.reason_code) }}</small>
+        <small class="feedback-source">{{ '自动判定' if review.decision_source == 'ai' else '人工选择' if review.decision_source == 'human' else '' }}</small>
+      {% elif review.state == 'NEEDS_HUMAN' %}
+        <select class="feedback-reason-picker" data-review-id="{{ review.id }}">
+          <option value="">选择请求原因…</option>
+          {% for category, reasons in reason_catalog.items() %}
+          <optgroup label="{{ category_labels.get(category, category) }}">
+            {% for code, label in reasons.items() %}<option value="{{ category }}|{{ code }}">{{ label }}</option>{% endfor %}
+          </optgroup>
+          {% endfor %}
+        </select>
+      {% else %}
+        <small class="feedback-muted">{{ review.decision_note or '—' }}</small>
+      {% endif %}
+    </td>
+    <td><span class="status status-{{ review.state|lower }}">{{ review.state|feedback_state_label }}</span>{% if review.submitted_at %}<small>{{ review.submitted_at|local_datetime('%m-%d %H:%M') }}</small>{% endif %}</td>
+    <td>{% if review.state == 'NEEDS_HUMAN' %}<button class="button dark" data-action="save-feedback-reason" data-review-id="{{ review.id }}">保存原因</button>{% endif %}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="7"><div class="blank-slate"><span>反</span><h2>还没有读取到任何反馈</h2><p>为店铺创建一条「店铺 1-3 星 Feedback 自动删除」排期并运行一次，结果会出现在这里。</p></div></td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<p class="feedback-note"><b>状态怎么读：</b>
+<b>已提交</b>＝请求审核已送出，亚马逊是否采纳由它决定，本工具不追踪结果；
+<b>待人工</b>＝自动判定没把握，选个原因后下次运行会提交；
+<b>已跳过</b>＝亚马逊没有对这条给出「请求审核」入口，改不了；
+<b>未确认</b>＝提交按钮点下去了，但页面没确认——<b>不会重试</b>，请到卖家后台自行核对；
+<b>失败</b>＝没能走到提交那一步，同样不会重试。
+</p>
+{% endblock %}

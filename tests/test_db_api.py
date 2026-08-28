@@ -836,7 +836,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260828-no-funds-block" in page.text
+    assert "/static/app.js?v=20260828-feedback-removal" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text
@@ -1277,7 +1277,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
     assert "应用版本 / 构建" in page.text
     assert "0.4.1" in page.text
     assert "数据库迁移版本" in page.text
-    assert "0007" in page.text
+    assert "0008" in page.text
 
 
 def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):

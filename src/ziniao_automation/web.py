@@ -28,9 +28,11 @@ from .db import create_sqlite_engine, database_revision, init_database, make_ses
 from .models import (
     ApprovalRequest,
     Evidence,
+    FeedbackReview,
     OperationGuard,
     Run,
     RunQueueEntry,
+    Store,
     SystemSetting,
     ZiniaoAccount,
 )
@@ -46,9 +48,11 @@ from .repositories import (
 from .schedule_batch import BatchScheduleService, BatchScheduleValidationError
 from .scheduler import ScheduleProjectionReport
 from .schemas import (
+    AiSettingsInput,
     BatchScheduleCreateInput,
     BatchSchedulePreviewInput,
     BootstrapInput,
+    FeedbackDecisionInput,
     FeishuSettingsInput,
     LoginInput,
     MarketplaceSetupInput,
@@ -68,8 +72,22 @@ from .schemas import (
 from .version import __version__, build_commit
 from .workflows import WorkflowRegistry
 from .workflows.amazon_disbursement import build_amazon_disbursement_definition
+from .workflows.amazon_feedback import build_amazon_feedback_definition
+from .workflows.amazon_feedback.config import (
+    AMAZON_REVIEW_CRITERIA,
+    CATEGORY_LABELS,
+    REASON_CATALOG,
+    is_known_reason,
+    reason_label,
+)
+from .workflows.amazon_feedback.review_store import (
+    NEEDS_HUMAN as FEEDBACK_NEEDS_HUMAN,
+    PENDING as FEEDBACK_PENDING,
+    TERMINAL_STATES as FEEDBACK_TERMINAL_STATES,
+)
 from .workflows.errors import WorkflowNotRegistered
 from .ziniao.credentials import (
+    DEFAULT_AI_TARGET,
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
     CredentialStoreError,
@@ -235,6 +253,17 @@ STATUS_LABELS = {
     "EXPIRED": "已过期",
 }
 
+# Feedback entries need their own words.  Sharing STATUS_LABELS would render
+# UNCERTAIN as "已发出，平台尚未显示", which is about money leaving the account.
+FEEDBACK_STATE_LABELS = {
+    "PENDING": "待提交",
+    "NEEDS_HUMAN": "待人工",
+    "SKIPPED": "已跳过",
+    "SUBMITTED": "已提交",
+    "UNCERTAIN": "未确认",
+    "FAILED": "失败",
+}
+
 QUEUE_STATE_LABELS = {
     "READY": "排队中",
     "CLAIMED": "执行中",
@@ -332,6 +361,7 @@ def create_app(
     package_dir = Path(__file__).resolve().parent
     templates = Jinja2Templates(directory=str(package_dir / "templates"))
     templates.env.filters["status_label"] = lambda value: STATUS_LABELS.get(str(value), str(value))
+    templates.env.filters["feedback_state_label"] = lambda value: FEEDBACK_STATE_LABELS.get(str(value), str(value))
     templates.env.filters["queue_state_label"] = lambda value: QUEUE_STATE_LABELS.get(str(value), str(value))
     templates.env.filters["queue_action_label"] = lambda value: QUEUE_ACTION_LABELS.get(str(value), str(value))
     templates.env.filters["money"] = lambda value: "—" if value is None else f"{value:,.2f}"
@@ -602,6 +632,38 @@ def create_app(
         approvals = WorkflowRepository(db).list_pending_approvals()
         return render(request, "approvals.html", {"approvals": approvals}, db=db, page_title="资金审核台")
 
+    @app.get("/feedback", response_class=HTMLResponse)
+    def feedback_page(request: Request, db: Session = Depends(get_session)) -> Response:
+        """Every feedback the automation has ever considered, per store.
+
+        This is the ledger behind "never retry": an entry appears here exactly
+        once and keeps whatever outcome it reached.
+        """
+
+        reviews = list(
+            db.scalars(
+                select(FeedbackReview)
+                .order_by(FeedbackReview.created_at.desc())
+                .limit(500)
+            )
+        )
+        store_names = {
+            int(row.id): str(row.name) for row in db.scalars(select(Store))
+        }
+        return render(
+            request,
+            "feedback.html",
+            {
+                "reviews": reviews,
+                "store_names": store_names,
+                "reason_catalog": REASON_CATALOG,
+                "category_labels": CATEGORY_LABELS,
+                "review_criteria": AMAZON_REVIEW_CRITERIA,
+            },
+            db=db,
+            page_title="反馈处理台",
+        )
+
     @app.get("/runs", response_class=HTMLResponse)
     def runs_page(request: Request, db: Session = Depends(get_session)) -> Response:
         runs = WorkflowRepository(db).list_runs(limit=200)
@@ -672,6 +734,9 @@ def create_app(
             "feishu_credential_readable": bool(
                 feishu_ref and credential_exists(feishu_ref)
             ),
+            # Classifier key for the feedback workflow.  Its absence is not an
+            # error: without it every entry simply waits for a human.
+            "ai_credential_readable": credential_exists(DEFAULT_AI_TARGET),
             "host": f"{settings.host}:{settings.port}",
             # Non-secret fields only, so the forms can be pre-filled without a
             # round trip.  Passwords and App Secret are never sent to the page —
@@ -957,6 +1022,26 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
             raise HTTPException(502, f"发送失败：{_safe_probe_error(exc)}") from exc
         return {"status": "sent"}
+
+    @api.post("/settings/ai", status_code=200)
+    async def save_ai_settings(
+        payload: AiSettingsInput,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+    ) -> dict[str, Any]:
+        """Store the classifier key beside the other two, and verify readback."""
+
+        try:
+            write_generic_credential(
+                DEFAULT_AI_TARGET, {"api_key": payload.api_key}, username="ai"
+            )
+        except (CredentialStoreError, ValueError, OSError) as exc:
+            raise HTTPException(502, f"写入 Windows 凭据管理器失败：{exc}") from exc
+        if not credential_matches(DEFAULT_AI_TARGET, {"api_key": payload.api_key}):
+            raise HTTPException(
+                502,
+                "凭据写入后无法回读，请检查安全软件是否拦截了 Windows 凭据管理器。",
+            )
+        return {"status": "saved"}
 
     @api.post("/settings/ziniao", status_code=200)
     async def save_ziniao_settings(
@@ -1962,6 +2047,44 @@ def create_app(
         )
         db.commit()
         return {"status": "acknowledged", "marketplace_code": marketplace_code}
+
+    @api.post("/feedback-reviews/{review_id}/decision", status_code=200)
+    async def api_decide_feedback_reason(
+        review_id: str,
+        payload: FeedbackDecisionInput,
+        _: AuthenticatedAdmin = Depends(verified_admin),
+        db: Session = Depends(get_session),
+    ) -> dict[str, str]:
+        """Let an operator pick the reason the classifier declined to choose.
+
+        This only records the decision.  Nothing is submitted here — the entry
+        moves to ``PENDING`` and the next scheduled run of that store submits
+        it, under the same per-run cap and the same one-shot guarantee.
+        """
+
+        review = db.get(FeedbackReview, review_id)
+        if review is None:
+            raise HTTPException(404, "找不到这条反馈记录")
+        if review.state in FEEDBACK_TERMINAL_STATES:
+            # Already submitted; a second request is exactly what must never
+            # happen, so this is refused rather than quietly ignored.
+            raise HTTPException(
+                409, f"这条反馈已经是「{review.state}」，不能再改原因或重新提交"
+            )
+        if not is_known_reason(payload.category, payload.reason_code):
+            raise HTTPException(422, "请求原因不在亚马逊提供的选项里")
+
+        review.category = payload.category
+        review.reason_code = payload.reason_code
+        review.decision_source = "human"
+        review.decision_note = reason_label(payload.category, payload.reason_code)
+        review.state = FEEDBACK_PENDING
+        db.commit()
+        return {
+            "status": FEEDBACK_PENDING,
+            "category": payload.category,
+            "reason_code": payload.reason_code,
+        }
 
     @api.post("/runs/{run_id}/settle", status_code=200)
     async def api_settle_run(run_id: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:

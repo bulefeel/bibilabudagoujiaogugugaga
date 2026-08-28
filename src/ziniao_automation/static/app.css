@@ -170,3 +170,34 @@
 /* 回读跑过但仍没查到，和「压根没跑」在页面上必须能区分开——否则操作员只会反复点。 */
 .guard-reconciled{color:#5c6b62;font-weight:700}
 .guard-reason{flex-basis:100%;color:#765950}
+
+/* ── 反馈处理台 ────────────────────────────────────────────────────────────
+   提交请求审核是不可逆的，所以这张表的重点是「看清楚再决定」：留言要能读完整
+   （不像流水表那样 nowrap 截断），星级要一眼分得出中差评，状态要有自己的措辞。 */
+.feedback-intro{display:grid;grid-template-columns:1fr 1fr;align-items:end;margin-bottom:30px}
+.feedback-intro h2{font:39px/1.2 var(--serif);margin:0}
+.feedback-intro>p{max-width:520px;line-height:1.9;color:var(--muted);border-left:2px solid var(--red);padding-left:20px}
+.feedback-criteria{border:1px solid var(--line);background:#e9e4d6;padding:16px 20px;margin-bottom:22px}
+.feedback-criteria b{font-size:11px}
+.feedback-criteria ul{margin:9px 0;padding-left:20px;color:var(--muted);font-size:11px;line-height:1.9}
+.feedback-criteria small{color:#89601e}
+.feedback-table-wrap{border:1px solid var(--line);background:rgba(251,250,245,.55);overflow:auto}
+.feedback-table{width:100%;border-collapse:collapse;text-align:left}
+.feedback-table td{vertical-align:top}
+/* 买家留言是判断依据，必须完整可读；这里刻意不用流水表的 nowrap。 */
+.feedback-comment{max-width:330px;white-space:normal;line-height:1.7;color:#4a5049}
+.feedback-reason{min-width:190px}
+.feedback-reason b{font-size:11px}
+.feedback-source{color:#7d8880;font:9px var(--mono)}
+.feedback-muted{color:var(--muted)}
+.feedback-reason-picker{width:100%;border:1px solid #aca697;background:#f8f5ec;padding:9px 10px;outline:none}
+.feedback-reason-picker:focus{border-color:var(--red);box-shadow:0 0 0 2px rgba(180,60,47,.1)}
+.feedback-stars{font-size:13px;letter-spacing:1px;white-space:nowrap;color:#b0a894}
+/* 1-3 星是本流程的作用范围，用告警色；4-5 星永远不该出现在这张表里。 */
+.stars-1,.stars-2,.stars-3{color:var(--red)}
+.feedback-note{margin:18px 0 0;border-left:3px solid var(--ink);background:#e5dfd1;padding:16px 22px;color:#5d5749;font-size:11px;line-height:1.9}
+/* 已提交＝请求已送出但亚马逊未必采纳，用金色而不是绿色，避免读成「已删除」。 */
+.status-submitted:before{background:var(--gold)}
+.status-needs_human:before{background:#bd7630}
+.status-skipped:before{background:#8b938a}
+@media(max-width:760px){.feedback-intro{grid-template-columns:1fr}.feedback-intro>p{margin-top:20px}.feedback-comment{max-width:200px}.feedback-table-wrap{margin-left:-17px;margin-right:-17px;border-left:0;border-right:0}}

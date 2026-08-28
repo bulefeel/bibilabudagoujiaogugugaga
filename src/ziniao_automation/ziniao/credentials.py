@@ -21,6 +21,7 @@ class CredentialStoreError(ZiniaoError):
 # silently configuring nothing.
 DEFAULT_ZINIAO_TARGET = "ziniao-automation/ziniao/main"
 DEFAULT_FEISHU_TARGET = "ziniao-automation/feishu/main"
+DEFAULT_AI_TARGET = "ziniao-automation/ai/main"
 
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
@@ -34,6 +35,8 @@ ALLOWED_FIELDS = frozenset(
         "app_id",
         "app_secret",
         "chat_id",
+        # Cloud classifier key for the feedback removal workflow.
+        "api_key",
     }
 )
 

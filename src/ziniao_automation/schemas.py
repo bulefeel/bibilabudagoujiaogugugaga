@@ -68,6 +68,23 @@ class ZiniaoSettingsInput(ApiModel):
     password: str = Field(min_length=1, max_length=500)
 
 
+class AiSettingsInput(ApiModel):
+    """Cloud classifier key for the feedback removal workflow."""
+
+    api_key: str = Field(min_length=1, max_length=500)
+
+
+class FeedbackDecisionInput(ApiModel):
+    """An operator choosing the removal reason the classifier declined to pick.
+
+    Both values are re-checked against the code whitelist before use; the
+    console can only ever offer what Amazon actually lists.
+    """
+
+    category: str = Field(min_length=1, max_length=40)
+    reason_code: str = Field(min_length=1, max_length=8)
+
+
 class StoreCreate(ApiModel):
     name: str = Field(min_length=1, max_length=160)
     selector_type: Literal["oauth", "id"]

@@ -166,7 +166,7 @@ def test_global_credential_error_pauses_single_and_bulk_setup_without_store_fail
     assert "bulkStoreSetup.failed += 1" not in bulk
     assert "凭据保存后重试当前店铺" in script
     assert "不会继续打开下一家" in script
-    assert "app.js') }}?v=20260828-no-funds-block" in base
+    assert "app.js') }}?v=20260828-feedback-removal" in base
 
 
 def test_bulk_refresh_revalidates_probe_before_showing_auth_actions() -> None:
@@ -343,4 +343,4 @@ def test_legacy_setup_routes_are_not_left_in_the_frontend_and_cache_is_bumped() 
         "detect-all-marketplace-setups",
     ):
         assert legacy not in combined
-    assert "20260828-no-funds-block" in base
+    assert "20260828-feedback-removal" in base

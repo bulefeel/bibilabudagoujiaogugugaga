@@ -535,17 +535,39 @@ class WorkflowEngine:
 
     @asynccontextmanager
     async def _financial_session(self, run: WorkflowRun) -> AsyncIterator[Any]:
+        """Open the store's browser, taking the funds lock only when required.
+
+        ``financial_session`` acquires the *global* funds lock, which serialises
+        every store's payouts.  That is correct for money, but a workflow that
+        merely reads and clicks non-financial controls can run for minutes and
+        would then block payouts everywhere — and Amazon rate limits on-demand
+        disbursement on a rolling 24-hour window, so a delayed payout is a
+        missed one.  The per-store lock inside ``session`` still prevents two
+        runs from driving the same Ziniao browser.
+        """
+
         from ziniao_automation.ziniao.models import ProfileSelector
 
         selector = ProfileSelector(run.store.selector_type, run.store.selector_value)
-        factory = getattr(self.browser_sessions, "financial_session", None)
-        context = (
-            factory(selector, store_key=run.store.id)
-            if callable(factory)
-            else self.browser_sessions.session(selector, store_key=run.store.id)
-        )
-        async with context as handle:
+        locking = getattr(self.browser_sessions, "financial_session", None)
+        plain = getattr(self.browser_sessions, "session", None)
+        # Providers that cannot open a non-financial session leave nothing to
+        # choose; this is a capability check, not a fallback that hides an error.
+        use_lock = self._needs_funds_lock(run) or not callable(plain)
+        factory = locking if callable(locking) and use_lock else plain
+        if factory is None:
+            raise RuntimeError("浏览器会话提供方既没有 session 也没有 financial_session")
+        async with factory(selector, store_key=run.store.id) as handle:
             yield handle
+
+    def _needs_funds_lock(self, run: WorkflowRun) -> bool:
+        try:
+            definition = self.registry.definition(run.workflow)
+        except Exception:
+            # An unregistered workflow cannot be reasoned about; take the
+            # stricter lock rather than assume it moves no money.
+            return True
+        return bool(getattr(definition, "requires_financial_lock", True))
 
     async def _notify(self, workflow: Any, run: WorkflowRun, status: RunStatus) -> None:
         try:
