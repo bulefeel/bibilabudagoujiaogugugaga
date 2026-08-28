@@ -68,14 +68,15 @@ class BatchScheduleService:
             require_request_id=False,
         )
         targets = self._preview_targets(prepared)
-        eligible = all(item["eligible"] for item in targets)
+        # 一个店铺不合格不再拖垮整批：能建的建，建不了的自动摘掉。操作员勾选十家、
+        # 其中两家还没建档时，原来的 all-or-nothing 会写零条，逼他回去一个个取消勾选。
+        # 预检会把每一家的去向逐条列出来，确认之前看得见，所以不算「悄悄少建」。
         eligible_count = sum(1 for item in targets if item["eligible"])
+        eligible = eligible_count > 0
         return {
             "eligible": eligible,
             "eligible_count": eligible_count,
-            # Creation is all-or-nothing: one invalid target means this exact
-            # request will write zero schedules.
-            "created_count": len(targets) if eligible else 0,
+            "created_count": eligible_count,
             "definition_hash": prepared.definition_hash,
             "targets": targets,
             "normalized_template": dict(prepared.template),
@@ -108,28 +109,43 @@ class BatchScheduleService:
             return existing
 
         targets = self._preview_targets(prepared)
-        eligible = all(item["eligible"] for item in targets)
+        # 跳过的目标不构成阻断：这一批仍然可以为其余店铺创建。
+        # 一个店铺不合格不再拖垮整批：能建的建，建不了的自动摘掉。操作员勾选十家、
+        # 其中两家还没建档时，原来的 all-or-nothing 会写零条，逼他回去一个个取消勾选。
+        # 预检会把每一家的去向逐条列出来，确认之前看得见，所以不算「悄悄少建」。
         eligible_count = sum(1 for item in targets if item["eligible"])
+        eligible = eligible_count > 0
         preview = {
             "eligible": eligible,
             "eligible_count": eligible_count,
-            "created_count": len(targets) if eligible else 0,
+            "created_count": eligible_count,
             "definition_hash": prepared.definition_hash,
             "targets": targets,
             "normalized_template": dict(prepared.template),
         }
-        if not preview["eligible"]:
+        # 只有一条都建不出来时才拒绝——否则空批次会让「已创建」的回执骗人。
+        # 两种「零条」原因不同，给的话也不同。
+        if not eligible_count:
+            if all(item["skipped"] for item in targets):
+                raise ConflictError(
+                    "所选店铺都已有同一流程的排期（含已暂停），本次没有需要创建的内容。"
+                )
             raise BatchScheduleValidationError(preview)
 
         definition_json = {
             "store_ids": list(prepared.store_ids),
             "template": dict(prepared.template),
         }
+        # 只为真正要创建的店铺建行；definition_json 保留原始请求（幂等键算的是
+        # 请求本身，不是结果），schedule_count 记实际建了几条。
+        create_store_ids = [
+            item["store_id"] for item in targets if item["eligible"]
+        ]
         batch = ScheduleBatch(
             request_id=prepared.request_id,
             definition_hash=prepared.definition_hash,
             definition_json=definition_json,
-            schedule_count=len(prepared.store_ids),
+            schedule_count=len(create_store_ids),
         )
 
         # Batch and children stay in the same outer transaction.  Releasing a
@@ -141,7 +157,7 @@ class BatchScheduleService:
         config = dict(prepared.template["workflow_config"])
         marketplace_codes = list(config.get("marketplace_codes") or ())
         schedules: list[Schedule] = []
-        for order, store_id in enumerate(prepared.store_ids, start=1):
+        for order, store_id in enumerate(create_store_ids, start=1):
             schedule = Schedule(
                 store_id=store_id,
                 batch_id=batch.id,
@@ -169,7 +185,12 @@ class BatchScheduleService:
             self.session.add(schedule)
             schedules.append(schedule)
         self.session.flush()
-        return self._result(batch, schedules, status="created")
+        return self._result(
+            batch,
+            schedules,
+            status="created",
+            skipped_count=sum(1 for item in targets if item["skipped"]),
+        )
 
     def _begin_immediate_if_available(self) -> None:
         """Serialize SQLite idempotency checks before the first database read.
@@ -347,13 +368,25 @@ class BatchScheduleService:
                         )
                     except (ValueError, LookupError) as exc:
                         reasons.append(str(exc))
+            # 「已经有一条了」不是错误，是无事可做。放进 reasons 会让整批失败，
+            # 因为 eligible 是「全体合格才创建」——所以它必须是独立的一维。
+            already = (
+                store is not None
+                and not reasons
+                and repository.existing_workflow_schedule_id(
+                    store.id, prepared.template["workflow"]
+                )
+                is not None
+            )
             targets.append(
                 {
                     "store_id": store_id,
                     "store_name": store_name,
-                    "eligible": not reasons,
+                    "eligible": not reasons and not already,
+                    "skipped": bool(already),
                     "order": order,
                     "reasons": reasons,
+                    "skip_reason": "该店铺已有同一流程的排期（含已暂停），本次跳过" if already else "",
                 }
             )
         return targets
@@ -383,9 +416,13 @@ class BatchScheduleService:
         schedules: Sequence[Schedule],
         *,
         status: str,
+        skipped_count: int = 0,
     ) -> dict[str, Any]:
         return {
             "status": status,
+            # 让回执说实话：勾了 5 家但只建了 3 家时，操作员必须看得出另外 2 家
+            # 是被跳过而不是失败了。
+            "skipped_count": skipped_count,
             "batch_id": batch.id,
             "request_id": batch.request_id,
             "definition_hash": batch.definition_hash,

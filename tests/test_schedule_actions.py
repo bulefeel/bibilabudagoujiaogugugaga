@@ -263,3 +263,102 @@ def test_schedule_action_http_contract(database):
             "schedule_id": schedule_id,
             "scheduler_refreshed": True,
         }
+
+
+def _ui_edit_payload(**changes):
+    """Exactly what the edit dialog PATCHes — every field, not just the delta."""
+
+    payload = {
+        "name": "循环提现",
+        "mode": "dry_run",
+        "workflow_config": {"marketplace_codes": ["CA"]},
+        "marketplace_codes": ["CA"],
+        "first_run_at": "2026-01-01T01:00:00+00:00",
+        "interval_minutes": 1500,
+        "timezone": "Asia/Singapore",
+        "enabled": False,
+    }
+    payload.update(changes)
+    return payload
+
+
+def _turn_the_site_off(app, schedule_id: int) -> None:
+    with app.state.sessions() as db:
+        store_id = db.get(Schedule, schedule_id).store_id
+        for site in db.query(StoreMarketplace).filter_by(store_id=store_id):
+            site.enabled = False
+        db.commit()
+
+
+def test_a_schedule_can_always_be_paused_even_after_a_site_is_turned_off(database):
+    """Pausing must never depend on the targets still being usable.
+
+    Requiring valid sites before allowing a pause made an enabled schedule
+    unstoppable the moment one of its marketplaces was switched off: the edit
+    form resends the whole config, so every save 422'd on the site check, and
+    deleting the rule — which also detaches its run history — was the only way
+    out. ``update`` already gates the store and identity checks on the resulting
+    enabled state; the site check simply was not.
+    """
+
+    settings, factory = database
+    schedule_id = seed(factory, enabled=True)
+    app = create_app(settings, automation_service=Automation())
+
+    with TestClient(app) as client:
+        headers = {"X-CSRF-Token": bootstrap(client)}
+        _turn_the_site_off(app, schedule_id)
+
+        paused = client.patch(
+            f"/api/schedules/{schedule_id}",
+            json=_ui_edit_payload(enabled=False),
+            headers=headers,
+        )
+
+        assert paused.status_code == 200, paused.text
+        assert paused.json()["enabled"] is False
+
+
+def test_pausing_needs_only_the_enabled_flag(database):
+    """The row toggle sends the smallest possible change.
+
+    Resending the whole configuration just to pause is what dragged the site
+    check into a path that had no business running it, and it would also write a
+    possibly-stale config back on the way past.
+    """
+
+    settings, factory = database
+    schedule_id = seed(factory, enabled=True)
+    app = create_app(settings, automation_service=Automation())
+
+    with TestClient(app) as client:
+        headers = {"X-CSRF-Token": bootstrap(client)}
+        _turn_the_site_off(app, schedule_id)
+
+        paused = client.patch(
+            f"/api/schedules/{schedule_id}", json={"enabled": False}, headers=headers
+        )
+
+        assert paused.status_code == 200, paused.text
+        assert paused.json()["enabled"] is False
+
+
+def test_enabling_still_refuses_a_schedule_whose_sites_are_off(database):
+    """The guard keeps its real job: it stops you STARTING something unusable."""
+
+    settings, factory = database
+    schedule_id = seed(factory, enabled=False)
+    app = create_app(settings, automation_service=Automation())
+
+    with TestClient(app) as client:
+        headers = {"X-CSRF-Token": bootstrap(client)}
+        _turn_the_site_off(app, schedule_id)
+
+        resumed = client.patch(
+            f"/api/schedules/{schedule_id}", json={"enabled": True}, headers=headers
+        )
+
+        assert resumed.status_code == 422, resumed.text
+        assert "站点" in resumed.text, "拒绝的理由必须点明是站点问题"
+        with app.state.sessions() as db:
+            assert db.get(Schedule, schedule_id).enabled is False

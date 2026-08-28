@@ -331,7 +331,16 @@ def test_unrelated_projection_failure_does_not_mark_new_batch_unrefreshed(
     }
 
 
-def test_invalid_target_keeps_batch_transaction_empty(batch_client) -> None:
+def test_an_unusable_target_is_dropped_over_http_without_stopping_the_rest(
+    batch_client,
+) -> None:
+    """Over HTTP too: the usable stores get their schedules, the rest are dropped.
+
+    Selecting a handful of stores and having the whole request write nothing
+    because one of them is not enrolled yet made the operator untick them by
+    hand. The preview names every store's fate before the confirm.
+    """
+
     app, client, headers, refresh = batch_client
     valid = _seed_store(app, name="valid")
     invalid = _seed_store(app, name="disabled", enabled=False)
@@ -343,10 +352,31 @@ def test_invalid_target_keeps_batch_transaction_empty(batch_client) -> None:
         "/api/schedules/batch/preview", json=payload, headers=headers
     )
     assert preview.status_code == 200
-    assert preview.json()["eligible"] is False
+    assert preview.json()["eligible"] is True
+    assert preview.json()["created_count"] == 1
     assert preview.json()["targets"][1]["reasons"]
 
+    created = client.post("/api/schedules/batch", json=payload, headers=headers)
+
+    assert created.status_code == 201, created.text
+    assert created.json()["created_count"] == 1
+    assert refresh.calls == 1
+    with app.state.sessions() as db:
+        rows = list(db.scalars(select(Schedule)))
+        assert [row.store_id for row in rows] == [valid]
+
+
+def test_a_request_with_no_usable_target_still_writes_nothing(batch_client) -> None:
+    """The floor holds: nothing creatable means no batch row at all."""
+
+    app, client, headers, refresh = batch_client
+    invalid = _seed_store(app, name="disabled", enabled=False)
+    payload = _payload(
+        [invalid], request_id="87654321-4321-4321-8321-cba987654321"
+    )
+
     rejected = client.post("/api/schedules/batch", json=payload, headers=headers)
+
     assert rejected.status_code == 422
     assert rejected.json()["detail"]["eligible"] is False
     assert refresh.calls == 0

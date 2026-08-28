@@ -56,7 +56,17 @@
       首次<br>{{ item.first_run_at|local_datetime('%m-%d %H:%M') }}
     </div>
     <div class="schedule-state">
-      <span class="switch-label {{ 'on' if item.enabled else '' }}">{{ '已启用' if item.enabled else '已停用' }}</span>
+      <!-- 一个真开关，不是标签。原来这里只写着「已启用」，要暂停得进「编辑」找那个
+           叫「保存后启用」的勾选框，而那条路会把整份配置重发一遍——任何一个站点被
+           关掉，保存就 422，于是只剩删除一条路。 -->
+      <button
+        type="button"
+        class="switch-label switch-toggle {{ 'on' if item.enabled else '' }}"
+        data-action="toggle-schedule"
+        data-schedule-id="{{ item.id }}"
+        data-schedule-name="{{ item.name }}"
+        data-schedule-enabled="{{ 'true' if item.enabled else 'false' }}"
+      >{{ '已启用' if item.enabled else '已停用' }}</button>
       <small class="next-run">{{ item.next_run_at|local_datetime('%Y-%m-%d %H:%M') if item.next_run_at else '尚未计算下次运行' }}</small>
     </div>
     <div class="schedule-actions">

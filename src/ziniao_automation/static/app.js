@@ -980,12 +980,24 @@
   function renderBatchPreview(form,data){
     const panel=$("[data-batch-preview]",form);if(!panel)return;const targets=Array.isArray(data?.targets)?data.targets:[],eligible=data?.eligible===true,eligibleCount=Number(data?.eligible_count??targets.filter(item=>item?.eligible===true).length),count=eligible?Number(data?.created_count??targets.length):0,meta=workflowMeta(form),sites=collectWorkflowConfig(form).marketplace_codes||[];panel.hidden=false;
     const countNode=$("[data-batch-preview-count]",panel);if(countNode)countNode.textContent="本次将创建 "+count+" 条";
-    const message=$("[data-batch-preview-message]",panel);if(message)message.textContent=eligible?"所有选中的店铺均已通过预检，可以确认创建。":"预检未通过：已选 "+targets.length+" 家，其中 "+eligibleCount+" 家符合条件，本次仍会创建 0 条。请取消不合格店铺，或先完成店铺建档后再试。";
+    // 三种去向必须分开说：会创建 / 已有排期跳过 / 不合格自动摘掉。
+    // 后两者都不阻断，但含义完全不同——一个无事可做，一个是店铺还没弄好。
+    const skippedCount=targets.filter(item=>item?.skipped===true).length;
+    const blockedCount=targets.filter(item=>item?.eligible!==true&&item?.skipped!==true).length;
+    const dropped=[];
+    if(skippedCount)dropped.push(skippedCount+" 家已有同一流程的排期");
+    if(blockedCount)dropped.push(blockedCount+" 家尚不符合条件");
+    const message=$("[data-batch-preview-message]",panel);
+    if(message)message.textContent=eligible
+      ?(dropped.length?"将为 "+count+" 家创建；自动跳过 "+dropped.join("、")+"，不影响本次创建。":"所有选中的店铺均已通过预检，可以确认创建。")
+      :(skippedCount===targets.length
+        ?"所选店铺都已有同一流程的排期，本次没有需要创建的内容。想改就直接编辑或启用现有排期。"
+        :"已选 "+targets.length+" 家，没有一家符合条件，本次会创建 0 条。请先完成下面列出的店铺建档。");
     const list=$("[data-batch-preview-list]",panel);if(!list)return;list.replaceChildren();
-    targets.sort((a,b)=>Number(a.order||0)-Number(b.order||0)).forEach(item=>{const row=document.createElement("div");row.className="batch-preview-row "+(item.eligible?"ok":"bad");const name=document.createElement("b"),order=Number(item.order||0),siteCopy=sites.length?" · "+sites.join(" / "):" · 店铺级";name.textContent="#"+order+" "+String(item.store_name||("店铺 #"+item.store_id))+" · "+String(meta?.display_name||meta?.key||"流程")+siteCopy;const reason=document.createElement("span"),reasons=Array.isArray(item.reasons)?item.reasons:[];reason.textContent=item.eligible?"符合条件":(reasons.join("；")||"不符合该流程要求");row.append(name,reason);list.append(row);const targetRow=scheduleStoreRow(form,item.store_id),state=targetRow&&$("[data-store-target-state]",targetRow);if(state){state.textContent=item.eligible?"可创建":"需处理";state.className="store-target-state "+(item.eligible?"ok":"bad");}});
-    form.dataset.batchPreviewHash=String(data.definition_hash||"");form.dataset.previewed=eligible?"true":"false";const submit=$("[data-schedule-submit]",form);if(submit)submit.textContent=eligible?"确认创建 "+count+" 条排期":"重新预检";
+    targets.sort((a,b)=>Number(a.order||0)-Number(b.order||0)).forEach(item=>{const row=document.createElement("div");row.className="batch-preview-row "+(item.skipped?"skip":(item.eligible?"ok":"bad"));const name=document.createElement("b"),order=Number(item.order||0),siteCopy=sites.length?" · "+sites.join(" / "):" · 店铺级";name.textContent="#"+order+" "+String(item.store_name||("店铺 #"+item.store_id))+" · "+String(meta?.display_name||meta?.key||"流程")+siteCopy;const reason=document.createElement("span"),reasons=Array.isArray(item.reasons)?item.reasons:[];reason.textContent=item.eligible?"符合条件":(item.skipped?(String(item.skip_reason||"已有同一流程的排期，本次跳过")):(reasons.join("；")||"不符合该流程要求"));row.append(name,reason);list.append(row);const targetRow=scheduleStoreRow(form,item.store_id),state=targetRow&&$("[data-store-target-state]",targetRow);if(state){state.textContent=item.eligible?"可创建":(item.skipped?"已有排期":"需处理");state.className="store-target-state "+(item.eligible?"ok":(item.skipped?"skip":"bad"));}});
+    form.dataset.batchPreviewHash=String(data.definition_hash||"");form.dataset.previewed=eligible?"true":"false";const submit=$("[data-schedule-submit]",form);if(submit)submit.textContent=eligible?"确认创建 "+count+" 条排期":"没有可创建的店铺";
   }  async function previewBatchSchedule(form){const error=$("[data-form-error]",form),storeIds=selectedScheduleStoreIds(form);if(!storeIds.length){error.textContent="请至少选择一家店铺。";setScheduleStep(form,2);return false;}const nonce=invalidateSchedulePreview(form),payload=buildBatchPayload(form),payloadJson=JSON.stringify(payload),button=$("[data-schedule-submit]",form);if(button){button.disabled=true;button.textContent="预检中…";}try{const result=await api("/api/schedules/batch/preview",{method:"POST",body:payloadJson});if(form.dataset.previewNonce!==nonce)return false;form.dataset.batchPreviewPayload=payloadJson;renderBatchPreview(form,result);return result?.eligible===true;}catch(exc){if(form.dataset.previewNonce===nonce)error.textContent=exc.message;return false;}finally{if(button&&form.dataset.previewNonce===nonce)button.disabled=false;}}
-  async function createBatchSchedule(form,payloadJson){const error=$("[data-form-error]",form),button=$("[data-schedule-submit]",form);if(button){button.disabled=true;button.textContent="正在创建…";}try{const result=await api("/api/schedules/batch",{method:"POST",body:payloadJson}),count=Number(result.created_count||result.schedules?.length||0),refreshWarning=result.scheduler_refreshed===false?String(result.warning||"排期已保存，但定时器尚未刷新。请在本页点击重试，不要重新新建。"):"";toast(refreshWarning||(result.status==="existing"?"相同批次已存在，未重复创建":`已创建 ${count} 条排期`),Boolean(refreshWarning));if(refreshWarning){setScheduleRefreshPending(form,true);error.textContent=refreshWarning;if(button){button.disabled=false;button.textContent="重试刷新定时器";}return false;}setScheduleRefreshPending(form,false);setTimeout(()=>location.reload(),650);return true;}catch(exc){if(exc.detail&&typeof exc.detail==="object"&&Array.isArray(exc.detail.targets))renderBatchPreview(form,exc.detail);error.textContent=exc.message;if(button){button.disabled=false;button.textContent=form.dataset.schedulerRefreshPending==="true"?"重试刷新定时器":"确认创建排期";}return false;}}
+  async function createBatchSchedule(form,payloadJson){const error=$("[data-form-error]",form),button=$("[data-schedule-submit]",form);if(button){button.disabled=true;button.textContent="正在创建…";}try{const result=await api("/api/schedules/batch",{method:"POST",body:payloadJson}),count=Number(result.created_count||result.schedules?.length||0),refreshWarning=result.scheduler_refreshed===false?String(result.warning||"排期已保存，但定时器尚未刷新。请在本页点击重试，不要重新新建。"):"";const skipped=Number(result.skipped_count||0);toast(refreshWarning||(result.status==="existing"?"相同批次已存在，未重复创建":`已创建 ${count} 条排期`+(skipped?`，跳过 ${skipped} 家已有排期的店铺`:"")),Boolean(refreshWarning));if(refreshWarning){setScheduleRefreshPending(form,true);error.textContent=refreshWarning;if(button){button.disabled=false;button.textContent="重试刷新定时器";}return false;}setScheduleRefreshPending(form,false);setTimeout(()=>location.reload(),650);return true;}catch(exc){if(exc.detail&&typeof exc.detail==="object"&&Array.isArray(exc.detail.targets))renderBatchPreview(form,exc.detail);error.textContent=exc.message;if(button){button.disabled=false;button.textContent=form.dataset.schedulerRefreshPending==="true"?"重试刷新定时器":"确认创建排期";}return false;}}
 
   $$('[data-api-form]').forEach(form => form.addEventListener("submit", async event => {
     event.preventDefault(); const error = $("[data-form-error]", form); if (error) error.textContent = "";
@@ -1264,6 +1276,22 @@
         toast("任务已进入执行队列");
         location.href = data.redirect || `/runs/${data.run_id}`;
       } catch (exc) { toast(exc.message, true); target.disabled = false; target.textContent = "立即执行"; }
+      return;
+    }
+    if (action === "toggle-schedule") {
+      // 最小 PATCH：只发 enabled。不重发配置，所以站点状态变化不会把暂停这条路堵死，
+      // 也不会在暂停时顺手把一份可能已经过期的配置写回去。
+      const id = Number(target.dataset.scheduleId);
+      if (!validPositiveId(id)) { toast("排期编号无效，请刷新页面。", true); return; }
+      const wasEnabled = target.dataset.scheduleEnabled === "true";
+      const name = target.dataset.scheduleName || `排期 #${id}`;
+      if (wasEnabled && !(await confirmAction(`暂停「${name}」吗？定时器会立刻停止，规则和运行历史都保留，随时可以再启用。`))) return;
+      target.disabled = true;
+      try {
+        const result = await api(`/api/schedules/${id}`, {method:"PATCH", body:JSON.stringify({enabled: !wasEnabled})});
+        toast(result.enabled ? "排期已启用" : "排期已暂停");
+        setTimeout(() => location.reload(), 600);
+      } catch (exc) { toast(exc.message, true); target.disabled = false; }
       return;
     }
     if (action === "delete-schedule") {

@@ -158,3 +158,12 @@
 /* 「我已在亚马逊核对，结案」——和同排的「确认未发出，释放」是一对人工出口，
    外观必须一致，否则看起来像两种不同分量的操作。 */
 .guard-acknowledge{border-color:#b97065;color:#8e2f24}
+/* 「已启用/已停用」现在是按钮而不是标签，需要可点的样式与反馈。 */
+.switch-toggle{border:0;cursor:pointer;font:inherit;font-size:10px;padding:5px 8px}
+.switch-toggle:hover{box-shadow:0 2px 8px rgba(24,37,32,.16)}
+.switch-toggle:disabled{opacity:.45;cursor:not-allowed;box-shadow:none}
+/* 批量预检里「已有排期，跳过」既不是通过也不是失败——用中性的琥珀色，
+   避免操作员把跳过读成失败而去排查一个并不存在的问题。 */
+.batch-preview-row.skip span{color:#89601e}
+/* 店铺列表右侧的「已有排期」：跳过是中性的，不该和「需处理」共用红色。 */
+.store-target-state.skip{color:#89601e}

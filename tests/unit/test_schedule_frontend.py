@@ -93,3 +93,38 @@ def test_schedule_marketplaces_follow_the_selected_store_configuration() -> None
     assert "旧排期包含当前未启用的站点" in script
 
 
+
+
+def test_the_row_has_a_real_pause_switch_not_just_a_label() -> None:
+    """Pausing has to be one click that sends only ``enabled``.
+
+    The row used to show 「已启用」 as plain text, so stopping a schedule meant
+    opening 编辑, finding a checkbox labelled 「保存后启用」 — wording written for
+    the create flow — and saving. That path resends the whole configuration,
+    which is how a rule became unstoppable once one of its sites was switched
+    off; deleting it, which also detaches its run history, was the only way out.
+    """
+
+    template = (PROJECT_ROOT / "src/ziniao_automation/templates/schedules.html").read_text(
+        encoding="utf-8"
+    )
+    script = (PROJECT_ROOT / "src/ziniao_automation/static/app.js").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'data-action="toggle-schedule"' in template
+    assert "switch-toggle" in template
+    assert 'data-schedule-enabled="{{' in template, "按钮要带上当前状态，否则点了不知道往哪切"
+
+    handler = script[
+        script.index('if (action === "toggle-schedule")') :
+        script.index('if (action === "delete-schedule")')
+    ]
+    # The smallest possible change: no config travels with a pause.
+    assert 'JSON.stringify({enabled: !wasEnabled})' in handler
+    assert "workflow_config" not in handler
+    assert "marketplace_codes" not in handler
+    assert 'method:"PATCH"' in handler
+    # Stopping is confirmed, resuming is not — only one of them interrupts work.
+    assert "confirmAction" in handler
+    assert "wasEnabled &&" in handler

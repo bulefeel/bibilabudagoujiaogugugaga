@@ -444,12 +444,39 @@ class ScheduleRepository:
             raise NotFoundError(f"计划 {schedule_id} 不存在")
         return schedule
 
+    def existing_workflow_schedule_id(self, store_id: int, workflow: str) -> int | None:
+        """Any rule this store already has for this workflow, paused or not.
+
+        A paused rule is still a rule: recreating it leaves two schedules for
+        one job, and the row toggle makes resuming the existing one a click.
+        """
+
+        return self.session.scalar(
+            select(Schedule.id)
+            .where(
+                Schedule.store_id == int(store_id),
+                Schedule.workflow == str(workflow),
+            )
+            .limit(1)
+        )
+
     def create(self, **values: Any) -> Schedule:
         store = self.session.get(Store, values["store_id"])
         if store is None:
             raise NotFoundError("店铺不存在")
         workflow = str(values.get("workflow") or "amazon_disbursement")
         definition = self._definition(workflow)
+        # Two disbursement schedules on one store cannot both win: Amazon caps
+        # the account at one payout per rolling 24 hours, so the second is
+        # refused every time and turns into pure noise. Workflows that do not
+        # take the funds lock may legitimately have several rules.
+        if bool(getattr(definition, "requires_financial_lock", False)):
+            duplicate = self.existing_workflow_schedule_id(store.id, workflow)
+            if duplicate is not None:
+                raise ConflictError(
+                    f"该店铺已有「{workflow}」排期（#{duplicate}），资金类流程每家店只允许一条；"
+                    "请直接编辑或启用那一条。"
+                )
         mode = str(values.get("mode") or "dry_run")
         if mode not in {str(item) for item in definition.supported_modes}:
             raise ValueError(f"工作流不支持运行模式：{mode}")
@@ -571,13 +598,35 @@ class ScheduleRepository:
         future_mode = changes.get("mode", schedule.mode)
         if str(future_mode) not in {str(item) for item in definition.supported_modes}:
             raise ValueError(f"工作流不支持运行模式：{future_mode}")
+        future_enabled = changes.get("enabled", schedule.enabled)
         normalized_codes = _normalized_codes(future_codes)
+        codes_are_changing = config_was_changed or legacy_codes_were_changed
         if bool(getattr(definition, "requires_marketplace_targets", False)):
-            self._validate_marketplace_codes(
-                schedule.store_id,
-                normalized_codes,
-                require_payment_account=False,
-            )
+            # Validate the targets when they are being CHANGED, or when the rule
+            # is being switched ON — never merely because a pause happened to
+            # pass through here.
+            #
+            # Pausing used to be blocked twice over. A schedule whose site had
+            # been turned off failed the enabled-site check, and a bare
+            # ``{"enabled": false}`` — the one shape the repository's own
+            # "must always remain stoppable" escape hatch was written for —
+            # failed on 「必须明确选择至少一个站点」, because a schedule whose
+            # workflow_config never carried the codes normalises to an empty
+            # list here. Either way the only way to stop a running rule was to
+            # delete it, which also detaches its run history.
+            #
+            # Only the "is this site switched on" half is relaxed for a pause.
+            # An empty, unknown, duplicated or un-enrolled code is a broken rule
+            # whether or not it runs, and a first attempt that skipped the whole
+            # check was caught by
+            # ``test_schedule_requires_an_explicit_marketplace_selection``.
+            if codes_are_changing or future_enabled:
+                self._validate_marketplace_codes(
+                    schedule.store_id,
+                    normalized_codes,
+                    require_payment_account=False,
+                    require_enabled_sites=bool(future_enabled),
+                )
             future_config["marketplace_codes"] = normalized_codes
         if "marketplace_codes" in changes or "workflow_config" in changes:
             changes["marketplace_codes"] = normalized_codes
@@ -585,7 +634,6 @@ class ScheduleRepository:
             changes["workflow_config_version"] = int(
                 getattr(definition, "config_version", 1)
             )
-        future_enabled = changes.get("enabled", schedule.enabled)
         if future_enabled:
             store = self.session.get(Store, schedule.store_id)
             if not store or not store.enabled:
@@ -616,8 +664,17 @@ class ScheduleRepository:
         codes: Sequence[str],
         *,
         require_payment_account: bool = True,
+        require_enabled_sites: bool = True,
     ) -> None:
-        """Require every scheduled code to exist and be enabled for the store."""
+        """Require every scheduled code to exist and be enabled for the store.
+
+        ``require_enabled_sites`` separates two rules that used to travel
+        together.  Whether a code is well-formed, unique and configured on this
+        store is about the rule itself and always applies.  Whether that site is
+        switched on right now only decides if the rule may *run* — demanding it
+        before allowing a pause is what made a schedule unstoppable once one of
+        its sites was turned off.
+        """
 
         normalized = [str(code).upper() for code in codes]
         if not normalized:
@@ -647,7 +704,11 @@ class ScheduleRepository:
                 + "、".join(sorted(missing))
                 + "；请先在店铺建档中配置并启用"
             )
-        disabled = {code for code, row in rows.items() if not row.enabled}
+        disabled = (
+            {code for code, row in rows.items() if not row.enabled}
+            if require_enabled_sites
+            else set()
+        )
         if disabled:
             raise ValueError(
                 "排期包含该店铺尚未启用的站点："

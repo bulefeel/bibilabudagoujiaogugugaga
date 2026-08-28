@@ -154,25 +154,64 @@ def test_batch_creates_one_independent_schedule_per_store_and_is_idempotent(data
             )
 
 
-def test_one_invalid_store_rejects_the_whole_batch_without_writes(database):
+def test_an_unusable_store_is_dropped_without_stopping_the_others(database):
+    """One bad store must not cost the whole batch.
+
+    This used to be all-or-nothing: selecting ten stores with two of them not
+    yet enrolled wrote zero schedules and sent the operator back to untick them
+    one by one. The preview lists every store's fate before the confirm, so
+    dropping them is visible rather than silent.
+    """
+
     with database() as session:
         good = _seed_store(session, 1)
         disabled = _seed_store(session, 2, enabled=False)
         session.commit()
         service = BatchScheduleService(session, _registry())
 
+        preview = service.preview(
+            store_ids=[good.id, disabled.id], template=_template()
+        )
+        assert preview["eligible"] is True, "还有店铺能建，就不该整批失败"
+        assert preview["created_count"] == 1
+        assert preview["targets"][1]["eligible"] is False
+        assert "店铺尚未启用" in preview["targets"][1]["reasons"]
+        assert preview["targets"][1]["skipped"] is False, (
+            "「不合格」和「已有排期」是两回事，不能混成一档"
+        )
+
+        result = service.create(
+            request_id=str(uuid4()),
+            store_ids=[good.id, disabled.id],
+            template=_template(),
+        )
+        session.commit()
+
+        assert result["created_count"] == 1
+        assert [row["store_id"] for row in result["schedules"]] == [good.id]
+        assert session.scalar(
+            select(func.count(Schedule.id)).where(Schedule.store_id == disabled.id)
+        ) == 0
+
+
+def test_a_batch_with_no_usable_store_writes_nothing(database):
+    """The floor stays: zero creatable targets must not produce an empty batch."""
+
+    with database() as session:
+        disabled = _seed_store(session, 1, enabled=False)
+        session.commit()
+        service = BatchScheduleService(session, _registry())
+
         with pytest.raises(BatchScheduleValidationError) as caught:
             service.create(
                 request_id=str(uuid4()),
-                store_ids=[good.id, disabled.id],
+                store_ids=[disabled.id],
                 template=_template(),
             )
         assert caught.value.preview["eligible"] is False
-        assert caught.value.preview["eligible_count"] == 1
         assert caught.value.preview["created_count"] == 0
-        rejected = caught.value.preview["targets"][1]
-        assert rejected["eligible"] is False
-        assert "店铺尚未启用" in rejected["reasons"]
+        assert "店铺尚未启用" in caught.value.preview["targets"][0]["reasons"]
+        session.rollback()
         assert session.scalar(select(func.count(ScheduleBatch.id))) == 0
         assert session.scalar(select(func.count(Schedule.id))) == 0
 
@@ -596,3 +635,126 @@ def test_no_blocking_rule_ever_vetoes_on_a_dead_end_status():
             f"repositories.py 第 {node.lineno} 行内联了一份状态列表来阻断查询，"
             f"其中含 {sorted(offenders)}；请改用文件顶部的共享常量"
         )
+
+
+def test_a_store_that_already_has_this_workflow_is_skipped_not_rejected(database):
+    """Already having a rule is nothing to do, not a fault.
+
+    Eligibility is all-or-nothing — one bad target writes zero schedules — so
+    reporting "already scheduled" as a reason would make re-running a batch over
+    a partly-covered set fail entirely. It is a separate dimension.
+    """
+
+    with database() as session:
+        covered = _seed_store(session, 1)
+        fresh = _seed_store(session, 2)
+        session.commit()
+        service = BatchScheduleService(session, _registry())
+        service.create(
+            request_id=str(uuid4()), store_ids=[covered.id], template=_template()
+        )
+        session.commit()
+
+        preview = service.preview(
+            store_ids=[covered.id, fresh.id], template=_template()
+        )
+
+        assert preview["eligible"] is True, "已有排期不该让整批失败"
+        assert preview["created_count"] == 1
+        first, second = preview["targets"]
+        assert first["skipped"] is True and first["eligible"] is False
+        assert first["reasons"] == [], "跳过不是错误，不该出现在 reasons 里"
+        assert "已有同一流程的排期" in first["skip_reason"]
+        assert second["eligible"] is True and second["skipped"] is False
+
+        result = service.create(
+            request_id=str(uuid4()),
+            store_ids=[covered.id, fresh.id],
+            template=_template(),
+        )
+        session.commit()
+
+        assert result["created_count"] == 1
+        assert result["skipped_count"] == 1
+        assert [row["store_id"] for row in result["schedules"]] == [fresh.id]
+        # One rule per store, still.
+        assert session.scalar(
+            select(func.count(Schedule.id)).where(Schedule.store_id == covered.id)
+        ) == 1
+
+
+def test_a_paused_rule_still_counts_as_already_scheduled(database):
+    """A paused rule is a rule. Recreating gives one job two schedules.
+
+    The row toggle makes resuming the existing one a single click, so there is
+    no need to build a second.
+    """
+
+    with database() as session:
+        store = _seed_store(session, 1)
+        session.commit()
+        service = BatchScheduleService(session, _registry())
+        service.create(
+            request_id=str(uuid4()),
+            store_ids=[store.id],
+            template=_template(enabled=False),
+        )
+        session.commit()
+
+        preview = service.preview(store_ids=[store.id], template=_template())
+
+        assert preview["targets"][0]["skipped"] is True
+        assert preview["created_count"] == 0
+
+
+def test_a_batch_with_nothing_left_to_create_is_refused_not_written_empty(database):
+    """An empty batch would report success while doing nothing."""
+
+    with database() as session:
+        store = _seed_store(session, 1)
+        session.commit()
+        service = BatchScheduleService(session, _registry())
+        service.create(
+            request_id=str(uuid4()), store_ids=[store.id], template=_template()
+        )
+        session.commit()
+
+        with pytest.raises(ConflictError, match="没有需要创建的内容"):
+            service.create(
+                request_id=str(uuid4()),
+                store_ids=[store.id],
+                template=_template(),
+            )
+        session.rollback()
+        assert session.scalar(select(func.count(ScheduleBatch.id))) == 1
+
+
+def test_a_second_financial_schedule_for_one_store_is_refused_outright(database):
+    """Two payout rules on one store cannot both win.
+
+    Amazon caps the account at one disbursement per rolling 24 hours, so the
+    second rule is refused every time it fires — noise, not configuration
+    freedom. Workflows that do not take the funds lock stay unrestricted.
+    """
+
+    with database() as session:
+        store = _seed_store(session, 1)
+        session.commit()
+        repository = ScheduleRepository(session, _registry())
+        fields = dict(
+            store_id=store.id,
+            name="第一条",
+            workflow="amazon_disbursement",
+            mode="dry_run",
+            workflow_config={"marketplace_codes": ["CA", "UK"]},
+            marketplace_codes=["CA", "UK"],
+            first_run_at=SCHEDULE_ANCHOR,
+            interval_minutes=1500,
+            timezone="Asia/Singapore",
+            enabled=False,
+        )
+        repository.create(**fields)
+        session.commit()
+
+        with pytest.raises(ConflictError, match="资金类流程每家店只允许一条"):
+            repository.create(**{**fields, "name": "第二条"})
