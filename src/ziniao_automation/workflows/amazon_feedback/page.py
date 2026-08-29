@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
+class ListOutcome:
+    """Why we can or cannot read this marketplace's feedback list."""
+
+    ok: bool
+    rows_loaded: bool = False
+    reason: str = ""
+    landed_url: str = ""
+
+
+@dataclass(frozen=True, slots=True)
 class FeedbackRow:
     """One row of the feedback table, as read off the page."""
 
@@ -289,6 +299,46 @@ _ROW_COUNT = (
 )
 
 
+_NEXT_PAGE_CONTROL = """
+const nextControl = (contract) => {
+    const hits = deepAll(contract.pager_controls).filter((el) => {
+        if (el.children.length) return false;
+        return textOf(el).includes(contract.pager_next_text);
+    });
+    return hits.length === 1 ? hits[0] : null;
+};
+"""
+
+
+_HAS_NEXT_PAGE = (
+    _JS_PRELUDE
+    + _NEXT_PAGE_CONTROL
+    + """
+(contract) => {
+    const next = nextControl(contract);
+    if (!next) return false;
+    // These controls carry no disabled attribute; the class is the only signal.
+    return !String(next.className || '').includes(contract.pager_disabled_class);
+}
+"""
+)
+
+
+_CLICK_NEXT_PAGE = (
+    _JS_PRELUDE
+    + _NEXT_PAGE_CONTROL
+    + """
+(contract) => {
+    const next = nextControl(contract);
+    if (!next) return false;
+    if (String(next.className || '').includes(contract.pager_disabled_class)) return false;
+    next.click();
+    return true;
+}
+"""
+)
+
+
 _PANEL_OPEN_COUNT = (
     _JS_PRELUDE
     + """
@@ -336,11 +386,13 @@ class AmazonFeedbackPage:
         *,
         settle_seconds: float = 1.5,
         list_timeout_seconds: float = 25.0,
+        max_list_pages: int = 20,
         cancel_text: str = "取消",
     ) -> None:
         self.contract = contract or FeedbackDomContract()
         self.settle_seconds = settle_seconds
         self.list_timeout_seconds = list_timeout_seconds
+        self.max_list_pages = max_list_pages
         self.cancel_text = cancel_text
 
     # -- contract payload handed to the browser ---------------------------
@@ -360,20 +412,40 @@ class AmazonFeedbackPage:
             "category_dropdown": contract.category_dropdown,
             "reason_dropdown": contract.reason_dropdown,
             "submit_button": contract.submit_button,
+            "pager_controls": contract.pager_controls,
+            "pager_next_text": contract.pager_next_text,
+            "pager_disabled_class": contract.pager_disabled_class,
         }
 
-    async def open_list(self, page: Any, domain: str) -> bool:
+    async def open_list(self, page: Any, domain: str) -> ListOutcome:
         """Navigate to the feedback manager and wait for its rows to arrive.
 
-        The table shell renders before Angular has fetched anything, so a fixed
-        pause reads an empty list as "this store has no feedback" — which looks
-        exactly like success and silently does nothing.  Poll for rows instead
-        and report whether any ever appeared, so the caller can tell an
-        genuinely empty list from one that never loaded.
+        Three outcomes, deliberately distinguished:
+
+        * ``unavailable`` — Seller Central bounced us somewhere else, which it
+          does when the store is not selling on that marketplace: the URL comes
+          back as ``/account-switcher/...?returnTo=/feedback-manager/index.html``.
+          That is a fact about the store, not a fault, so it must not fail the
+          run the way a contract break does.
+        * ``ok`` with ``rows_loaded`` — the list rendered and has entries.
+        * ``ok`` without ``rows_loaded`` — the page is fine but no row ever
+          appeared.  Usually an empty store; the caller records it and does
+          nothing, because acting on a half-loaded list is the worse mistake.
+
+        Only "we are on the right page and its table never rendered" is a
+        contract error.
         """
 
         url = f"https://{domain}{FEEDBACK_MANAGER_PATH}"
         await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+        await page.wait_for_timeout(int(self.settle_seconds * 1000))
+
+        landed = str(getattr(page, "url", "") or "")
+        if FEEDBACK_MANAGER_PATH not in landed:
+            return ListOutcome(
+                ok=False, reason="marketplace_unavailable", landed_url=landed
+            )
+
         try:
             await page.wait_for_selector(
                 self.contract.list_root, timeout=45_000, state="attached"
@@ -392,8 +464,29 @@ class AmazonFeedbackPage:
             if await page.evaluate(_ROW_COUNT, self._contract_payload):
                 # One more settle so a partially rendered batch finishes.
                 await page.wait_for_timeout(int(step * 1000))
-                return True
-        return False
+                return ListOutcome(ok=True, rows_loaded=True)
+        return ListOutcome(ok=True, rows_loaded=False)
+
+    async def read_all_rows(self, page: Any) -> tuple[list[FeedbackRow], bool]:
+        """Read every page of the list, not just the first.
+
+        The list paginates, and the only way to know another page exists is
+        that the 「下一个」 control has lost its disabled class — it carries no
+        ``disabled`` attribute.  Returns ``(rows, truncated)``; ``truncated``
+        is True when the page cap stopped a longer list, which the caller
+        reports rather than silently presenting a partial sweep as complete.
+        """
+
+        collected: dict[str, FeedbackRow] = {}
+        for _ in range(self.max_list_pages):
+            for row in await self.read_rows(page):
+                collected.setdefault(row.order_id, row)
+            if not await page.evaluate(_HAS_NEXT_PAGE, self._contract_payload):
+                return list(collected.values()), False
+            if not await page.evaluate(_CLICK_NEXT_PAGE, self._contract_payload):
+                return list(collected.values()), False
+            await page.wait_for_timeout(int(self.settle_seconds * 2000))
+        return list(collected.values()), True
 
     async def read_rows(self, page: Any) -> list[FeedbackRow]:
         raw = await page.evaluate(_READ_ROWS, self._contract_payload)

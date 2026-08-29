@@ -249,6 +249,7 @@ class DatabaseNoticeBuilder:
                     select(
                         FeedbackReview.order_id,
                         FeedbackReview.rating,
+                        FeedbackReview.marketplace_code,
                         FeedbackReview.comment,
                         FeedbackReview.category,
                         FeedbackReview.reason_code,
@@ -258,7 +259,11 @@ class DatabaseNoticeBuilder:
                         FeedbackReview.run_id == run_id,
                         FeedbackReview.state.in_(wanted),
                     )
-                    .order_by(FeedbackReview.rating, FeedbackReview.created_at)
+                    .order_by(
+                        FeedbackReview.marketplace_code,
+                        FeedbackReview.rating,
+                        FeedbackReview.created_at,
+                    )
                 ).all()
                 feedback_omitted = max(0, len(rows) - FEEDBACK_CARD_LIMIT)
                 for row in rows[:FEEDBACK_CARD_LIMIT]:
@@ -266,6 +271,7 @@ class DatabaseNoticeBuilder:
                         SafeFeedbackNotice(
                             order_id=str(row.order_id or ""),
                             rating=int(row.rating or 0),
+                            marketplace_code=str(row.marketplace_code or ""),
                             comment=_clip(row.comment, FEEDBACK_COMMENT_CHARS),
                             reason_label=_reason_label(row.category, row.reason_code),
                             state=str(row.state or ""),

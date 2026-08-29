@@ -363,3 +363,31 @@ def test_a_payout_run_detail_has_no_review_table(client) -> None:
     run_id = _seed_run(app, "amazon_disbursement")
 
     assert "本次处理的评论" not in test_client.get(f"/runs/{run_id}").text
+
+
+def test_the_page_can_be_filtered_to_one_site(client) -> None:
+    """一次运行覆盖 CA/UK/AU，站点不能筛就是一锅粥。"""
+
+    app, test_client, _ = client
+    with app.state.sessions() as session:
+        StoreRepository(session).create(
+            name="测试店铺", selector_type="oauth", selector_value="oauth-1"
+        )
+        session.flush()
+        for code, order in (("CA", "702-CA"), ("UK", "702-UK")):
+            session.add(
+                FeedbackReview(
+                    store_id=1, marketplace_code=code, order_id=order,
+                    rating=1, comment=f"{code} 的留言", state="ALREADY_REQUESTED",
+                )
+            )
+        session.commit()
+
+    everything = test_client.get("/feedback").text
+    assert "CA 的留言" in everything and "UK 的留言" in everything
+
+    only_uk = test_client.get("/feedback?site=UK").text
+    assert "UK 的留言" in only_uk
+    assert "CA 的留言" not in only_uk
+    # The per-site breakdown counts the whole ledger, not the filtered view.
+    assert "各店各站点已收录的条数" in only_uk

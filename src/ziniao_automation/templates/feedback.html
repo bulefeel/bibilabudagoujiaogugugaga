@@ -11,13 +11,24 @@
   <small>低分本身不是删除理由。不落在上述任何一类的反馈，即使提交了大概率也不会被受理。</small>
 </section>
 
+{% if breakdown %}<section class="feedback-breakdown"><b>各店各站点已收录的条数</b><div>{% for item in breakdown %}<a href="/feedback?store={{ item.store_id }}&site={{ item.code }}" class="feedback-chip{{ ' active' if selected.store == item.store_id and selected.site == item.code else '' }}"><i>{{ item.code }}</i><span>{{ item.store_name }}</span><b>{{ item.count }}</b></a>{% endfor %}</div></section>{% endif %}
+
+<form class="feedback-filter" method="get" action="/feedback">
+  <label>店铺<select name="store"><option value="">全部</option>{% for id, name in store_names.items() %}<option value="{{ id }}" {{ 'selected' if selected.store == id else '' }}>{{ name }}</option>{% endfor %}</select></label>
+  <label>站点<select name="site"><option value="">全部</option>{% for code in ['CA','UK','AU'] %}<option value="{{ code }}" {{ 'selected' if selected.site == code else '' }}>{{ code }}</option>{% endfor %}</select></label>
+  <label>状态<select name="state"><option value="">全部</option>{% for value, label in state_labels.items() %}<option value="{{ value }}" {{ 'selected' if selected.state == value else '' }}>{{ label }}</option>{% endfor %}</select></label>
+  <button class="button dark" type="submit">筛选</button>
+  <a class="button ghost" href="/feedback">清除</a>
+</form>
+
 <div class="feedback-table-wrap">
 <table class="feedback-table">
-  <thead><tr><th>店铺 / 站点</th><th>评分</th><th>订单</th><th>买家留言</th><th>请求原因</th><th>状态</th><th></th></tr></thead>
+  <thead><tr><th>站点</th><th>店铺</th><th>评分</th><th>订单</th><th>买家留言</th><th>请求原因</th><th>状态</th><th></th></tr></thead>
   <tbody>
   {% for review in reviews %}
   <tr data-review-id="{{ review.id }}">
-    <td><b>{{ store_names.get(review.store_id, review.store_id) }}</b><small>{{ review.marketplace_code }} · {{ review.order_date or '—' }}</small></td>
+    <td><i class="feedback-site-tag">{{ review.marketplace_code }}</i></td>
+    <td><b>{{ store_names.get(review.store_id, review.store_id) }}</b><small>{{ review.order_date or '—' }}</small></td>
     <td><span class="feedback-stars stars-{{ review.rating }}">{{ '★' * review.rating }}{{ '☆' * (5 - review.rating) }}</span></td>
     <td><code>{{ review.order_id }}</code></td>
     <td class="feedback-comment">{{ review.comment or '（无留言）' }}</td>
@@ -43,7 +54,7 @@
     <td>{% if review.state == 'NEEDS_HUMAN' %}<button class="button dark" data-action="save-feedback-reason" data-review-id="{{ review.id }}">保存原因</button>{% endif %}</td>
   </tr>
   {% else %}
-  <tr><td colspan="7"><div class="blank-slate"><span>反</span><h2>还没有读取到任何反馈</h2><p>为店铺创建一条「店铺 1-3 星 Feedback 自动删除」排期并运行一次，结果会出现在这里。</p></div></td></tr>
+  <tr><td colspan="8"><div class="blank-slate"><span>反</span><h2>还没有读取到任何反馈</h2><p>为店铺创建一条「店铺 1-3 星 Feedback 自动删除」排期并运行一次，结果会出现在这里。</p></div></td></tr>
   {% endfor %}
   </tbody>
 </table>

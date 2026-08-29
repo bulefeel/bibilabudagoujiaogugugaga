@@ -77,6 +77,9 @@ class SafeFeedbackNotice:
 
     order_id: str
     rating: int
+    # A run covers CA/UK/AU in one go, so an entry without its marketplace
+    # cannot be looked up in the right seller account.
+    marketplace_code: str = ""
     comment: str = ""
     reason_label: str = ""
     state: str = ""

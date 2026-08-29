@@ -394,6 +394,8 @@ def _feedback_line(item: SafeFeedbackNotice) -> str:
 
     rating = max(0, min(5, int(item.rating or 0)))
     parts = [f"{'★' * rating}{'☆' * (5 - rating)}"]
+    if item.marketplace_code:
+        parts.append(f"**{_md(item.marketplace_code.upper())}**")
     if item.order_id:
         parts.append(f"`{_order_ref(item.order_id)}`")
     if item.comment:

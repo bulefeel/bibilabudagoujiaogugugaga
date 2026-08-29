@@ -635,29 +635,66 @@ def create_app(
         return render(request, "approvals.html", {"approvals": approvals}, db=db, page_title="资金审核台")
 
     @app.get("/feedback", response_class=HTMLResponse)
-    def feedback_page(request: Request, db: Session = Depends(get_session)) -> Response:
-        """Every feedback the automation has ever considered, per store.
+    def feedback_page(
+        request: Request,
+        store: int | None = None,
+        site: str | None = None,
+        state: str | None = None,
+        db: Session = Depends(get_session),
+    ) -> Response:
+        """Every feedback the automation has ever considered, per store and site.
 
         This is the ledger behind "never retry": an entry appears here exactly
-        once and keeps whatever outcome it reached.
+        once and keeps whatever outcome it reached.  One run covers CA/UK/AU,
+        so the marketplace has to be filterable — otherwise three sites' worth
+        of reviews arrive as one undifferentiated list.
         """
 
-        reviews = list(
-            db.scalars(
-                select(FeedbackReview)
-                .order_by(FeedbackReview.created_at.desc())
-                .limit(500)
-            )
-        )
+        stmt = select(FeedbackReview).order_by(FeedbackReview.created_at.desc())
+        if store is not None:
+            stmt = stmt.where(FeedbackReview.store_id == store)
+        if site:
+            stmt = stmt.where(FeedbackReview.marketplace_code == site.upper())
+        if state:
+            stmt = stmt.where(FeedbackReview.state == state.upper())
+        reviews = list(db.scalars(stmt.limit(500)))
+
         store_names = {
             int(row.id): str(row.name) for row in db.scalars(select(Store))
         }
+        # Counts per store+site over the WHOLE ledger, not the filtered view —
+        # the point of the summary is to show where the reviews actually are.
+        breakdown: dict[tuple[int, str], int] = {}
+        for store_id, code in db.execute(
+            select(FeedbackReview.store_id, FeedbackReview.marketplace_code)
+        ):
+            key = (int(store_id), str(code))
+            breakdown[key] = breakdown.get(key, 0) + 1
+
         return render(
             request,
             "feedback.html",
             {
                 "reviews": reviews,
                 "store_names": store_names,
+                "breakdown": sorted(
+                    (
+                        {
+                            "store_id": key[0],
+                            "store_name": store_names.get(key[0], str(key[0])),
+                            "code": key[1],
+                            "count": value,
+                        }
+                        for key, value in breakdown.items()
+                    ),
+                    key=lambda item: (item["store_name"], item["code"]),
+                ),
+                "selected": {
+                    "store": store,
+                    "site": (site or "").upper(),
+                    "state": (state or "").upper(),
+                },
+                "state_labels": FEEDBACK_STATE_LABELS,
                 "reason_catalog": REASON_CATALOG,
                 "category_labels": CATEGORY_LABELS,
                 "review_criteria": AMAZON_REVIEW_CRITERIA,

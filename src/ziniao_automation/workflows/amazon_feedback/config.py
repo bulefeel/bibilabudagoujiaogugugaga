@@ -45,6 +45,13 @@ class FeedbackDomContract:
     # while expanded.  So the panel is looked up page-wide, and the link back to
     # a specific row is established by opening from zero: no panel open, click
     # exactly one row's action, then assert exactly one panel exists.
+    # Paging.  Both controls render even when the list is empty, and the only
+    # signal that one is usable is the absence of this class — they carry no
+    # ``disabled`` attribute.
+    pager_controls: str = '[class*="pagination-nav"]'
+    pager_next_text: str = "下一个"
+    pager_disabled_class: str = "pagination-nav-disabled"
+
     panel: str = "feedback-removal"
     panel_open: str = "feedback-removal .side-panel.side-panel-open"
     continue_button_pattern: str = "继续"

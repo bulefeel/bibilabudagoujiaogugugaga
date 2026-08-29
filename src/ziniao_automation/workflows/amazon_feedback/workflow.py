@@ -124,19 +124,44 @@ class AmazonFeedbackWorkflow:
     async def _plan_marketplace(
         self, run: WorkflowRun, page: Any, marketplace: MarketplaceRef
     ) -> int:
-        loaded = await self.page_adapter.open_list(page, marketplace.domain)
-        rows = await self.page_adapter.read_rows(page)
-        if not rows and not loaded:
-            # "No feedback" and "the list never arrived" look identical from
-            # here, and the second one must not be reported as a clean sweep.
+        outcome = await self.page_adapter.open_list(page, marketplace.domain)
+        if not outcome.ok:
+            # Seller Central bounced us to the account switcher, which is what
+            # it does when the store does not sell on this marketplace.  That
+            # is a fact about the store, not a fault: the other sites must
+            # still run, and the whole run must not be reported as failed.
+            await self.repository.append_event(
+                run.id,
+                "feedback_site_unavailable",
+                "该店铺未开通此站点（页面跳转到账户/站点选择），本站点跳过",
+                marketplace_code=marketplace.code,
+                details={"reason_code": outcome.reason or "marketplace_unavailable"},
+            )
+            await self.repository.set_site_status(
+                run.id, marketplace.code, SiteStatus.SKIPPED
+            )
+            _log_item(marketplace.code, "SKIPPED", outcome.reason or "unavailable")
+            return 0
+
+        rows, truncated = await self.page_adapter.read_all_rows(page)
+        if truncated:
+            await self.repository.append_event(
+                run.id,
+                "feedback_list_truncated",
+                "反馈列表页数超过上限，本次只读了前面若干页",
+                marketplace_code=marketplace.code,
+                details={"reason_code": "page_cap_reached"},
+            )
+            _log_item(marketplace.code, "PARTIAL", "page_cap_reached")
+        if not rows:
             await self.repository.append_event(
                 run.id,
                 "feedback_list_empty",
-                "等待超时仍未读到任何反馈行；本站点这次不做任何处理",
+                "该站点没有读到任何反馈（通常是这个站点还没有评价）",
                 marketplace_code=marketplace.code,
-                details={"reason_code": "list_never_loaded"},
+                details={"reason_code": "no_rows"},
             )
-            _log_item(marketplace.code, "EMPTY", "list_never_loaded")
+            _log_item(marketplace.code, "EMPTY", "no_rows")
             return 0
 
         known = await self.review_store.known_order_ids(
@@ -302,8 +327,14 @@ class AmazonFeedbackWorkflow:
             )
             return 0
 
-        await self.page_adapter.open_list(page, marketplace.domain)
-        rows = {row.order_id: row for row in await self.page_adapter.read_rows(page)}
+        outcome = await self.page_adapter.open_list(page, marketplace.domain)
+        if not outcome.ok:
+            await self.repository.set_site_status(
+                run.id, marketplace.code, SiteStatus.SKIPPED
+            )
+            return 0
+        page_rows, _ = await self.page_adapter.read_all_rows(page)
+        rows = {row.order_id: row for row in page_rows}
 
         submitted = 0
         for item in pending:

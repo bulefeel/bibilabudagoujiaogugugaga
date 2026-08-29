@@ -31,7 +31,7 @@ from ziniao_automation.workflows.amazon_feedback import (
     build_amazon_feedback_definition,
 )
 from ziniao_automation.workflows.amazon_feedback.classifier import ReasonDecision
-from ziniao_automation.workflows.amazon_feedback.page import FeedbackRow
+from ziniao_automation.workflows.amazon_feedback.page import FeedbackRow, ListOutcome
 from ziniao_automation.workflows.amazon_feedback.review_store import (
     NEEDS_HUMAN,
     PENDING,
@@ -58,11 +58,18 @@ class FakePage:
         self.opened: list[str] = []
         self.closed = 0
         self.select_result_ok = True
+        self.unavailable = False
+        self.truncated = False
 
-    async def open_list(self, page: Any, domain: str) -> bool:
-        # True = rows arrived.  The workflow must tell an empty list apart
-        # from one that never loaded.
-        return bool(self._rows)
+    async def open_list(self, page: Any, domain: str) -> ListOutcome:
+        if self.unavailable:
+            # Seller Central bounces to the account switcher for a marketplace
+            # the store does not sell on.
+            return ListOutcome(ok=False, reason="marketplace_unavailable")
+        return ListOutcome(ok=True, rows_loaded=bool(self._rows))
+
+    async def read_all_rows(self, page: Any) -> tuple[list[FeedbackRow], bool]:
+        return list(self._rows), self.truncated
 
     async def read_rows(self, page: Any) -> list[FeedbackRow]:
         return list(self._rows)
@@ -577,3 +584,49 @@ async def test_a_finished_site_is_not_reported_as_failed(session_factory) -> Non
     assert len(page.submitted) == 1
     assert repo.site_status.get("CA") != "FAILED"
     assert not any(event[0] == "site_execution_failed" for event in repo.events)
+
+
+# --------------------------------------------------------------------------
+# 7. 实战暴露的两件事（2026-08-29）
+# --------------------------------------------------------------------------
+async def test_a_marketplace_the_store_does_not_sell_on_is_skipped(
+    session_factory,
+) -> None:
+    """店铺没开通的站点会被 Seller Central 跳到账户选择页。
+
+    那上面没有 feedback-list，原来会等满 45 秒抛契约错误，**整个 run 判失败**——
+    廖莉-7.2 和卢光桂-卢元CA 就是这么红的。这是店铺的事实，不是故障：
+    该站点跳过，其余站点照跑。
+    """
+
+    workflow, page, repo = build(session_factory, [row("702-60", 1)])
+    page.unavailable = True
+    run = make_run()
+
+    plan = await workflow.plan(run, object())
+
+    assert plan.lines == ()
+    assert states(session_factory) == {}
+    assert any(event[0] == "feedback_site_unavailable" for event in repo.events)
+    assert repo.site_status.get("CA") == "SKIPPED"
+
+
+async def test_an_empty_site_is_not_reported_as_a_timeout(session_factory) -> None:
+    """没有商品的店铺读到 0 行是正常的，别写成「等待超时」。"""
+
+    workflow, _, repo = build(session_factory, [])
+    await workflow.plan(make_run(), object())
+
+    empty = [event for event in repo.events if event[0] == "feedback_list_empty"]
+    assert empty and empty[0][2]["reason_code"] == "no_rows"
+
+
+async def test_reading_more_pages_than_the_cap_is_reported(session_factory) -> None:
+    """列表分页了却只读了前几页，绝不能当成完整扫描静静过去。"""
+
+    workflow, page, repo = build(session_factory, [row("702-70", 1)])
+    page.truncated = True
+
+    await workflow.plan(make_run(), object())
+
+    assert any(event[0] == "feedback_list_truncated" for event in repo.events)
