@@ -385,12 +385,20 @@ class ScheduleManager:
         *,
         now: datetime | None = None,
     ) -> tuple[str, ...]:
-        """Create only the most recent occurrence missed while offline.
+        """Create the most recent missed occurrence, if it is still fresh.
 
-        The method is deliberately repeatable: a persisted occurrence is
-        found by ``(schedule_id, scheduled_for_at)`` and is not recreated,
-        regardless of whether that earlier run is waiting, running or already
-        terminal.  We never enumerate every missed day.
+        Two limits apply, and both matter:
+
+        * repeatability — a persisted occurrence is found by
+          ``(schedule_id, scheduled_for_at)`` and is not recreated, regardless
+          of whether that earlier run is waiting, running or already terminal.
+          We never enumerate every missed day.
+        * freshness — an occurrence later than ``misfire_grace_seconds`` is
+          dropped, the same rule APScheduler applies in-process.  Without it,
+          starting the service (which the installer does on every upgrade, and
+          which the desktop shortcut does whenever the app is opened on a
+          machine that is not left running) executed a schedule hours after the
+          moment the operator chose.
         """
 
         observed_at = _as_utc(now or self._clock())
@@ -415,6 +423,31 @@ class ScheduleManager:
                         )
                     )
                     if occurrence < eligible_since:
+                        continue
+                    # ``misfire_grace_seconds`` must mean the same thing on both
+                    # paths.  APScheduler already refuses an in-process fire that
+                    # is later than the grace (see the add_job call above), but
+                    # this offline path used to ignore it entirely: an operator
+                    # who configured 30 minutes got an occurrence caught up 11
+                    # hours late, simply because the machine had been off.
+                    #
+                    # That is wrong for the payout workflow in particular.
+                    # Amazon rate limits on a ROLLING 24 hours from the previous
+                    # request, so a catch-up at an arbitrary hour drags the whole
+                    # window with it and the next scheduled occurrence is refused
+                    # — which is exactly what the interval trigger exists to
+                    # avoid.  Nothing is lost by waiting: the balance keeps
+                    # accruing at Amazon and the next occurrence pays it out.
+                    grace = timedelta(seconds=max(0, int(schedule.misfire_grace_seconds)))
+                    if occurrence < observed_at - grace:
+                        logger.info(
+                            "schedule_missed_occurrence_expired schedule_id=%s "
+                            "occurrence=%s late_seconds=%d grace_seconds=%d",
+                            schedule.id,
+                            occurrence.isoformat(),
+                            int((observed_at - occurrence).total_seconds()),
+                            int(grace.total_seconds()),
+                        )
                         continue
                     run_id = await self._trigger_schedule_locked(
                         schedule.id,

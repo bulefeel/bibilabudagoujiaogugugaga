@@ -204,8 +204,14 @@ def test_clock_trigger_persists_the_original_occurrence_and_deduplicates(databas
 
 
 def test_offline_recovery_creates_only_the_latest_missed_occurrence(database):
+    """一次停机只补跑最近的那一次，而且只补一次。
+
+    时刻取在 occurrence 之后 10 分钟——在 misfire 宽限（默认 1800 秒）之内，
+    所以补跑成立；错过十天里的其余九次一个都不补。
+    """
+
     async def scenario() -> None:
-        now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 13, 1, 10, tzinfo=timezone.utc)
         schedule_id = seed_daily_schedule(
             database,
             created_at=now - timedelta(days=10),
@@ -227,6 +233,62 @@ def test_offline_recovery_creates_only_the_latest_missed_occurrence(database):
             assert as_utc(rows[0].scheduled_for_at) == datetime(
                 2026, 8, 13, 1, 0, tzinfo=timezone.utc
             )
+
+    asyncio.run(scenario())
+
+
+def test_an_occurrence_missed_by_longer_than_the_grace_is_not_caught_up(database):
+    """机器关了一夜，早上打开应用不该把凌晨那次补跑掉。
+
+    操作员报的就是这个：装完新版打开页面，之前的定时任务自己跑了起来。
+    根因不是执行记录被重置——去重一直是好的——而是
+    ``misfire_grace_seconds`` 有两套含义：APScheduler 在进程内按它拒绝迟到的
+    触发（最多 30 分钟），而停机补跑这条路完全不看它，11 小时照跑。
+
+    对提现尤其错：亚马逊按**滑动 24 小时**从上一次请求起算，中午补跑会把整个
+    窗口拖走，下一次按点的运行反而被拒。等下一次没有损失——余额在亚马逊那边
+    继续累积。
+    """
+
+    async def scenario() -> None:
+        # occurrence 是 01:00 UTC，开机时已经是 11 小时之后。
+        now = datetime(2026, 8, 13, 12, 0, tzinfo=timezone.utc)
+        schedule_id = seed_daily_schedule(
+            database,
+            created_at=now - timedelta(days=10),
+        )
+        automation = RecordingAutomation()
+        manager = ScheduleManager(database, automation, clock=lambda: now)
+
+        created = await manager.recover_latest_missed(now=now)
+
+        assert created == ()
+        assert automation.run_ids == []
+        with database() as session:
+            assert session.query(Run).filter_by(schedule_id=schedule_id).count() == 0
+
+    asyncio.run(scenario())
+
+
+def test_reopening_the_app_repeatedly_never_multiplies_runs(database):
+    """反复开关应用不该反复触发——去重和新鲜度两道闸都得在。"""
+
+    async def scenario() -> None:
+        first = datetime(2026, 8, 13, 1, 5, tzinfo=timezone.utc)
+        schedule_id = seed_daily_schedule(
+            database,
+            created_at=first - timedelta(days=3),
+        )
+        automation = RecordingAutomation()
+
+        for offset in (0, 3, 6, 20):
+            moment = first + timedelta(minutes=offset)
+            manager = ScheduleManager(database, automation, clock=lambda m=moment: m)
+            await manager.recover_latest_missed(now=moment)
+
+        with database() as session:
+            rows = session.query(Run).filter_by(schedule_id=schedule_id).all()
+            assert len(rows) == 1, f"四次启动只该有一个任务，实际 {len(rows)}"
 
     asyncio.run(scenario())
 
@@ -291,8 +353,14 @@ def test_next_occurrence_is_kept_while_previous_one_is_still_queued(database):
 
 
 def test_saved_next_run_survives_projection_updated_at_noise(database):
+    """这条钉的是 updated_at 噪声不能压过 next_run_at。
+
+    时刻取在 occurrence 之后 10 分钟：补跑现在还要过 misfire 新鲜度那一关，
+    而本测试要验的不是那一关。
+    """
+
     async def scenario() -> None:
-        now = datetime(2026, 8, 13, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 13, 1, 10, tzinfo=timezone.utc)
         schedule_id = seed_daily_schedule(
             database,
             created_at=now - timedelta(days=20),
@@ -333,7 +401,9 @@ def test_a_naive_stored_next_run_is_read_as_utc_not_as_a_wall_clock(database):
     """
 
     async def scenario() -> None:
-        now = SCHEDULE_ANCHOR + timedelta(days=20, hours=2)
+        # 10 分钟，不是 2 小时：本测试要验的是 SQLite 返回的 naive 时间戳，
+        # 不是新鲜度限制，所以把间隔收进 misfire 宽限内。
+        now = SCHEDULE_ANCHOR + timedelta(days=20, minutes=10)
         schedule_id = seed_daily_schedule(
             database,
             created_at=SCHEDULE_ANCHOR - timedelta(days=1),
@@ -390,8 +460,14 @@ def test_refresh_isolates_corrupt_schedule_projection(database):
 
 
 def test_missed_recovery_continues_after_corrupt_schedule(database):
+    """一条坏排期不能拖垮同一轮里其余健康排期的补跑。
+
+    时刻同样取在 occurrence 之后 10 分钟：本测试验的是「坏行被跳过、好行照常」，
+    不是新鲜度限制。
+    """
+
     async def scenario() -> None:
-        now = datetime(2026, 8, 13, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 13, 1, 10, tzinfo=timezone.utc)
         valid_id, corrupt_id = seed_valid_and_corrupt_schedules(
             database, created_at=now - timedelta(days=10)
         )
