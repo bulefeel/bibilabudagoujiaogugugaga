@@ -111,6 +111,7 @@ class DatabaseNoticeBuilder:
                     Run.auth_deadline,
                     Run.error,
                     Run.workflow,
+                    Run.store_id,
                     Store.name.label("store_name"),
                     Schedule.name.label("schedule_name"),
                     Schedule.timezone.label("schedule_timezone"),
@@ -237,6 +238,7 @@ class DatabaseNoticeBuilder:
         # Counting here rather than in the card builder keeps the notice a
         # plain data object with no database access of its own.
         feedback_counts: dict[str, int] | None = None
+        feedback_backlog: dict[str, int] = {}
         feedback_items: list[SafeFeedbackNotice] = []
         feedback_omitted = 0
         if run_row.workflow == FEEDBACK_WORKFLOW_KEY:
@@ -249,6 +251,19 @@ class DatabaseNoticeBuilder:
                 ):
                     key = str(state)
                     feedback_counts[key] = feedback_counts.get(key, 0) + 1
+
+                # What is still waiting for this STORE, not just this run.  A
+                # card that only reports the run's own delta says "nothing to
+                # handle" while an entry sits waiting for the operator to pick
+                # a reason — which is exactly what happened.
+                for (state,) in session.execute(
+                    select(FeedbackReview.state).where(
+                        FeedbackReview.store_id == run_row.store_id,
+                        FeedbackReview.state.in_(("PENDING", "NEEDS_HUMAN")),
+                    )
+                ):
+                    key = str(state)
+                    feedback_backlog[key] = feedback_backlog.get(key, 0) + 1
 
                 # A dry run has not sent anything, so the interesting entries
                 # are the ones it *would* send; a real run's are the ones it
@@ -297,6 +312,7 @@ class DatabaseNoticeBuilder:
             kind,
             workflow=run_row.workflow,
             feedback_counts=feedback_counts,
+            feedback_backlog=feedback_backlog,
             run_mode=run_row.mode,
             run_error=run_row.error,
             site_payables=[row.payable_amount for row in site_rows],
@@ -612,6 +628,7 @@ def _feedback_summary(
     site_errors: list[str],
     event_message: str | None,
     has_sites: bool = False,
+    backlog: dict[str, int] | None = None,
 ) -> str:
     submitted = counts.get("SUBMITTED", 0)
     pending = counts.get("PENDING", 0)
@@ -625,28 +642,40 @@ def _feedback_summary(
             return f"反馈处理异常：{_without_exception_prefix(reason)}"
         return "反馈处理未能完成。"
     removed = counts.get("AMAZON_REMOVED", 0)
+
+    waiting = backlog or {}
+    waiting_human = waiting.get("NEEDS_HUMAN", 0)
+    waiting_pending = waiting.get("PENDING", 0)
+    outstanding = ""
+    if waiting_human or waiting_pending:
+        outstanding = (
+            f"该店铺目前还有 {waiting_human} 条待人工"
+            f"（去反馈处理台选原因）、{waiting_pending} 条待提交。"
+        )
+
     if not any(counts.values()):
         # Every number zero means this run found nothing NEW — usually because
         # the store's feedback was all handled by earlier runs.  Printing four
         # zeros made that look like a broken run.
-        return (
+        head = (
             "本次没有发现需要处理的新反馈；各站点读取情况见下方。"
             if has_sites
             else "本次没有发现需要处理的新反馈。"
         )
+        return f"{head}{outstanding}" if outstanding else head
 
     seen = (
         f"待提交 {pending} 条，待人工 {needs_human} 条，"
         f"此前已请求 {already} 条，亚马逊已剔除 {removed} 条。"
     )
     if str(run_mode).lower() == "dry_run":
-        return f"只读检查已完成，未提交任何请求审核。{seen}"
+        return f"只读检查已完成，未提交任何请求审核。{seen}{outstanding}"
     if submitted:
         return (
             f"已提交 {submitted} 条请求审核；亚马逊是否采纳由其决定。"
-            f"未确认 {uncertain} 条。{seen}"
+            f"未确认 {uncertain} 条。{seen}{outstanding}"
         )
-    return f"本次没有提交任何请求审核。未确认 {uncertain} 条。{seen}"
+    return f"本次没有提交任何请求审核。未确认 {uncertain} 条。{seen}{outstanding}"
 
 
 def _summary_for(
@@ -660,6 +689,7 @@ def _summary_for(
     event_message: str | None,
     workflow: str = "",
     feedback_counts: dict[str, int] | None = None,
+    feedback_backlog: dict[str, int] | None = None,
     has_sites: bool = False,
 ) -> str:
     if feedback_counts is not None or workflow == FEEDBACK_WORKFLOW_KEY:
@@ -671,6 +701,7 @@ def _summary_for(
             site_errors=site_errors,
             event_message=event_message,
             has_sites=has_sites,
+            backlog=feedback_backlog or {},
         )
     if kind is NotificationKind.RUN_SKIPPED:
         # Lead with the reason, not the outcome.  "已跳过" alone is what sent

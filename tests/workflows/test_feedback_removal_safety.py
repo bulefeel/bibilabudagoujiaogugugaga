@@ -763,3 +763,73 @@ async def test_the_site_row_exists_before_events_are_logged(session_factory) -> 
     await workflow.plan(make_run(), object())
 
     assert order[0].startswith("site:"), f"站点行必须先建立，实际顺序：{order}"
+
+
+# --------------------------------------------------------------------------
+# 10. 「待人工」不是死胡同
+# --------------------------------------------------------------------------
+async def test_an_undecided_entry_is_judged_again_next_run(session_factory) -> None:
+    """旧提示词判不准的条目，必须能被新提示词重新判。
+
+    实际发生过：秦登友 CA 那条 3 星在第一次运行时被保守版提示词判成「待人工」，
+    之后提示词改果断了，它却再也不会被重判——known_order_ids 不看状态所以不再
+    收录，pending_for_store 只取 PENDING 所以不会提交。卖家在页面上明明看到
+    「请求审核」是可点的，飞书却一直说没有可提交的。
+    """
+
+    # 第一次：模型判不准
+    workflow, _, _ = build(session_factory, [row("702-100", 3)], decision=None)
+    await workflow.plan(make_run("run-1"), object())
+    assert states(session_factory)["702-100"] == NEEDS_HUMAN
+
+    # 第二次：模型给得出原因了
+    workflow2, page2, repo2 = build(session_factory, [row("702-100", 3)])
+    second = make_run("run-2")
+    plan = await workflow2.plan(second, object())
+
+    assert states(session_factory)["702-100"] == PENDING
+    assert plan.lines, "重判出结果后本次运行就该有事可做"
+    assert any(event[0] == "feedback_rejudged" for event in repo2.events)
+
+    await workflow2.execute(second, object(), plan)
+    assert [item[0] for item in page2.submitted] == ["702-100"]
+
+
+async def test_rejudging_skips_entries_amazon_has_since_handled(
+    session_factory,
+) -> None:
+    """页面上已经没有入口了就别再花模型调用——它已经提交不了了。"""
+
+    workflow, _, _ = build(session_factory, [row("702-101", 3)], decision=None)
+    await workflow.plan(make_run("run-1"), object())
+
+    page = FakePage([row("702-101", 3, available=False)])
+    classifier = FakeClassifier(DECISION)
+    workflow2 = AmazonFeedbackWorkflow(
+        repository=RecordingRepository(),
+        review_store=FeedbackReviewStore(session_factory),
+        classifier=classifier,
+        page_adapter=page,
+    )
+    await workflow2.plan(make_run("run-2"), object())
+
+    assert classifier.calls == 0
+    assert states(session_factory)["702-101"] == NEEDS_HUMAN
+
+
+async def test_a_submitted_entry_is_never_rejudged(session_factory) -> None:
+    """重判只针对「待人工」；终态绝不能被重新排上。"""
+
+    workflow, page, _ = build(session_factory, [row("702-102", 2)])
+    first = make_run("run-1")
+    plan = await workflow.plan(first, object())
+    await workflow.execute(first, object(), plan)
+    assert states(session_factory)["702-102"] == SUBMITTED
+
+    workflow2, page2, _ = build(session_factory, [row("702-102", 2)])
+    second = make_run("run-2")
+    plan2 = await workflow2.plan(second, object())
+    await workflow2.execute(second, object(), plan2)
+
+    assert page2.submitted == []
+    assert states(session_factory)["702-102"] == SUBMITTED

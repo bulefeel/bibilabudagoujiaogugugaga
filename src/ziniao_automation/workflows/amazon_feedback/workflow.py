@@ -51,6 +51,10 @@ from .review_store import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_SUBMISSIONS_PER_RUN = 20
+# How many previously-undecided entries one run will show the model again.
+# Re-judging is what stops NEEDS_HUMAN being a dead end, but an operator who
+# never resolves them should not pay for the whole backlog every run.
+MAX_REJUDGE_PER_SITE = 20
 
 
 def _log_item(
@@ -215,6 +219,8 @@ class AmazonFeedbackWorkflow:
                 continue
             _log_item(marketplace.code, state, reason_code or "none")
 
+        await self._rejudge_undecided(run, marketplace, rows)
+
         # Everything still waiting to be sent for this store and site — not just
         # what this run just wrote down.  Entries decided by an earlier dry run,
         # or by an operator on the Feedback page, are exactly as actionable.
@@ -255,6 +261,65 @@ class AmazonFeedbackWorkflow:
             run.id, marketplace.code, SiteStatus.SKIPPED
         )
         return actionable
+
+    async def _rejudge_undecided(
+        self,
+        run: WorkflowRun,
+        marketplace: MarketplaceRef,
+        rows: list[FeedbackRow],
+    ) -> None:
+        """Give previously-undecided entries another look.
+
+        An entry judged by an older, more cautious prompt would otherwise sit in
+        NEEDS_HUMAN forever: ``known_order_ids`` ignores state, so it is never
+        re-recorded, and only PENDING entries are ever submitted.  Nothing has
+        been sent for these, so looking again costs nothing but a model call.
+        """
+
+        stuck = await self.review_store.needs_human_for_store(
+            int(run.store.id), marketplace.code
+        )
+        if not stuck:
+            return
+        by_order = {row.order_id: row for row in rows}
+        considered = stuck[:MAX_REJUDGE_PER_SITE]
+        resolved = 0
+
+        for item in considered:
+            row = by_order.get(item.order_id)
+            # Gone from the page, or Amazon has since handled it — either way
+            # there is nothing to submit, so do not pay for a judgement.
+            if row is None or not row.removal_available or row.amazon_removed:
+                continue
+            decision = await self.classifier.classify(
+                comment=row.comment, rating=row.rating, order_date=row.order_date
+            )
+            if decision is None:
+                continue
+            if await self.review_store.set_decision(
+                item.id,
+                category=decision.category,
+                reason_code=decision.reason_code,
+                decision_source="ai",
+                decision_note=decision.note,
+                run_id=run.id,
+            ):
+                resolved += 1
+                _log_item(marketplace.code, PENDING, decision.reason_code)
+
+        if resolved or len(stuck) > len(considered):
+            await self.repository.append_event(
+                run.id,
+                "feedback_rejudged",
+                f"重新判定了 {len(considered)} 条此前「待人工」的反馈，"
+                f"其中 {resolved} 条已给出原因",
+                marketplace_code=marketplace.code,
+                details={
+                    "considered": len(considered),
+                    "resolved": resolved,
+                    "skipped_over_cap": max(0, len(stuck) - len(considered)),
+                },
+            )
 
     async def _decide(
         self, row: FeedbackRow

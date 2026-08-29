@@ -149,6 +149,44 @@ class FeedbackReviewStore:
             ).all()
             return [_to_item(row) for row in rows]
 
+    async def needs_human_for_store(
+        self, store_id: int, marketplace_code: str
+    ) -> list[ReviewItem]:
+        """Entries a previous run could not decide.
+
+        NEEDS_HUMAN is deliberately NOT terminal: nothing was submitted, so a
+        later run may look again.  Without this the state was a dead end —
+        an entry judged by an older, more cautious prompt stayed there forever,
+        because ``known_order_ids`` ignores state and refuses to re-record it.
+        """
+
+        with self.session_factory() as session:
+            rows = session.scalars(
+                select(FeedbackReview)
+                .where(
+                    FeedbackReview.store_id == store_id,
+                    FeedbackReview.marketplace_code == marketplace_code,
+                    FeedbackReview.state == NEEDS_HUMAN,
+                )
+                .order_by(FeedbackReview.created_at)
+            ).all()
+            return [_to_item(row) for row in rows]
+
+    async def outstanding_for_store(self, store_id: int) -> dict[str, int]:
+        """Work still waiting for this store, across every run and site."""
+
+        with self.session_factory() as session:
+            rows = session.scalars(
+                select(FeedbackReview.state).where(
+                    FeedbackReview.store_id == store_id,
+                    FeedbackReview.state.in_((PENDING, NEEDS_HUMAN)),
+                )
+            ).all()
+        counts: dict[str, int] = {}
+        for state in rows:
+            counts[str(state)] = counts.get(str(state), 0) + 1
+        return counts
+
     async def counts_for_run(self, run_id: str) -> dict[str, int]:
         with self.session_factory() as session:
             rows = session.scalars(
@@ -198,11 +236,14 @@ class FeedbackReviewStore:
         reason_code: str,
         decision_source: str,
         decision_note: str | None = None,
+        run_id: str | None = None,
     ) -> bool:
         with self.session_factory() as session:
             row = session.get(FeedbackReview, review_id)
             if row is None or row.state in TERMINAL_STATES:
                 return False
+            if run_id is not None:
+                row.run_id = run_id
             row.category = category
             row.reason_code = reason_code
             row.decision_source = decision_source
