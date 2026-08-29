@@ -55,6 +55,19 @@ FEEDBACK_DISPATCHED_STATES = ("SUBMITTED", "UNCERTAIN")
 FEEDBACK_CARD_LIMIT = 10
 FEEDBACK_COMMENT_CHARS = 60
 
+# Event types whose ``message`` explains what happened to one site.  Only
+# the message is read, never ``details`` — these strings are composed by
+# this codebase, so nothing off a page can ride along.  Without the
+# feedback entries here a card listed only the sites that went wrong and
+# silently omitted every site that was read successfully.
+SITE_REASON_EVENTS = (
+    "site_skipped",
+    "feedback_scanned",
+    "feedback_list_empty",
+    "feedback_site_unavailable",
+    "feedback_list_truncated",
+)
+
 
 class SafeNoticeSender(Protocol):
     async def send(self, notice: SafeRunNotice) -> None: ...
@@ -135,7 +148,7 @@ class DatabaseNoticeBuilder:
                 select(RunEvent.site_run_id, RunEvent.message)
                 .where(
                     RunEvent.run_id == run_id,
-                    RunEvent.event_type == "site_skipped",
+                    RunEvent.event_type.in_(SITE_REASON_EVENTS),
                     RunEvent.site_run_id.is_not(None),
                 )
                 .order_by(RunEvent.id)
@@ -288,6 +301,7 @@ class DatabaseNoticeBuilder:
             run_error=run_row.error,
             site_payables=[row.payable_amount for row in site_rows],
             site_errors=[row.error for row in site_rows if row.error],
+            has_sites=bool(site_rows),
             site_skip_reasons=[
                 reason
                 for reason in (skip_reasons.get(row.id, "") for row in site_rows)
@@ -597,6 +611,7 @@ def _feedback_summary(
     run_error: str | None,
     site_errors: list[str],
     event_message: str | None,
+    has_sites: bool = False,
 ) -> str:
     submitted = counts.get("SUBMITTED", 0)
     pending = counts.get("PENDING", 0)
@@ -609,15 +624,29 @@ def _feedback_summary(
         if reason:
             return f"反馈处理异常：{_without_exception_prefix(reason)}"
         return "反馈处理未能完成。"
-    if str(run_mode).lower() == "dry_run":
+    removed = counts.get("AMAZON_REMOVED", 0)
+    if not any(counts.values()):
+        # Every number zero means this run found nothing NEW — usually because
+        # the store's feedback was all handled by earlier runs.  Printing four
+        # zeros made that look like a broken run.
         return (
-            f"只读检查已完成，未提交任何请求审核。"
-            f"待提交 {pending} 条，待人工 {needs_human} 条，此前已请求 {already} 条。"
+            "本次没有发现需要处理的新反馈；各站点读取情况见下方。"
+            if has_sites
+            else "本次没有发现需要处理的新反馈。"
         )
-    tail = f"待人工 {needs_human} 条，未确认 {uncertain} 条，此前已请求 {already} 条。"
+
+    seen = (
+        f"待提交 {pending} 条，待人工 {needs_human} 条，"
+        f"此前已请求 {already} 条，亚马逊已剔除 {removed} 条。"
+    )
+    if str(run_mode).lower() == "dry_run":
+        return f"只读检查已完成，未提交任何请求审核。{seen}"
     if submitted:
-        return f"已提交 {submitted} 条请求审核；亚马逊是否采纳由其决定。{tail}"
-    return f"本次没有提交任何请求审核。{tail}"
+        return (
+            f"已提交 {submitted} 条请求审核；亚马逊是否采纳由其决定。"
+            f"未确认 {uncertain} 条。{seen}"
+        )
+    return f"本次没有提交任何请求审核。未确认 {uncertain} 条。{seen}"
 
 
 def _summary_for(
@@ -631,6 +660,7 @@ def _summary_for(
     event_message: str | None,
     workflow: str = "",
     feedback_counts: dict[str, int] | None = None,
+    has_sites: bool = False,
 ) -> str:
     if feedback_counts is not None or workflow == FEEDBACK_WORKFLOW_KEY:
         return _feedback_summary(
@@ -640,6 +670,7 @@ def _summary_for(
             run_error=run_error,
             site_errors=site_errors,
             event_message=event_message,
+            has_sites=has_sites,
         )
     if kind is NotificationKind.RUN_SKIPPED:
         # Lead with the reason, not the outcome.  "已跳过" alone is what sent

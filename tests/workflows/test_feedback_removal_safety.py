@@ -695,3 +695,71 @@ async def test_amazon_removal_wins_over_a_missing_action(session_factory) -> Non
     await workflow.plan(make_run(), object())
 
     assert states(session_factory)["702-82"] == "AMAZON_REMOVED"
+
+
+# --------------------------------------------------------------------------
+# 9. 每个站点都要出现在报告里
+# --------------------------------------------------------------------------
+async def test_every_marketplace_gets_a_site_row(session_factory) -> None:
+    """飞书卡片只列出「出问题的站点」，读得好好的一个都不显示。
+
+    根因：site_runs 行只在两处产生——计划里有可提交条目，或我在跳过/失败路径上
+    调了 set_site_status。正常读完、没事可做的站点两处都不沾，于是三站全正常的
+    店铺整张卡上一个站点都没有，而只有一个站点没开通的店铺看起来「只跑了那一个」。
+    """
+
+    workflow, _, repo = build(session_factory, [row("702-90", 1)])
+    await workflow.plan(make_run(), object())
+
+    assert "CA" in repo.site_status, "读取正常的站点也必须有站点行"
+    assert repo.site_status["CA"] != "PREFLIGHT", "必须落到终态，不能停在读取中"
+
+
+async def test_an_unavailable_marketplace_still_gets_a_row(session_factory) -> None:
+    workflow, page, repo = build(session_factory, [row("702-91", 1)])
+    page.unavailable = True
+
+    await workflow.plan(make_run(), object())
+
+    assert repo.site_status.get("CA") == "SKIPPED"
+
+
+async def test_an_empty_marketplace_still_gets_a_row(session_factory) -> None:
+    workflow, _, repo = build(session_factory, [])
+    await workflow.plan(make_run(), object())
+
+    assert repo.site_status.get("CA") == "SKIPPED"
+
+
+async def test_the_site_row_exists_before_events_are_logged(session_factory) -> None:
+    """事件是靠 marketplace_code 去查 site_runs 行来挂载的。
+
+    行不存在时事件就成了孤儿，卡片上那个站点便没有任何原因说明——这正是
+    「未开通」的站点在卡片上只显示一个光秃秃「已跳过」的原因。
+    """
+
+    order: list[str] = []
+
+    class OrderedRepository(RecordingRepository):
+        async def set_site_status(self, run_id, marketplace_code, status, *, error=None):
+            order.append(f"site:{marketplace_code}")
+            await super().set_site_status(run_id, marketplace_code, status, error=error)
+
+        async def append_event(self, run_id, event_type, message, *, marketplace_code=None, details=None):
+            order.append(f"event:{event_type}")
+            await super().append_event(
+                run_id, event_type, message,
+                marketplace_code=marketplace_code, details=details,
+            )
+
+    page = FakePage([row("702-92", 1)])
+    page.unavailable = True
+    workflow = AmazonFeedbackWorkflow(
+        repository=OrderedRepository(),
+        review_store=FeedbackReviewStore(session_factory),
+        classifier=FakeClassifier(DECISION),
+        page_adapter=page,
+    )
+    await workflow.plan(make_run(), object())
+
+    assert order[0].startswith("site:"), f"站点行必须先建立，实际顺序：{order}"

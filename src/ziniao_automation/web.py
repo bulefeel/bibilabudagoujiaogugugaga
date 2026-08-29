@@ -256,6 +256,8 @@ STATUS_LABELS = {
     "WAITING_AUTH": "等待人工验证", "RECONCILING": "回读核对",
     "SUCCEEDED": "已完成", "PARTIAL": "部分完成", "FAILED": "失败", "CANCELLED": "已取消",
     "SKIPPED": "已跳过", "NEEDS_HUMAN_AUTH": "需要人工验证",
+    # Site-level states that had no label and rendered as raw English.
+    "PREFLIGHT": "读取中", "PLANNED": "已列入计划", "DRY_RUN_COMPLETE": "只读检查完成",
     "UNCERTAIN_FINANCIAL": "已发出，平台尚未显示", "PENDING": "待处理",
     "APPROVED": "已批准", "CONFIRMED": "已确认", "ARMED": "已锁定",
     "SUBMITTED": "已提交", "UNCERTAIN": "已发出，平台尚未显示", "INVALIDATED": "已失效",

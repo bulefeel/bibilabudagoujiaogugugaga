@@ -296,7 +296,7 @@ def _message(notice: SafeRunNotice) -> str:
         lines.extend(("", f"**说明：** {_md(notice.summary)}"))
     if notice.sites:
         lines.extend(("", "**站点明细**"))
-        lines.extend(_site_line(site) for site in notice.sites)
+        lines.extend(_site_line(site, notice.workflow) for site in notice.sites)
     if notice.feedback_items:
         heading = (
             "**本次将提交（尚未发出）**"
@@ -319,7 +319,7 @@ def _message(notice: SafeRunNotice) -> str:
 _REQUESTED_OUTCOMES = frozenset({"ARMED", "SUBMITTED", "CONFIRMED", "UNCERTAIN"})
 
 
-def _site_line(site: SafeSiteNotice) -> str:
+def _site_line(site: SafeSiteNotice, workflow: str = "") -> str:
     parts = [f"**{_md(site.code.upper() or '未知')}**"]
     if site.payable is not None:
         # "可提现" is the dashboard balance and keeps moving as orders settle.
@@ -339,7 +339,7 @@ def _site_line(site: SafeSiteNotice) -> str:
     if site.reference_suffix:
         parts.append(f"参考号 `••••{_last_four(site.reference_suffix)}`")
     if site.outcome:
-        outcome = _outcome_label(site.outcome)
+        outcome = _outcome_label(site.outcome, workflow)
         reason = _short_reason(site.reason)
         parts.append(f"结果 {_md(outcome + ('：' + reason if reason else ''))}")
     return "- " + " ｜ ".join(parts)
@@ -549,8 +549,21 @@ _OUTCOME_LABELS = {
 }
 
 
-def _outcome_label(value: str) -> str:
-    return _OUTCOME_LABELS.get(value.upper(), _plain(value))
+# 「已跳过」/「已确认」 are payout words.  For a feedback sweep the same two
+# states mean "read it, nothing left to send" and "submitted", and the reason
+# text beside them says which.
+_FEEDBACK_OUTCOME_LABELS = {
+    "SKIPPED": "已读取，无需提交",
+    "CONFIRMED": "已提交请求",
+    "PREFLIGHT": "读取中",
+}
+
+
+def _outcome_label(value: str, workflow: str = "") -> str:
+    key = value.upper()
+    if workflow == _FEEDBACK_WORKFLOW_KEY and key in _FEEDBACK_OUTCOME_LABELS:
+        return _FEEDBACK_OUTCOME_LABELS[key]
+    return _OUTCOME_LABELS.get(key, _plain(value))
 
 
 # Exception class names are an implementation detail; the sentence after them

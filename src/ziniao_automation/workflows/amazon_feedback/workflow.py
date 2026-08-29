@@ -125,6 +125,16 @@ class AmazonFeedbackWorkflow:
     async def _plan_marketplace(
         self, run: WorkflowRun, page: Any, marketplace: MarketplaceRef
     ) -> int:
+        # Create the site row before anything else.  Two reasons: every site
+        # the run touched has to appear in the report — the card used to list
+        # only the ones that went wrong, because a site that read fine and had
+        # nothing to do never produced a row at all — and ``append_event``
+        # binds an event to its site by looking the row up, so events logged
+        # before it exists are orphaned.
+        await self.repository.set_site_status(
+            run.id, marketplace.code, SiteStatus.PREFLIGHT
+        )
+
         outcome = await self.page_adapter.open_list(page, marketplace.domain)
         if not outcome.ok:
             # Seller Central bounced us to the account switcher, which is what
@@ -163,6 +173,9 @@ class AmazonFeedbackWorkflow:
                 details={"reason_code": "no_rows"},
             )
             _log_item(marketplace.code, "EMPTY", "no_rows")
+            await self.repository.set_site_status(
+                run.id, marketplace.code, SiteStatus.SKIPPED
+            )
             return 0
 
         known = await self.review_store.known_order_ids(
@@ -235,6 +248,12 @@ class AmazonFeedbackWorkflow:
                 details={"count": len(unreadable), "reason_code": "menu_unreadable"},
             )
             _log_item(marketplace.code, "DEFERRED", "menu_unreadable", count=len(unreadable))
+        # Read successfully.  SKIPPED here means "nothing left to send", which
+        # the event message spells out; execute() upgrades it to CONFIRMED for
+        # any site that actually submits.
+        await self.repository.set_site_status(
+            run.id, marketplace.code, SiteStatus.SKIPPED
+        )
         return actionable
 
     async def _decide(
@@ -338,6 +357,16 @@ class AmazonFeedbackWorkflow:
                 run.id, marketplace.code, SiteStatus.SKIPPED
             )
             return 0
+
+        # Create the site row before anything else.  Two reasons: every site
+        # the run touched has to appear in the report — the card used to list
+        # only the ones that went wrong, because a site that read fine and had
+        # nothing to do never produced a row at all — and ``append_event``
+        # binds an event to its site by looking the row up, so events logged
+        # before it exists are orphaned.
+        await self.repository.set_site_status(
+            run.id, marketplace.code, SiteStatus.PREFLIGHT
+        )
 
         outcome = await self.page_adapter.open_list(page, marketplace.domain)
         if not outcome.ok:

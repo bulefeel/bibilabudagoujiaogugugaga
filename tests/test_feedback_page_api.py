@@ -234,7 +234,11 @@ def test_the_feishu_card_for_a_feedback_run_never_mentions_payouts(client) -> No
     from ziniao_automation.notifications.dto import NotificationKind
 
     app, _, _ = client
-    run_id = _seed_run(app, "amazon_feedback_removal")
+    # A run that actually handled something — a run with nothing recorded gets
+    # the shorter "没有新反馈" summary, which would not exercise the wording.
+    run_id = _seed_reviewed_run(
+        app, mode="auto", state="SUBMITTED", comment="包裹寄丢了"
+    )
 
     notice = DatabaseNoticeBuilder(app.state.sessions).build(
         run_id, NotificationKind.RUN_COMPLETED
