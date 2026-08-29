@@ -534,28 +534,34 @@ class AmazonFeedbackPage:
             )
         return rows
 
-    async def wait_until_action_gone(
-        self, page: Any, order_id: str, *, timeout_seconds: float = 12.0
-    ) -> bool:
-        """Poll until the row stops offering 「请求审核」.
+    async def confirm_removal_requested(
+        self, page: Any, domain: str, order_id: str, *, attempts: int = 3
+    ) -> tuple[bool, list[FeedbackRow]]:
+        """Reload the list and check the row stopped offering the action.
 
-        Amazon withdraws the action once a review has been requested, but the
-        Angular list re-renders asynchronously, so a single read right after the
-        click reports the old state and turns a successful submission into
-        「未确认」.  Returns False on timeout, which the caller treats as
-        unconfirmed — never as a reason to submit again.
+        The reload is the whole point.  Polling the same DOM cannot work: the
+        Angular list does not re-fetch on its own, so re-reading it after the
+        click returns the pre-submit markup every time.  On the first real
+        submission that recorded a request which had demonstrably landed as
+        UNCERTAIN.
+
+        Returns ``(confirmed, rows)``; the caller reuses the fresh rows so the
+        next entry is not judged against a stale list.  False never means
+        "submit again" — the entry becomes UNCERTAIN and stops there.
         """
 
-        waited = 0.0
-        step = self.settle_seconds
-        while waited < timeout_seconds:
-            rows = {row.order_id: row for row in await self.read_rows(page)}
-            row = rows.get(order_id)
-            if row is not None and row.menu_readable and not row.removal_available:
-                return True
-            await page.wait_for_timeout(int(step * 1000))
-            waited += step
-        return False
+        rows: list[FeedbackRow] = []
+        for _ in range(max(1, attempts)):
+            await self.open_list(page, domain)
+            rows, _truncated = await self.read_all_rows(page)
+            row = next((item for item in rows if item.order_id == order_id), None)
+            if row is None:
+                # Gone from the list entirely — Amazon removed it outright.
+                return True, rows
+            if row.menu_readable and not row.removal_available:
+                return True, rows
+            await page.wait_for_timeout(int(self.settle_seconds * 1000))
+        return False, rows
 
     async def open_removal_panel(self, page: Any, order_id: str) -> dict[str, Any]:
         """Open the inline removal panel and advance past 继续.

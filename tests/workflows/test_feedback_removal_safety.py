@@ -60,6 +60,7 @@ class FakePage:
         self.select_result_ok = True
         self.unavailable = False
         self.truncated = False
+        self.reloads = 0
 
     async def open_list(self, page: Any, domain: str) -> ListOutcome:
         if self.unavailable:
@@ -115,11 +116,13 @@ class FakePage:
         self.closed += 1
         return 1
 
-    async def wait_until_action_gone(
-        self, page: Any, order_id: str, *, timeout_seconds: float = 12.0
-    ) -> bool:
+    async def confirm_removal_requested(
+        self, page: Any, domain: str, order_id: str, *, attempts: int = 3
+    ) -> tuple[bool, list[FeedbackRow]]:
+        self.reloads += 1
         row = next((r for r in self._rows if r.order_id == order_id), None)
-        return row is not None and not row.removal_available
+        confirmed = row is not None and not row.removal_available
+        return confirmed, list(self._rows)
 
 
 class FakeClassifier:
@@ -833,3 +836,20 @@ async def test_a_submitted_entry_is_never_rejudged(session_factory) -> None:
 
     assert page2.submitted == []
     assert states(session_factory)["702-102"] == SUBMITTED
+
+
+async def test_confirming_a_submission_reloads_the_list(session_factory) -> None:
+    """确认必须重新加载列表，不能反复读同一个 DOM。
+
+    Angular 的列表不会自己重取，所以点完提交后再读到的还是提交前的内容——
+    第一次真实提交就是这么把一条**确实送达**的请求记成了「未确认」。
+    """
+
+    workflow, page, _ = build(session_factory, [row("702-110", 2)])
+    run = make_run()
+
+    plan = await workflow.plan(run, object())
+    await workflow.execute(run, object(), plan)
+
+    assert page.reloads >= 1, "确认阶段必须重新打开列表"
+    assert states(session_factory)["702-110"] == SUBMITTED

@@ -447,7 +447,9 @@ class AmazonFeedbackWorkflow:
             if submitted >= remaining:
                 await self._note_budget_stop(run, marketplace, submitted, _max_submissions(run))
                 break
-            outcome = await self._submit_one(run, page, marketplace, item, rows)
+            outcome, rows = await self._submit_one(
+                run, page, marketplace, item, rows
+            )
             if outcome == SUBMITTED:
                 submitted += 1
 
@@ -466,12 +468,16 @@ class AmazonFeedbackWorkflow:
         marketplace: MarketplaceRef,
         item: Any,
         rows: dict[str, FeedbackRow],
-    ) -> str:
+    ) -> tuple[str, dict[str, FeedbackRow]]:
+        """One entry.  Returns its outcome and the rows to judge the next
+        one against: confirming a submission reloads the list, so the
+        caller's copy is stale from that point on."""
+
         category, reason_code = item.category, item.reason_code
         if not category or not reason_code:
             await self.review_store.mark(item.id, NEEDS_HUMAN, run_id=run.id)
             _log_item(marketplace.code, NEEDS_HUMAN, "no_reason_recorded")
-            return NEEDS_HUMAN
+            return NEEDS_HUMAN, rows
 
         row = rows.get(item.order_id)
         if row is None:
@@ -480,7 +486,7 @@ class AmazonFeedbackWorkflow:
                 details={"reason_code": "row_disappeared"},
             )
             _log_item(marketplace.code, FAILED, "row_disappeared")
-            return FAILED
+            return FAILED, rows
         if not row.is_low_star:
             # The list changed underneath us.  Never act on a row that is no
             # longer a 1–3 star entry.
@@ -489,14 +495,14 @@ class AmazonFeedbackWorkflow:
                 details={"reason_code": "rating_changed"},
             )
             _log_item(marketplace.code, FAILED, "rating_changed", rating=row.rating)
-            return FAILED
+            return FAILED, rows
 
         try:
             opened = await self.page_adapter.open_removal_panel(page, item.order_id)
             if not opened.get("ok"):
                 return await self._abort_item(
                     run, marketplace, item, str(opened.get("reason") or "panel_failed")
-                )
+                ), rows
 
             chosen = await self.page_adapter.select_reason(
                 page, item.order_id, category, reason_code
@@ -504,7 +510,7 @@ class AmazonFeedbackWorkflow:
             if not chosen.get("ok"):
                 return await self._abort_item(
                     run, marketplace, item, str(chosen.get("reason") or "reason_failed")
-                )
+                ), rows
 
             result = await self.page_adapter.submit_removal(
                 page, item.order_id, category, reason_code
@@ -512,14 +518,18 @@ class AmazonFeedbackWorkflow:
             if not result.get("ok"):
                 return await self._abort_item(
                     run, marketplace, item, str(result.get("reason") or "submit_blocked")
-                )
+                ), rows
         finally:
             # Always return the table to its resting state, whatever happened.
             await self.page_adapter.close_panels(page)
 
         # The click went through.  Confirm by re-reading the row's own menu:
         # once a review is requested Amazon stops offering request_removal.
-        confirmed = await self._confirm_submitted(page, item.order_id)
+        confirmed, fresh = await self.page_adapter.confirm_removal_requested(
+            page, marketplace.domain, item.order_id
+        )
+        if fresh:
+            rows = {row.order_id: row for row in fresh}
         state = SUBMITTED if confirmed else UNCERTAIN
         await self.review_store.mark(
             item.id,
@@ -540,18 +550,7 @@ class AmazonFeedbackWorkflow:
             details={"reason_code": reason_code, "category": category, "state": state},
         )
         _log_item(marketplace.code, state, reason_code)
-        return state
-
-    async def _confirm_submitted(self, page: Any, order_id: str) -> bool:
-        """Confirm from the page, not from the fact that we clicked.
-
-        Amazon withdraws 「请求审核」 from a feedback once a review has been
-        requested for it, so the action being gone is a positive signal that the
-        request landed.  A row that has vanished, or one that still offers the
-        action, is left UNCERTAIN — and UNCERTAIN is never retried either.
-        """
-
-        return await self.page_adapter.wait_until_action_gone(page, order_id)
+        return state, rows
 
     async def _abort_item(
         self, run: WorkflowRun, marketplace: MarketplaceRef, item: Any, reason_code: str
