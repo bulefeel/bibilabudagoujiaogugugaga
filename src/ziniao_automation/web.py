@@ -690,6 +690,19 @@ def create_app(
         run = WorkflowRepository(db).get_run(run_id, full=True)
         _attach_queue_projection(db, [run])
         guards = list(db.scalars(select(OperationGuard).where(OperationGuard.run_id == run_id)))
+        # Which reviews this run actually touched, with the buyer's own words —
+        # a count cannot be checked against the seller account.
+        feedback_reviews = (
+            list(
+                db.scalars(
+                    select(FeedbackReview)
+                    .where(FeedbackReview.run_id == run_id)
+                    .order_by(FeedbackReview.rating, FeedbackReview.created_at)
+                )
+            )
+            if run.workflow == "amazon_feedback_removal"
+            else []
+        )
         registry = getattr(request.app.state, "workflow_registry", None)
         definitions = {
             item["key"]: item
@@ -702,6 +715,9 @@ def create_app(
                 "run": run,
                 "guards": guards,
                 "workflow_meta": definitions.get(run.workflow),
+                "feedback_reviews": feedback_reviews,
+                "reason_catalog": REASON_CATALOG,
+                "category_labels": CATEGORY_LABELS,
             },
             db=db,
             page_title=f"任务 {run.id[:8]}",

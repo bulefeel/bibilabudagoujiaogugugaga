@@ -32,7 +32,12 @@ from ..models import (
     Store,
     StoreMarketplace,
 )
-from .dto import NotificationKind, SafeRunNotice, SafeSiteNotice
+from .dto import (
+    NotificationKind,
+    SafeFeedbackNotice,
+    SafeRunNotice,
+    SafeSiteNotice,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,14 @@ _ALLOWED_KINDS = frozenset(NotificationKind)
 # A run of this workflow moves no money, so every payout phrase in this module
 # would be a false statement about it.
 FEEDBACK_WORKFLOW_KEY = "amazon_feedback_removal"
+FEEDBACK_PENDING = "PENDING"
+# Entries whose submit button was actually clicked.  UNCERTAIN belongs here:
+# the request went out, only the read-back could not confirm it.
+FEEDBACK_DISPATCHED_STATES = ("SUBMITTED", "UNCERTAIN")
+# Cards are read on a phone.  Beyond this the list stops being scannable and
+# the count in the summary is the better answer.
+FEEDBACK_CARD_LIMIT = 10
+FEEDBACK_COMMENT_CHARS = 60
 
 
 class SafeNoticeSender(Protocol):
@@ -211,6 +224,8 @@ class DatabaseNoticeBuilder:
         # Counting here rather than in the card builder keeps the notice a
         # plain data object with no database access of its own.
         feedback_counts: dict[str, int] | None = None
+        feedback_items: list[SafeFeedbackNotice] = []
+        feedback_omitted = 0
         if run_row.workflow == FEEDBACK_WORKFLOW_KEY:
             with self.session_factory() as session:
                 feedback_counts = {}
@@ -221,6 +236,41 @@ class DatabaseNoticeBuilder:
                 ):
                     key = str(state)
                     feedback_counts[key] = feedback_counts.get(key, 0) + 1
+
+                # A dry run has not sent anything, so the interesting entries
+                # are the ones it *would* send; a real run's are the ones it
+                # actually clicked.
+                wanted = (
+                    (FEEDBACK_PENDING,)
+                    if str(run_row.mode).lower() == "dry_run"
+                    else FEEDBACK_DISPATCHED_STATES
+                )
+                rows = session.execute(
+                    select(
+                        FeedbackReview.order_id,
+                        FeedbackReview.rating,
+                        FeedbackReview.comment,
+                        FeedbackReview.category,
+                        FeedbackReview.reason_code,
+                        FeedbackReview.state,
+                    )
+                    .where(
+                        FeedbackReview.run_id == run_id,
+                        FeedbackReview.state.in_(wanted),
+                    )
+                    .order_by(FeedbackReview.rating, FeedbackReview.created_at)
+                ).all()
+                feedback_omitted = max(0, len(rows) - FEEDBACK_CARD_LIMIT)
+                for row in rows[:FEEDBACK_CARD_LIMIT]:
+                    feedback_items.append(
+                        SafeFeedbackNotice(
+                            order_id=str(row.order_id or ""),
+                            rating=int(row.rating or 0),
+                            comment=_clip(row.comment, FEEDBACK_COMMENT_CHARS),
+                            reason_label=_reason_label(row.category, row.reason_code),
+                            state=str(row.state or ""),
+                        )
+                    )
 
         summary = _summary_for(
             kind,
@@ -290,6 +340,8 @@ class DatabaseNoticeBuilder:
             run_short_id=run_row.id[:8],
             store_name=run_row.store_name,
             workflow=run_row.workflow or "",
+            feedback_items=tuple(feedback_items),
+            feedback_omitted=feedback_omitted,
             mode=run_row.mode,
             trigger=run_row.trigger,
             schedule_name=run_row.schedule_name or "",
@@ -506,6 +558,21 @@ _EXCEPTION_PREFIX = re.compile(
     r"(?:Error|Rejected|Required|Exists|Changed|Dispatched|Limited|Operation|Expired)"
     r"\s*[:：]\s*"
 )
+
+
+def _clip(value: str | None, limit: int) -> str:
+    """One line, length-capped.  Newlines would break the card's list layout."""
+
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _reason_label(category: str | None, reason_code: str | None) -> str:
+    if not category or not reason_code:
+        return ""
+    from ..workflows.amazon_feedback.config import REASON_CATALOG
+
+    return REASON_CATALOG.get(str(category), {}).get(str(reason_code), "")
 
 
 def _without_exception_prefix(value: str | None) -> str:

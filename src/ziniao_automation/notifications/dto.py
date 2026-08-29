@@ -65,6 +65,28 @@ class SafeSiteNotice:
 
 
 @dataclass(frozen=True, slots=True)
+class SafeFeedbackNotice:
+    """One feedback entry, as it appears on a card.
+
+    ``comment`` is buyer wording, and this module otherwise refuses to carry
+    free text to Feishu at all.  It is here because the operator asked to see
+    *which* review was submitted — a count alone cannot be checked against the
+    seller account.  The builder truncates it and the renderer still runs it
+    through the same redaction pass as every other operator-facing string.
+    """
+
+    order_id: str
+    rating: int
+    comment: str = ""
+    reason_label: str = ""
+    state: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rating, int):
+            object.__setattr__(self, "rating", int(self.rating))
+
+
+@dataclass(frozen=True, slots=True)
 class SafeRunNotice:
     """Whitelist DTO used by all external notification renderers."""
 
@@ -87,6 +109,10 @@ class SafeRunNotice:
     next_action: str = ""
     sites: tuple[SafeSiteNotice, ...] = field(default_factory=tuple)
     deadline_at: datetime | None = None
+    # Present only for the feedback workflow; empty for every payout notice.
+    feedback_items: tuple[SafeFeedbackNotice, ...] = field(default_factory=tuple)
+    # How many entries were left out of ``feedback_items`` by the card's cap.
+    feedback_omitted: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, NotificationKind):
@@ -95,6 +121,14 @@ class SafeRunNotice:
             object.__setattr__(self, "sites", tuple(self.sites))
         if any(not isinstance(site, SafeSiteNotice) for site in self.sites):
             raise TypeError("sites must contain only SafeSiteNotice values")
+        if not isinstance(self.feedback_items, tuple):
+            object.__setattr__(self, "feedback_items", tuple(self.feedback_items))
+        if any(
+            not isinstance(item, SafeFeedbackNotice) for item in self.feedback_items
+        ):
+            raise TypeError(
+                "feedback_items must contain only SafeFeedbackNotice values"
+            )
         for name in ("scheduled_for", "started_at", "deadline_at"):
             value = getattr(self, name)
             if value is not None and not isinstance(value, datetime):

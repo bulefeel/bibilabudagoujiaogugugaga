@@ -19,7 +19,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from ..models import SystemSetting
 from ..ziniao.credentials import read_generic_credential
-from .dto import NotificationKind, SafeRunNotice, SafeSiteNotice
+from .dto import (
+    NotificationKind,
+    SafeFeedbackNotice,
+    SafeRunNotice,
+    SafeSiteNotice,
+)
 
 if TYPE_CHECKING:  # pragma: no cover
     from ..workflows.types import WorkflowReport
@@ -292,6 +297,16 @@ def _message(notice: SafeRunNotice) -> str:
     if notice.sites:
         lines.extend(("", "**站点明细**"))
         lines.extend(_site_line(site) for site in notice.sites)
+    if notice.feedback_items:
+        heading = (
+            "**本次将提交（尚未发出）**"
+            if str(notice.mode).lower() == "dry_run"
+            else "**本次已提交**"
+        )
+        lines.extend(("", heading))
+        lines.extend(_feedback_line(item) for item in notice.feedback_items)
+        if notice.feedback_omitted:
+            lines.append(f"- 另有 {notice.feedback_omitted} 条，见本地后台「反馈处理台」")
     action = notice.next_action or _default_next_action(notice.kind, notice.workflow)
     if action:
         lines.extend(("", f"**下一步：** {_md(action)}"))
@@ -327,6 +342,66 @@ def _site_line(site: SafeSiteNotice) -> str:
         outcome = _outcome_label(site.outcome)
         reason = _short_reason(site.reason)
         parts.append(f"结果 {_md(outcome + ('：' + reason if reason else ''))}")
+    return "- " + " ｜ ".join(parts)
+
+
+_EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+# Seven or more digits with the usual separators — enough to be a phone number
+# or an account, not enough to catch a price or a date.
+_CONTACT_DIGITS = re.compile(r"(?:\+?\d[\d()\-. ]{5,}\d)")
+_DATE_LIKE = re.compile(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}")
+# Amazon order ids are 3-7-7; keep the whole thing so it can be looked up.
+_ORDER_REF = re.compile(r"[^0-9A-Za-z-]")
+
+
+def _order_ref(value: object) -> str:
+    return _ORDER_REF.sub("", str(value or ""))[:24] or "unknown"
+
+
+def _mask_contacts(text: str) -> str:
+    """Strip contact details out of buyer wording before it leaves the machine.
+
+    Amazon's own removal reason 103 is 「反馈包含了个人识别信息」, so a comment
+    containing a phone number or an email is not an edge case — it is one of
+    the categories this workflow exists to act on.  The operator can read the
+    untouched text on the local Feedback page; a group chat is the wrong place
+    for a buyer's phone number.  The module-wide ``_redact`` only masks runs of
+    seven or more digits, which lets a formatted number like 555-0142 through.
+    """
+
+    text = _EMAIL.sub("[邮箱已隐藏]", text)
+
+    def _mask(match: re.Match[str]) -> str:
+        found = match.group(0)
+        # A date is not a contact detail, and buyers write them constantly
+        # ("包裹 2026-08-29 才到").  Masking those would mangle the very text
+        # the operator asked to see.
+        if _DATE_LIKE.fullmatch(found.strip()):
+            return found
+        return "[号码已隐藏]" if sum(c.isdigit() for c in found) >= 7 else found
+
+    return _CONTACT_DIGITS.sub(_mask, text)
+
+
+def _feedback_line(item: SafeFeedbackNotice) -> str:
+    """One review, as stars + the buyer's own words.
+
+    A count alone cannot be checked against the seller account, which is why
+    the operator asked for these.  The comment is already truncated by the
+    builder; ``_md`` escapes it and the message-level redaction pass still
+    applies.
+    """
+
+    rating = max(0, min(5, int(item.rating or 0)))
+    parts = [f"{'★' * rating}{'☆' * (5 - rating)}"]
+    if item.order_id:
+        parts.append(f"`{_order_ref(item.order_id)}`")
+    if item.comment:
+        parts.append(f"「{_md(_mask_contacts(item.comment))}」")
+    if item.reason_label:
+        parts.append(f"原因：{_md(item.reason_label)}")
+    if str(item.state).upper() == "UNCERTAIN":
+        parts.append("**页面未确认**")
     return "- " + " ｜ ".join(parts)
 
 

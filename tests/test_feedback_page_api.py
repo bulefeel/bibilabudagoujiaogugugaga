@@ -240,3 +240,126 @@ def test_a_payout_run_still_gets_the_payout_card(client) -> None:
     assert "紫鸟提现" in notice.title
     assert "提现" in notice.summary
     assert "提现结果已确认" in _message(notice)
+
+
+# --------------------------------------------------------------------------
+# 星级和留言要能看到——但买家的联系方式不该发到飞书群里
+# --------------------------------------------------------------------------
+def _seed_reviewed_run(app, *, mode: str, state: str, comment: str) -> str:
+    from ziniao_automation.models import Run
+
+    with app.state.sessions() as session:
+        if not session.query(FeedbackReview).count():
+            StoreRepository(session).create(
+                name="测试店铺", selector_type="oauth", selector_value="oauth-1"
+            )
+            session.flush()
+        run_id = f"run-{mode}-{state}"
+        session.add(
+            Run(id=run_id, store_id=1, workflow="amazon_feedback_removal",
+                mode=mode, status="SUCCEEDED")
+        )
+        session.flush()
+        session.add(
+            FeedbackReview(
+                run_id=run_id, store_id=1, marketplace_code="CA",
+                order_id="702-2037224-8066659", rating=2, comment=comment,
+                category="delivery-related-feedback", reason_code="402",
+                state=state,
+            )
+        )
+        session.commit()
+        return run_id
+
+
+def _card_body(app, run_id: str) -> str:
+    from ziniao_automation.notifications.database import DatabaseNoticeBuilder
+    from ziniao_automation.notifications.dto import NotificationKind
+    from ziniao_automation.notifications.feishu import _message
+
+    notice = DatabaseNoticeBuilder(app.state.sessions).build(
+        run_id, NotificationKind.RUN_COMPLETED
+    )
+    assert notice is not None
+    return _message(notice)
+
+
+def test_the_card_shows_the_stars_and_the_buyers_words(client) -> None:
+    app, _, _ = client
+    run_id = _seed_reviewed_run(
+        app, mode="auto", state="SUBMITTED", comment="包裹寄丢了等了三周"
+    )
+
+    body = _card_body(app, run_id)
+
+    assert "本次已提交" in body
+    assert "★★☆☆☆" in body
+    assert "包裹寄丢了等了三周" in body
+    assert "订单由亚马逊配送" in body
+    # The full order id, not the 8-character run-id form.
+    assert "702-2037224-8066659" in body
+
+
+def test_a_dry_run_card_says_these_have_not_been_sent(client) -> None:
+    app, _, _ = client
+    run_id = _seed_reviewed_run(
+        app, mode="dry_run", state="PENDING", comment="东西不对"
+    )
+
+    body = _card_body(app, run_id)
+
+    assert "本次将提交（尚未发出）" in body
+    assert "东西不对" in body
+
+
+def test_a_buyers_phone_number_never_reaches_feishu(client) -> None:
+    """亚马逊的删除理由 103 就是「反馈包含了个人识别信息」——含联系方式的留言
+    不是边缘情况，正是这个流程要处理的一类。完整原文留在本地页面上。"""
+
+    app, _, _ = client
+    run_id = _seed_reviewed_run(
+        app, mode="auto", state="SUBMITTED",
+        comment="Call me at 555-0142 or bob@example.com",
+    )
+
+    body = _card_body(app, run_id)
+
+    assert "555-0142" not in body
+    assert "bob@example.com" not in body
+    assert "号码已隐藏" in body
+    assert "邮箱已隐藏" in body
+
+
+def test_a_date_in_a_comment_is_not_mistaken_for_a_phone_number(client) -> None:
+    app, _, _ = client
+    run_id = _seed_reviewed_run(
+        app, mode="auto", state="SUBMITTED", comment="包裹 2026-08-29 才到"
+    )
+
+    body = _card_body(app, run_id)
+
+    # markdown 转义会把连字符写成 ``\-``；真正要钉的是它没有被当成号码抹掉。
+    assert "号码已隐藏" not in body
+    assert "2026" in body and "08" in body and "29" in body
+
+
+def test_the_run_detail_lists_the_reviews_that_run_handled(client) -> None:
+    app, test_client, _ = client
+    run_id = _seed_reviewed_run(
+        app, mode="auto", state="SUBMITTED", comment="迟到了很久非常失望"
+    )
+
+    page = test_client.get(f"/runs/{run_id}")
+
+    assert page.status_code == 200
+    assert "本次处理的评论" in page.text
+    # The local page is the audit surface, so it shows the untouched text.
+    assert "迟到了很久非常失望" in page.text
+    assert "702-2037224-8066659" in page.text
+
+
+def test_a_payout_run_detail_has_no_review_table(client) -> None:
+    app, test_client, _ = client
+    run_id = _seed_run(app, "amazon_disbursement")
+
+    assert "本次处理的评论" not in test_client.get(f"/runs/{run_id}").text
