@@ -148,15 +148,46 @@ def test_an_already_submitted_feedback_can_never_be_requeued(client, state) -> N
         assert row.reason_code == "301"
 
 
-def test_the_ai_key_card_explains_where_the_comment_goes(client) -> None:
-    """买家留言会离开这台机器，这件事必须写在配置它的地方。"""
+def test_the_diagnostics_page_shows_where_judgement_is_sent(client) -> None:
+    """买家留言会离开这台机器，这件事必须写在能看到接口地址的地方。
+
+    判定接口读的是操作员自己的 Codex 配置，所以这一栏是只读状态而不是表单；
+    读不到配置时必须说清「这不是故障，只是全部转人工」。
+    """
 
     _, test_client, _ = client
     page = test_client.get("/diagnostics")
 
     assert page.status_code == 200
-    assert 'data-settings-form="ai"' in page.text
-    assert "唯一的对外网络请求" in page.text
+    assert "反馈原因自动判定" in page.text
+    assert "~/.codex" in page.text
+    assert "待人工" in page.text
+
+
+def test_a_plaintext_endpoint_is_called_out(client) -> None:
+    from ziniao_automation.workflows.amazon_feedback.classifier import (
+        ClassifierEndpoint,
+    )
+    import ziniao_automation.web as web_module
+
+    _, test_client, _ = client
+    original = web_module.resolve_codex_endpoint
+    web_module.resolve_codex_endpoint = lambda: ClassifierEndpoint(
+        base_url="http://198.51.100.7:8979/v1",
+        api_key="sk-test",
+        model="gpt-5.6-sol",
+        provider="custom",
+    )
+    try:
+        page = test_client.get("/diagnostics")
+    finally:
+        web_module.resolve_codex_endpoint = original
+
+    assert "gpt-5.6-sol" in page.text
+    # Buyer wording going out unencrypted to a third party must be visible.
+    assert "明文 HTTP" in page.text
+    # And the key itself must never be echoed back to the page.
+    assert "sk-test" not in page.text
 
 
 # --------------------------------------------------------------------------

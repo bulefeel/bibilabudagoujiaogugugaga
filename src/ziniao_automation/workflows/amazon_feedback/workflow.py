@@ -258,7 +258,10 @@ class AmazonFeedbackWorkflow:
             )
 
         decision = await self.classifier.classify(
-            comment=row.comment, rating=row.rating, order_date=row.order_date
+            comment=row.comment,
+            rating=row.rating,
+            order_date=row.order_date,
+            fulfilled_by_amazon=row.fulfilled_by_amazon,
         )
         if decision is None:
             return (NEEDS_HUMAN, None, None, None, "自动判定未给出明确原因，待人工选择")

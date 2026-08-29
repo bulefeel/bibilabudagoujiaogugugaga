@@ -48,7 +48,6 @@ from .repositories import (
 from .schedule_batch import BatchScheduleService, BatchScheduleValidationError
 from .scheduler import ScheduleProjectionReport
 from .schemas import (
-    AiSettingsInput,
     BatchScheduleCreateInput,
     BatchSchedulePreviewInput,
     BootstrapInput,
@@ -73,6 +72,7 @@ from .version import __version__, build_commit
 from .workflows import WorkflowRegistry
 from .workflows.amazon_disbursement import build_amazon_disbursement_definition
 from .workflows.amazon_feedback import build_amazon_feedback_definition
+from .workflows.amazon_feedback.classifier import resolve_codex_endpoint
 from .workflows.amazon_feedback.config import (
     AMAZON_REVIEW_CRITERIA,
     CATEGORY_LABELS,
@@ -87,7 +87,6 @@ from .workflows.amazon_feedback.review_store import (
 )
 from .workflows.errors import WorkflowNotRegistered
 from .ziniao.credentials import (
-    DEFAULT_AI_TARGET,
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
     CredentialStoreError,
@@ -240,6 +239,16 @@ class UnconfiguredAutomationService:
 
     async def reconcile_run(self, run_id: str) -> None:
         raise RuntimeError("自动化运行服务尚未配置")
+
+
+def _resolved_classifier_endpoint() -> dict[str, Any] | None:
+    """Non-secret description of where reason judgement is sent, or None."""
+
+    try:
+        endpoint = resolve_codex_endpoint()
+    except Exception:  # noqa: BLE001 - diagnostics must render regardless
+        return None
+    return endpoint.describe() if endpoint is not None else None
 
 
 STATUS_LABELS = {
@@ -789,9 +798,10 @@ def create_app(
             "feishu_credential_readable": bool(
                 feishu_ref and credential_exists(feishu_ref)
             ),
-            # Classifier key for the feedback workflow.  Its absence is not an
-            # error: without it every entry simply waits for a human.
-            "ai_credential_readable": credential_exists(DEFAULT_AI_TARGET),
+            # The feedback classifier borrows the operator's Codex endpoint.
+            # Its absence is not an error: without it every entry simply waits
+            # for a human.
+            "ai_endpoint": _resolved_classifier_endpoint(),
             "host": f"{settings.host}:{settings.port}",
             # Non-secret fields only, so the forms can be pre-filled without a
             # round trip.  Passwords and App Secret are never sent to the page —
@@ -1077,26 +1087,6 @@ def create_app(
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator verbatim
             raise HTTPException(502, f"发送失败：{_safe_probe_error(exc)}") from exc
         return {"status": "sent"}
-
-    @api.post("/settings/ai", status_code=200)
-    async def save_ai_settings(
-        payload: AiSettingsInput,
-        _: AuthenticatedAdmin = Depends(verified_admin),
-    ) -> dict[str, Any]:
-        """Store the classifier key beside the other two, and verify readback."""
-
-        try:
-            write_generic_credential(
-                DEFAULT_AI_TARGET, {"api_key": payload.api_key}, username="ai"
-            )
-        except (CredentialStoreError, ValueError, OSError) as exc:
-            raise HTTPException(502, f"写入 Windows 凭据管理器失败：{exc}") from exc
-        if not credential_matches(DEFAULT_AI_TARGET, {"api_key": payload.api_key}):
-            raise HTTPException(
-                502,
-                "凭据写入后无法回读，请检查安全软件是否拦截了 Windows 凭据管理器。",
-            )
-        return {"status": "saved"}
 
     @api.post("/settings/ziniao", status_code=200)
     async def save_ziniao_settings(

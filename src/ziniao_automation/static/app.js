@@ -1609,7 +1609,6 @@
 
     bindSettings("ziniao", "/api/settings/ziniao", "紫鸟账号已保存到 Windows 凭据管理器");
     bindSettings("feishu", "/api/settings/feishu", "飞书配置已保存到 Windows 凭据管理器");
-    bindSettings("ai", "/api/settings/ai", "API Key 已保存到 Windows 凭据管理器");
 
     $('[data-action="test-feishu"]')?.addEventListener("click", async event => {
       const button = event.currentTarget;

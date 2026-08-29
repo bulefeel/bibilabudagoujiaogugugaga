@@ -224,3 +224,8 @@
 .feedback-filter select:focus{border-color:var(--red);box-shadow:0 0 0 2px rgba(180,60,47,.1)}
 .feedback-site-tag{font-style:normal;font:9px var(--mono);background:var(--ink);color:#fff;padding:4px 6px;white-space:nowrap}
 @media(max-width:760px){.feedback-filter{display:block}.feedback-filter label{margin-bottom:10px}}
+/* 反馈判定接口的只读状态：读的是 ~/.codex，不在本页配置。 */
+.ai-endpoint{margin:0 0 12px}
+.ai-endpoint div{display:flex;justify-content:space-between;gap:14px;padding:8px 0;border-bottom:1px dashed var(--line);font-size:11px}
+.ai-endpoint dt{color:var(--muted)}
+.ai-endpoint dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere;text-align:right}

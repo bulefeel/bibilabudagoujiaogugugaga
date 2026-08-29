@@ -68,12 +68,6 @@ class ZiniaoSettingsInput(ApiModel):
     password: str = Field(min_length=1, max_length=500)
 
 
-class AiSettingsInput(ApiModel):
-    """Cloud classifier key for the feedback removal workflow."""
-
-    api_key: str = Field(min_length=1, max_length=500)
-
-
 class FeedbackDecisionInput(ApiModel):
     """An operator choosing the removal reason the classifier declined to pick.
 

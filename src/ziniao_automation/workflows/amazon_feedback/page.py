@@ -25,6 +25,7 @@ from .config import (
     MAX_RATING_ELIGIBLE_FOR_REMOVAL,
     FeedbackDomContract,
     is_known_reason,
+    split_amazon_note,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,10 @@ class FeedbackRow:
     # the action from — and the latter is recorded as a terminal, irreversible
     # "already requested".  An unreadable menu must never make that claim.
     menu_readable: bool = True
+    # True only when Amazon's own note says it fulfilled the order.  False means
+    # "not stated", never "seller-fulfilled" — Amazon annotates only where it
+    # accepts responsibility.
+    fulfilled_by_amazon: bool = False
 
     @property
     def is_low_star(self) -> bool:
@@ -492,12 +497,18 @@ class AmazonFeedbackPage:
         raw = await page.evaluate(_READ_ROWS, self._contract_payload)
         rows: list[FeedbackRow] = []
         for item in raw:
+            # Amazon's fulfilment note is appended to the comment cell.  Split
+            # it out so the buyer's own words stay the comment and the channel
+            # becomes a checkable fact instead of something to read between
+            # the lines.
+            comment, fulfilled = split_amazon_note(item.get("comment") or "")
             rows.append(
                 FeedbackRow(
                     order_id=str(item["order_id"]),
                     rating=int(item["rating"]),
                     order_date=item.get("order_date") or None,
-                    comment=str(item.get("comment") or ""),
+                    comment=comment,
+                    fulfilled_by_amazon=fulfilled,
                     removal_available=bool(item.get("removal_available")),
                     menu_readable=bool(item.get("menu_readable", True)),
                 )

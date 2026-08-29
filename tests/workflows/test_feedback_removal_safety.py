@@ -126,9 +126,18 @@ class FakeClassifier:
     def __init__(self, decision: ReasonDecision | None) -> None:
         self.decision = decision
         self.calls = 0
+        self.seen_fulfilment: list[bool] = []
 
-    async def classify(self, *, comment: str, rating: int, order_date: str | None = None):
+    async def classify(
+        self,
+        *,
+        comment: str,
+        rating: int,
+        order_date: str | None = None,
+        fulfilled_by_amazon: bool = False,
+    ):
         self.calls += 1
+        self.seen_fulfilment.append(fulfilled_by_amazon)
         return self.decision
 
 

@@ -9,6 +9,7 @@ depend on the seller's interface language.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 
 FEEDBACK_MANAGER_PATH = "/feedback-manager/index.html"
@@ -109,6 +110,34 @@ AMAZON_REVIEW_CRITERIA: tuple[str, ...] = (
 )
 
 MAX_RATING_ELIGIBLE_FOR_REMOVAL = 3
+
+# Amazon appends its own note to feedback on orders it fulfilled:
+#   来自亚马逊的消息： “该商品由亚马逊配送，亚马逊对配送体验负责。”
+# That makes the fulfilment channel a FACT ON THE PAGE rather than something to
+# infer, which matters because reasons 401/402 assert exactly that.  Observed on
+# 32 of 33 entries read on 2026-08-29.
+#
+# ⚠️ Asymmetric: the note's PRESENCE proves Amazon fulfilled the order; its
+# absence proves nothing, because Amazon only annotates where it accepts
+# responsibility.  So it may enable 401/402, never rule them in the other way.
+FULFILLED_BY_AMAZON_PATTERN = re.compile(
+    r"来自亚马逊的消息|该商品由亚马逊配送|"
+    r"Message\s+from\s+Amazon|fulfil?led\s+by\s+Amazon",
+    re.IGNORECASE,
+)
+# The note itself, so the buyer's own words can be separated from Amazon's.
+AMAZON_NOTE_BLOCK = re.compile(
+    r"\s*来自亚马逊的消息[：:][\s\S]*$|\s*Message\s+from\s+Amazon\s*[：:][\s\S]*$",
+    re.IGNORECASE,
+)
+
+
+def split_amazon_note(comment: str) -> tuple[str, bool]:
+    """Return the buyer's own wording and whether Amazon fulfilled the order."""
+
+    text = str(comment or "")
+    fulfilled = bool(FULFILLED_BY_AMAZON_PATTERN.search(text))
+    return AMAZON_NOTE_BLOCK.sub("", text).strip(), fulfilled
 
 
 def is_known_reason(category: str, reason_code: str) -> bool:

@@ -41,7 +41,7 @@ from .workflows.amazon_feedback import (
     build_amazon_feedback_definition,
 )
 from .ziniao.factory import build_controller
-from .ziniao.credentials import DEFAULT_AI_TARGET, read_generic_credential
+from .ziniao.credentials import read_generic_credential
 from .ziniao.errors import ZiniaoCredentialError
 
 logger = logging.getLogger(__name__)
@@ -116,11 +116,10 @@ def build_runtime(
     feedback_workflow = AmazonFeedbackWorkflow(
         repository=workflow_repository,
         review_store=FeedbackReviewStore(session_factory),
-        # Resolved per call, not snapshotted: re-saving the key in the console
-        # takes effect without restarting the service.
-        classifier=FeedbackReasonClassifier(
-            lambda: read_generic_credential(DEFAULT_AI_TARGET)
-        ),
+        # The endpoint comes from the operator's own Codex install and is
+        # resolved per call, so rotating the key or switching model there takes
+        # effect without restarting this service.
+        classifier=FeedbackReasonClassifier(),
     )
     registry = WorkflowRegistry(
         (
