@@ -46,8 +46,9 @@
     {% if diagnostics.ai_endpoint %}
     <dl class="ai-endpoint">
       <div><dt>模型</dt><dd>{{ diagnostics.ai_endpoint.model }}</dd></div>
+      <div><dt>推理强度</dt><dd>{{ diagnostics.ai_endpoint.reasoning_effort }}</dd></div>
       <div><dt>接口</dt><dd>{{ diagnostics.ai_endpoint.base_url }}</dd></div>
-      <div><dt>来源</dt><dd>~/.codex（provider：{{ diagnostics.ai_endpoint.provider }}）</dd></div>
+      <div><dt>来源</dt><dd>接口与密钥来自 ~/.codex（provider：{{ diagnostics.ai_endpoint.provider }}）；模型与推理强度由本流程自己指定</dd></div>
     </dl>
     {% if diagnostics.ai_endpoint.plaintext %}<p class="fieldset-help warn">⚠️ 这个接口是 <b>明文 HTTP</b>，且不是亚马逊或本机——买家留言会以未加密的形式发给它。亚马逊的删除理由 103 就是「反馈包含了个人识别信息」，含联系方式的留言正是本流程要处理的一类。要换成加密接口，改 <code>~/.codex/config.toml</code> 里对应 provider 的 <code>base_url</code>。</p>{% endif %}
     <p class="fieldset-help">配置直接读你机器上的 Codex（<code>~/.codex/config.toml</code> + <code>auth.json</code>），<b>每次调用现读</b>，在 Codex 里换密钥或换模型无需重启本服务。读不到、调不通或判不准时不会猜，一律转「待人工」。</p>

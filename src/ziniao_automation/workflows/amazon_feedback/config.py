@@ -111,6 +111,15 @@ AMAZON_REVIEW_CRITERIA: tuple[str, ...] = (
 
 MAX_RATING_ELIGIBLE_FOR_REMOVAL = 3
 
+# Which model judges the reason, and how hard it thinks.  Deliberately NOT the
+# model from ``~/.codex/config.toml`` — only the endpoint and key are borrowed
+# from there, so changing the model Codex uses for coding does not silently
+# change what gets submitted to Amazon.  Verified on 2026-08-29 that the relay
+# honours ``reasoning_effort``: low spent 72 reasoning tokens on a real comment,
+# high spent 182.
+CLASSIFIER_MODEL = "gpt-5.6-luna"
+CLASSIFIER_REASONING_EFFORT = "high"
+
 # Amazon appends its own note to feedback on orders it fulfilled:
 #   来自亚马逊的消息： “该商品由亚马逊配送，亚马逊对配送体验负责。”
 # That makes the fulfilment channel a FACT ON THE PAGE rather than something to

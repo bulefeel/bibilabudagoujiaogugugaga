@@ -12,6 +12,10 @@ from pathlib import Path
 import httpx
 import pytest
 
+from ziniao_automation.workflows.amazon_feedback.config import (
+    CLASSIFIER_MODEL,
+    CLASSIFIER_REASONING_EFFORT,
+)
 from ziniao_automation.workflows.amazon_feedback.classifier import (
     SYSTEM_PROMPT,
     ClassifierEndpoint,
@@ -21,7 +25,7 @@ from ziniao_automation.workflows.amazon_feedback.classifier import (
 
 
 ENDPOINT = ClassifierEndpoint(
-    base_url="http://127.0.0.1:9/v1", api_key="sk-test", model="m", provider="custom"
+    base_url="http://127.0.0.1:9/v1", api_key="sk-test", provider="custom"
 )
 
 
@@ -157,8 +161,9 @@ def test_the_active_provider_is_resolved(tmp_path: Path) -> None:
     endpoint = resolve_codex_endpoint(write_codex(tmp_path, config=COMPLETE))
 
     assert endpoint is not None
-    assert endpoint.model == "gpt-5.6-sol"
     assert endpoint.base_url == "http://198.51.100.7:8979/v1"
+    # Codex says gpt-5.6-sol; judgement deliberately uses our own choice.
+    assert endpoint.model == CLASSIFIER_MODEL != "gpt-5.6-sol"
     assert endpoint.is_plaintext is True
     # The describe() payload feeds the diagnostics page and must not leak it.
     assert "sk-x" not in json.dumps(endpoint.describe())
@@ -185,3 +190,25 @@ def test_an_incomplete_config_resolves_to_nothing_not_half_an_endpoint(
 
 def test_a_missing_codex_install_is_not_an_error(tmp_path: Path) -> None:
     assert resolve_codex_endpoint(tmp_path / "nowhere") is None
+
+
+def test_the_request_carries_the_configured_model_and_effort() -> None:
+    """模型和推理强度是本流程自己定的，不跟着 Codex 写代码用的模型走。"""
+
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+    import asyncio
+
+    classifier = FeedbackReasonClassifier(
+        lambda: ENDPOINT, transport=httpx.MockTransport(handler)
+    )
+    asyncio.run(classifier.classify(comment="x", rating=1))
+
+    assert seen["model"] == CLASSIFIER_MODEL == "gpt-5.6-luna"
+    assert seen["reasoning_effort"] == CLASSIFIER_REASONING_EFFORT == "high"
+    # disable_response_storage 在 Codex 里是开的，请求要尊重它。
+    assert seen["store"] is False

@@ -6,10 +6,12 @@ response yields ``None``, and ``None`` means "do not submit — queue for a
 human".  Submitting a request is irreversible and one-shot per feedback, so a
 guessed reason costs the seller that feedback's only chance of removal.
 
-The endpoint is read from the operator's existing Codex install
+The endpoint and key are read from the operator's existing Codex install
 (``~/.codex/config.toml`` + ``~/.codex/auth.json``) rather than configured
-again here, at their request.  Resolution happens per call, so rotating the
-key or switching model in Codex takes effect without restarting the service.
+again here, at their request.  Resolution happens per call, so rotating the key
+there takes effect without restarting the service.  The *model* and reasoning
+effort are this module's own (see ``CLASSIFIER_MODEL``): changing the model
+Codex uses for coding must not silently change what is submitted to Amazon.
 
 Buyer wording is sent to the model and stored in SQLite for the operator, but
 must never reach the JSONL logs.
@@ -26,7 +28,13 @@ from typing import Any, Callable
 
 import httpx
 
-from .config import CATEGORY_LABELS, REASON_CATALOG, is_known_reason
+from .config import (
+    CATEGORY_LABELS,
+    CLASSIFIER_MODEL,
+    CLASSIFIER_REASONING_EFFORT,
+    REASON_CATALOG,
+    is_known_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +49,10 @@ class ClassifierEndpoint:
 
     base_url: str
     api_key: str
-    model: str
+    # Endpoint and key come from Codex; the model and how hard it thinks are
+    # this workflow's own decision, because they change what gets submitted.
+    model: str = CLASSIFIER_MODEL
+    reasoning_effort: str = CLASSIFIER_REASONING_EFFORT
     provider: str = ""
 
     @property
@@ -53,6 +64,7 @@ class ClassifierEndpoint:
         return {
             "base_url": self.base_url,
             "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
             "provider": self.provider,
             "plaintext": self.is_plaintext,
         }
@@ -82,16 +94,16 @@ def resolve_codex_endpoint(home: Path | None = None) -> ClassifierEndpoint | Non
         return None
 
     api_key = str(auth.get("OPENAI_API_KEY") or "").strip()
-    model = str(config.get("model") or "").strip()
     provider_key = str(config.get("model_provider") or "").strip()
     provider = (config.get("model_providers") or {}).get(provider_key) or {}
     base_url = str(provider.get("base_url") or "").strip().rstrip("/")
 
-    if not (api_key and model and base_url):
+    # Codex's own ``model`` key is deliberately ignored — see CLASSIFIER_MODEL.
+    if not (api_key and base_url):
         logger.info("Codex configuration is incomplete; classification stays manual")
         return None
     return ClassifierEndpoint(
-        base_url=base_url, api_key=api_key, model=model, provider=provider_key
+        base_url=base_url, api_key=api_key, provider=provider_key
     )
 
 
@@ -196,6 +208,7 @@ class FeedbackReasonClassifier:
             # buyer wording is not retained by the relay any longer than the
             # request itself.
             "store": False,
+            "reasoning_effort": endpoint.reasoning_effort,
         }
         headers = {
             "Authorization": f"Bearer {endpoint.api_key}",
