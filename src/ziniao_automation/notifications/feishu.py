@@ -396,6 +396,8 @@ def _feedback_line(item: SafeFeedbackNotice) -> str:
     parts = [f"{'★' * rating}{'☆' * (5 - rating)}"]
     if item.marketplace_code:
         parts.append(f"**{_md(item.marketplace_code.upper())}**")
+    if item.amazon_removed:
+        parts.append("亚马逊已剔除")
     if item.order_id:
         parts.append(f"`{_order_ref(item.order_id)}`")
     if item.comment:

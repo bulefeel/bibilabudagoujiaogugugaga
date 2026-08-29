@@ -270,6 +270,8 @@ FEEDBACK_STATE_LABELS = {
     # Amazon withdraws the action once a review has been requested, so its
     # absence means the request already exists — not that we chose to skip.
     "ALREADY_REQUESTED": "此前已请求",
+    # Amazon struck it out itself; nobody had to ask.
+    "AMAZON_REMOVED": "亚马逊已剔除",
     "SUBMITTED": "已提交",
     "UNCERTAIN": "未确认",
     "FAILED": "失败",

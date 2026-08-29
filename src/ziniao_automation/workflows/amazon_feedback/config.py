@@ -120,33 +120,40 @@ MAX_RATING_ELIGIBLE_FOR_REMOVAL = 3
 CLASSIFIER_MODEL = "gpt-5.6-luna"
 CLASSIFIER_REASONING_EFFORT = "high"
 
-# Amazon appends its own note to feedback on orders it fulfilled:
+# Amazon strikes a feedback through and appends its own note when IT has
+# already excluded that feedback from the seller's rating:
 #   来自亚马逊的消息： “该商品由亚马逊配送，亚马逊对配送体验负责。”
-# That makes the fulfilment channel a FACT ON THE PAGE rather than something to
-# infer, which matters because reasons 401/402 assert exactly that.  Observed on
-# 32 of 33 entries read on 2026-08-29.
 #
-# ⚠️ Asymmetric: the note's PRESENCE proves Amazon fulfilled the order; its
-# absence proves nothing, because Amazon only annotates where it accepts
-# responsibility.  So it may enable 401/402, never rule them in the other way.
-FULFILLED_BY_AMAZON_PATTERN = re.compile(
+# The note reads like a statement about fulfilment, and it is — but the seller
+# confirmed (2026-08-29, with a screenshot showing the struck-through rows) that
+# it appears on the ones Amazon has ALREADY removed.  Every entry carrying it
+# also lacks ``request_removal``, because there is nothing left to request.
+#
+# ⚠️ So it can never appear on a feedback still worth acting on, which is why
+# reasons 401/402 are not offered to the classifier at all: Amazon handles FBA
+# delivery complaints itself, and asserting the channel on anything else would
+# rest on no evidence.
+AMAZON_REMOVED_PATTERN = re.compile(
     r"来自亚马逊的消息|该商品由亚马逊配送|"
     r"Message\s+from\s+Amazon|fulfil?led\s+by\s+Amazon",
     re.IGNORECASE,
 )
-# The note itself, so the buyer's own words can be separated from Amazon's.
 AMAZON_NOTE_BLOCK = re.compile(
     r"\s*来自亚马逊的消息[：:][\s\S]*$|\s*Message\s+from\s+Amazon\s*[：:][\s\S]*$",
     re.IGNORECASE,
 )
 
+# Reasons the classifier is never offered.  Amazon removes FBA delivery
+# feedback on its own, and for anything else the page states no channel.
+CLASSIFIER_EXCLUDED_CATEGORIES = frozenset({"delivery-related-feedback"})
+
 
 def split_amazon_note(comment: str) -> tuple[str, bool]:
-    """Return the buyer's own wording and whether Amazon fulfilled the order."""
+    """Return the buyer's own wording, and whether Amazon already removed it."""
 
     text = str(comment or "")
-    fulfilled = bool(FULFILLED_BY_AMAZON_PATTERN.search(text))
-    return AMAZON_NOTE_BLOCK.sub("", text).strip(), fulfilled
+    removed = bool(AMAZON_REMOVED_PATTERN.search(text))
+    return AMAZON_NOTE_BLOCK.sub("", text).strip(), removed
 
 
 def is_known_reason(category: str, reason_code: str) -> bool:

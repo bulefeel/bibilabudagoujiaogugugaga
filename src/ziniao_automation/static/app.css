@@ -229,3 +229,6 @@
 .ai-endpoint div{display:flex;justify-content:space-between;gap:14px;padding:8px 0;border-bottom:1px dashed var(--line);font-size:11px}
 .ai-endpoint dt{color:var(--muted)}
 .ai-endpoint dd{margin:0;font-family:var(--mono);overflow-wrap:anywhere;text-align:right}
+/* 「亚马逊配送」是亚马逊自己贴在反馈上的声明，也是 401/402 唯一的合法依据。
+   它原本在留言正文里可见，程序把它拆成结构化字段后必须在界面上放回来。 */
+.fba-tag{display:inline-block;margin-left:8px;font:9px var(--mono);background:#e0e7dd;color:var(--green);border:1px solid #b9c9bb;padding:2px 6px;white-space:nowrap;vertical-align:middle}

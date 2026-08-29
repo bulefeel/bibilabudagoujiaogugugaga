@@ -31,7 +31,7 @@
     <td><b>{{ store_names.get(review.store_id, review.store_id) }}</b><small>{{ review.order_date or '—' }}</small></td>
     <td><span class="feedback-stars stars-{{ review.rating }}">{{ '★' * review.rating }}{{ '☆' * (5 - review.rating) }}</span></td>
     <td><code>{{ review.order_id }}</code></td>
-    <td class="feedback-comment">{{ review.comment or '（无留言）' }}</td>
+    <td class="feedback-comment">{{ review.comment or '（无留言）' }}{% if review.amazon_removed %}<b class="fba-tag" title="亚马逊已经把这条评论剔除，并在页面上划掉正文、附了说明「该商品由亚马逊配送，亚马逊对配送体验负责」。它自己处理了，不需要我们提交请求。">亚马逊已剔除</b>{% endif %}</td>
     <td class="feedback-reason">
       {% if review.category and review.reason_code %}
         <b>{{ category_labels.get(review.category, review.category) }}</b>
@@ -65,6 +65,9 @@
 每次运行有条数上限，超出的留到再下一次；
 <b>已提交</b>＝请求审核已送出，亚马逊是否采纳由它决定，本工具不追踪结果；
 <b>待人工</b>＝自动判定没把握，选个原因后下次运行会提交；
+<b>亚马逊已剔除</b>＝亚马逊自己把这条评论划掉并剔除了（通常是它负责配送的订单）。
+<b>它不需要我们提交请求</b>，所以自动判定也不会去选「配送相关反馈」那一类。
+<br>
 <b>此前已请求</b>＝这条在亚马逊那边<b>已经有一条请求审核了</b>（此前发起过，或已审核完成把评论删了），
 所以页面上不再给「请求审核」入口。一条反馈只受理一次，这条的机会已经用掉，不会也不能再提；
 <b>未确认</b>＝提交按钮点下去了，但页面没确认——<b>不会重试</b>，请到卖家后台自行核对；

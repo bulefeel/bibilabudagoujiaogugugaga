@@ -80,6 +80,8 @@ class SafeFeedbackNotice:
     # A run covers CA/UK/AU in one go, so an entry without its marketplace
     # cannot be looked up in the right seller account.
     marketplace_code: str = ""
+    # Amazon struck this one out itself, so it never needed a request.
+    amazon_removed: bool = False
     comment: str = ""
     reason_label: str = ""
     state: str = ""

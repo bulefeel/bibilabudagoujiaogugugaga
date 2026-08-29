@@ -39,6 +39,7 @@ from .classifier import FeedbackReasonClassifier
 from .page import AmazonFeedbackPage, FeedbackRow
 from .review_store import (
     ALREADY_REQUESTED,
+    AMAZON_REMOVED,
     FAILED,
     NEEDS_HUMAN,
     PENDING,
@@ -188,6 +189,7 @@ class AmazonFeedbackWorkflow:
                 rating=row.rating,
                 order_date=row.order_date,
                 comment=row.comment,
+                amazon_removed=row.amazon_removed,
                 state=state,
                 category=category,
                 reason_code=reason_code,
@@ -244,24 +246,31 @@ class AmazonFeedbackWorkflow:
         up waiting for a human rather than being submitted on a guess.
         """
 
+        if row.amazon_removed:
+            # Amazon struck it out and said why.  It handles FBA delivery
+            # complaints without being asked, so there was never anything for
+            # this workflow to do here.
+            return (
+                AMAZON_REMOVED,
+                None,
+                None,
+                None,
+                "亚马逊已自行剔除这条评论（正文划掉并附了说明）",
+            )
         if not row.removal_available:
-            # The action is gone, which per the seller means this feedback has
-            # already had a review requested — or was already reviewed and
-            # removed.  Its one request is spent either way, so there is nothing
-            # to classify and no point paying for a model call.
+            # The action is gone but Amazon did not claim the removal, so per
+            # the seller someone has already requested a review for it.  The one
+            # request is spent either way — nothing to classify, no model call.
             return (
                 ALREADY_REQUESTED,
                 None,
                 None,
                 None,
-                "亚马逊已不提供「请求审核」：此前已发起过请求，或已审核完成",
+                "亚马逊已不提供「请求审核」：此前已发起过请求",
             )
 
         decision = await self.classifier.classify(
-            comment=row.comment,
-            rating=row.rating,
-            order_date=row.order_date,
-            fulfilled_by_amazon=row.fulfilled_by_amazon,
+            comment=row.comment, rating=row.rating, order_date=row.order_date
         )
         if decision is None:
             return (NEEDS_HUMAN, None, None, None, "自动判定未给出明确原因，待人工选择")
@@ -492,7 +501,8 @@ class AmazonFeedbackWorkflow:
         needs_human = counts.get(NEEDS_HUMAN, 0)
         summary = (
             f"提交 {submitted} 条，待人工 {needs_human} 条，"
-            f"此前已请求 {counts.get(ALREADY_REQUESTED, 0)} 条"
+            f"此前已请求 {counts.get(ALREADY_REQUESTED, 0)} 条，"
+            f"亚马逊已自行剔除 {counts.get(AMAZON_REMOVED, 0)} 条"
         )
         if run.mode.value == "dry_run":
             summary = f"空跑：本次不提交。可提交 {counts.get(PENDING, 0)} 条，" + summary

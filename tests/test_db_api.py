@@ -1277,7 +1277,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
     assert "应用版本 / 构建" in page.text
     assert "0.4.1" in page.text
     assert "数据库迁移版本" in page.text
-    assert "0008" in page.text
+    assert "0009" in page.text
 
 
 def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):

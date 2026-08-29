@@ -26,6 +26,10 @@ NEEDS_HUMAN = "NEEDS_HUMAN"  # classifier declined; an operator must choose
 # reviewed and removed — not that Amazon provides no entry point.  Either way
 # the one request this feedback gets has been used.
 ALREADY_REQUESTED = "ALREADY_REQUESTED"
+# Amazon struck it out itself — typically an FBA delivery complaint, which
+# it excludes without being asked.  Distinct from ALREADY_REQUESTED so the
+# operator can see how much never needed them at all.
+AMAZON_REMOVED = "AMAZON_REMOVED"
 SUBMITTED = "SUBMITTED"      # request accepted by the page
 UNCERTAIN = "UNCERTAIN"      # clicked, but the outcome could not be confirmed
 FAILED = "FAILED"            # could not get as far as submitting
@@ -33,7 +37,9 @@ FAILED = "FAILED"            # could not get as far as submitting
 # States from which nothing may re-arm a submission.  ALREADY_REQUESTED belongs
 # here for the same reason SUBMITTED does: Amazon has the request either way,
 # so letting an operator assign a reason would only queue a doomed retry.
-TERMINAL_STATES = frozenset({SUBMITTED, UNCERTAIN, ALREADY_REQUESTED})
+TERMINAL_STATES = frozenset(
+    {SUBMITTED, UNCERTAIN, ALREADY_REQUESTED, AMAZON_REMOVED}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +49,7 @@ class ReviewItem:
     marketplace_code: str
     rating: int
     comment: str
+    amazon_removed: bool
     category: str | None
     reason_code: str | None
     state: str
@@ -75,6 +82,7 @@ class FeedbackReviewStore:
         order_date: str | None,
         comment: str,
         state: str,
+        amazon_removed: bool = False,
         category: str | None = None,
         reason_code: str | None = None,
         decision_source: str | None = None,
@@ -94,6 +102,7 @@ class FeedbackReviewStore:
             rating=rating,
             order_date=order_date,
             comment=comment,
+            amazon_removed=amazon_removed,
             category=category,
             reason_code=reason_code,
             decision_source=decision_source,
@@ -233,6 +242,7 @@ def _to_item(row: FeedbackReview) -> ReviewItem:
         marketplace_code=str(row.marketplace_code),
         rating=int(row.rating),
         comment=str(row.comment or ""),
+        amazon_removed=bool(row.amazon_removed),
         category=row.category,
         reason_code=row.reason_code,
         state=str(row.state),
@@ -241,6 +251,7 @@ def _to_item(row: FeedbackReview) -> ReviewItem:
 
 __all__ = [
     "ALREADY_REQUESTED",
+    "AMAZON_REMOVED",
     "FAILED",
     "NEEDS_HUMAN",
     "PENDING",

@@ -97,40 +97,38 @@ async def test_no_endpoint_means_manual_not_failure() -> None:
 
 
 # --------------------------------------------------------------------------
-# 模型不知道的事，不许它说
+# 配送类：亚马逊自己会处理，我们不提
 # --------------------------------------------------------------------------
-FBA_ANSWER = json.dumps({
-    "confident": True, "category": "delivery-related-feedback",
-    "reason_code": "402", "note": "该订单由亚马逊配送",
-})
+@pytest.mark.parametrize("code", ["401", "402"])
+async def test_a_delivery_reason_is_always_refused(code: str) -> None:
+    """配送类不在选项里，模型给了也不算。
 
-
-async def test_a_fulfilment_reason_is_refused_when_the_page_did_not_say_so() -> None:
-    """401/402 是在向亚马逊断言「这单由亚马逊配送」。
-
-    页面没写就不能提——那样的陈述只建立在模型的读法上，而请求只有一次。
+    亚马逊对自己配送的订单会主动剔除反馈（页面上划掉并附说明），所以那一类根本
+    轮不到我们提；而还需要我们提的那些，页面上没有任何配送方式可读，选它就是
+    在向亚马逊断言一件没有依据的事。
     """
 
-    classifier = build(FBA_ANSWER)
-    assert await classifier.classify(
-        comment="收到的鸟不对", rating=1, fulfilled_by_amazon=False
-    ) is None
+    decision = await classify(build(json.dumps({
+        "confident": True, "category": "delivery-related-feedback",
+        "reason_code": code, "note": "该订单由亚马逊配送",
+    })))
+    assert decision is None
 
 
-async def test_a_fulfilment_reason_is_accepted_when_amazon_itself_said_so() -> None:
-    """亚马逊会在它负责配送的反馈上贴一句说明，那是页面上的事实，不是判断。"""
-
-    classifier = build(FBA_ANSWER)
-    decision = await classifier.classify(
-        comment="收到的鸟不对", rating=1, fulfilled_by_amazon=True
-    )
-    assert decision is not None
-    assert decision.reason_code == "402"
+def test_the_prompt_does_not_offer_the_delivery_category() -> None:
+    assert "delivery-related-feedback" not in SYSTEM_PROMPT
+    assert "401" not in SYSTEM_PROMPT and "402" not in SYSTEM_PROMPT
+    assert "不在你的选项里" in SYSTEM_PROMPT
 
 
-def test_the_prompt_states_the_channel_is_given_not_guessed() -> None:
-    assert "配送方式**不要你猜**" in SYSTEM_PROMPT
-    assert "仅当输入写明" in SYSTEM_PROMPT
+def test_the_prompt_asks_for_a_decision_rather_than_a_referral() -> None:
+    """操作员明确要求「不用保守不用转人工」：每条都要判，别堆待办。
+
+    代码层的两道闸不受这条影响——白名单和「亚马逊配送」事实照旧强制。
+    """
+
+    assert "每条都要给出一个原因" in SYSTEM_PROMPT
+    assert "宁可交给人工" not in SYSTEM_PROMPT
     # 亚马逊真实提供的 11 个叶子必须都在提示词里，否则模型会去猜编号。
     for code in ("101", "102", "103", "104", "105", "202", "203", "204", "301"):
         assert code in SYSTEM_PROMPT

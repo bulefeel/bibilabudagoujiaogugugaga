@@ -56,10 +56,9 @@ class FeedbackRow:
     # the action from — and the latter is recorded as a terminal, irreversible
     # "already requested".  An unreadable menu must never make that claim.
     menu_readable: bool = True
-    # True only when Amazon's own note says it fulfilled the order.  False means
-    # "not stated", never "seller-fulfilled" — Amazon annotates only where it
-    # accepts responsibility.
-    fulfilled_by_amazon: bool = False
+    # Amazon struck this row out and said why.  It never coexists with an
+    # available ``request_removal``: there is nothing left to request.
+    amazon_removed: bool = False
 
     @property
     def is_low_star(self) -> bool:
@@ -144,6 +143,21 @@ _READ_ROWS = (
         // The comment cell is the one without a col_* class.
         const commentCell = cells.find(
             (td) => !/^col_/.test(td.className || '')) || cells[3] || null;
+        // Amazon strikes the comment through when it has excluded the feedback
+        // itself.  Read it as a computed style rather than a class name, so a
+        // markup change or a different locale still resolves; the note text is
+        // checked separately in Python and either signal is enough.
+        let struck = false;
+        if (commentCell) {
+            const candidates = [commentCell, ...commentCell.querySelectorAll('*')];
+            struck = candidates.some((el) => {
+                const tag = el.tagName ? el.tagName.toLowerCase() : '';
+                if (tag === 's' || tag === 'del' || tag === 'strike') return true;
+                const style = window.getComputedStyle(el);
+                const line = style.textDecorationLine || style.textDecoration || '';
+                return line.includes('line-through');
+            });
+        }
         const dateCell = row.querySelector(contract.order_date);
         return {
             order_id: orderIdOf(row, contract),
@@ -152,6 +166,7 @@ _READ_ROWS = (
             comment: commentCell ? textOf(commentCell) : '',
             removal_available: Boolean(removal),
             menu_readable: menuReadable,
+            struck_through: struck,
         };
     }).filter((row) => row.order_id && row.rating !== null);
 }
@@ -501,14 +516,18 @@ class AmazonFeedbackPage:
             # it out so the buyer's own words stay the comment and the channel
             # becomes a checkable fact instead of something to read between
             # the lines.
-            comment, fulfilled = split_amazon_note(item.get("comment") or "")
+            comment, noted = split_amazon_note(item.get("comment") or "")
+            # Either signal is enough: the struck-through styling and Amazon's
+            # note have always appeared together, but relying on one alone
+            # would break on a markup change or a different interface language.
+            removed = noted or bool(item.get("struck_through"))
             rows.append(
                 FeedbackRow(
                     order_id=str(item["order_id"]),
                     rating=int(item["rating"]),
                     order_date=item.get("order_date") or None,
                     comment=comment,
-                    fulfilled_by_amazon=fulfilled,
+                    amazon_removed=removed,
                     removal_available=bool(item.get("removal_available")),
                     menu_readable=bool(item.get("menu_readable", True)),
                 )

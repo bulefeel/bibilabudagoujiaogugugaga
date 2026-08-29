@@ -648,6 +648,12 @@ class FeedbackReview(TimestampMixin, Base):
     order_id: Mapped[str] = mapped_column(String(40), nullable=False)
     rating: Mapped[int] = mapped_column(Integer, nullable=False)
     order_date: Mapped[str | None] = mapped_column(String(20))
+    # Amazon struck this feedback through and explained why in its own note.
+    # The note is stripped out of ``comment`` so the buyer's words stand alone,
+    # which means this column is the only place the fact survives.
+    amazon_removed: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=text("0"), nullable=False
+    )
     # Buyer wording is kept here for the operator to review.  It must never be
     # written to the JSONL logs; see the redaction policy in the logging module.
     comment: Mapped[str | None] = mapped_column(Text)

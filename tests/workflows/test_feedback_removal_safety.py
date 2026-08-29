@@ -126,7 +126,6 @@ class FakeClassifier:
     def __init__(self, decision: ReasonDecision | None) -> None:
         self.decision = decision
         self.calls = 0
-        self.seen_fulfilment: list[bool] = []
 
     async def classify(
         self,
@@ -134,10 +133,8 @@ class FakeClassifier:
         comment: str,
         rating: int,
         order_date: str | None = None,
-        fulfilled_by_amazon: bool = False,
     ):
         self.calls += 1
-        self.seen_fulfilment.append(fulfilled_by_amazon)
         return self.decision
 
 
@@ -639,3 +636,62 @@ async def test_reading_more_pages_than_the_cap_is_reported(session_factory) -> N
     await workflow.plan(make_run(), object())
 
     assert any(event[0] == "feedback_list_truncated" for event in repo.events)
+
+
+# --------------------------------------------------------------------------
+# 8. 亚马逊自己剔除的，和「此前已请求」不是一回事
+# --------------------------------------------------------------------------
+async def plan_of(workflow, run):
+    return await workflow.plan(run, object())
+
+
+def struck(order_id: str, rating: int) -> FeedbackRow:
+    """页面上正文被划掉、并附了亚马逊说明的那种行。"""
+
+    return FeedbackRow(
+        order_id=order_id, rating=rating, order_date="2026/08/04",
+        comment="包裹一直没到", removal_available=False,
+        amazon_removed=True,
+    )
+
+
+async def test_amazon_removing_it_itself_is_its_own_state(session_factory) -> None:
+    """亚马逊对自己配送的订单会主动剔除反馈——那不是「有人请求过」。
+
+    两者都是终态、都不再提交，但分开记才看得出自动化到底帮了多少、
+    以及哪些是人工（或客服）真的发过请求的。
+    """
+
+    workflow, page, _ = build(session_factory, [struck("702-80", 1)])
+    run = make_run()
+
+    plan = await workflow.plan(run, object())
+    await workflow.execute(run, object(), plan)
+
+    assert page.submitted == []
+    assert states(session_factory)["702-80"] == "AMAZON_REMOVED"
+
+
+async def test_a_removed_entry_never_costs_a_model_call(session_factory) -> None:
+    page = FakePage([struck("702-81", 1)])
+    classifier = FakeClassifier(DECISION)
+    workflow = AmazonFeedbackWorkflow(
+        repository=RecordingRepository(),
+        review_store=FeedbackReviewStore(session_factory),
+        classifier=classifier,
+        page_adapter=page,
+    )
+
+    await workflow.plan(make_run(), object())
+
+    assert classifier.calls == 0
+    assert states(session_factory)["702-81"] == "AMAZON_REMOVED"
+
+
+async def test_amazon_removal_wins_over_a_missing_action(session_factory) -> None:
+    """两个信号同时出现时，以亚马逊自己的说明为准——它更具体。"""
+
+    workflow, _, _ = build(session_factory, [struck("702-82", 2)])
+    await workflow.plan(make_run(), object())
+
+    assert states(session_factory)["702-82"] == "AMAZON_REMOVED"

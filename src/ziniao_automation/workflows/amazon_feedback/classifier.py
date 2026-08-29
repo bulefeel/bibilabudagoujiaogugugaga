@@ -30,6 +30,7 @@ import httpx
 
 from .config import (
     CATEGORY_LABELS,
+    CLASSIFIER_EXCLUDED_CATEGORIES,
     CLASSIFIER_MODEL,
     CLASSIFIER_REASONING_EFFORT,
     REASON_CATALOG,
@@ -38,9 +39,15 @@ from .config import (
 
 logger = logging.getLogger(__name__)
 
-# These two assert "Amazon fulfilled this order".  That is only allowed when
-# Amazon's own note on the page says so — never as a judgement about wording.
-FULFILMENT_REASON_CODES = frozenset({"401", "402"})
+# Every code inside an excluded category.  Amazon removes FBA delivery
+# complaints itself (its note and the strike-through on the page are exactly
+# that), and for anything still actionable the page states no fulfilment
+# channel — so choosing one would assert a fact nothing supports.
+EXCLUDED_REASON_CODES = frozenset(
+    code
+    for category in CLASSIFIER_EXCLUDED_CATEGORIES
+    for code in REASON_CATALOG.get(category, {})
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,14 +117,11 @@ def resolve_codex_endpoint(home: Path | None = None) -> ClassifierEndpoint | Non
 def _catalog_prompt() -> str:
     lines: list[str] = []
     for category, reasons in REASON_CATALOG.items():
+        if category in CLASSIFIER_EXCLUDED_CATEGORIES:
+            continue
         lines.append(f"- {category} ({CATEGORY_LABELS[category]}):")
         for code, label in reasons.items():
-            marker = (
-                "  ← 仅当输入写明「是亚马逊配送」时可选"
-                if code in FULFILMENT_REASON_CODES
-                else ""
-            )
-            lines.append(f"    {code} = {label}{marker}")
+            lines.append(f"    {code} = {label}")
     return "\n".join(lines)
 
 
@@ -133,17 +137,21 @@ SYSTEM_PROMPT = f"""你在帮亚马逊卖家判断一条买家反馈应当用哪
 - 整条反馈其实是商品评论，而不是对卖家服务的评价
 - 该订单由亚马逊配送，且反馈针对配送或客服
 
-⚠️ 配送方式**不要你猜**：每条输入里都会明确写「是否亚马逊配送」，那是从亚马逊自己
-贴在反馈上的说明里读出来的事实。写「否」时表示亚马逊没有声明，你就**不许**选 401/402，
-也不许在理由里断言配送方式。
+⚠️ 「配送相关反馈」这一类**不在你的选项里**，别去猜配送方式：亚马逊对自己配送的订单
+会主动把反馈剔除掉，轮不到我们提；而还需要我们提的那些，页面上根本没写配送方式。
 
 判断规则：
-1. 只有当这条反馈**明确落入**上述某一类时才给出原因。
-2. 拿不准、信息不足、或只是买家单纯不满意，一律返回 confident=false。
-   宁可交给人工，也不要猜——提交机会只有一次，用错就没了。
-3. 不要因为评分低就认为可以删除。低分本身不是删除理由。
-4. 「既抱怨商品、又抱怨卖家服务/未回复」的混合内容，不算「整条都是商品评论」，
-   返回 confident=false。
+1. **每条都要给出一个原因，不要动不动就说判不准。** 卖家要的是把能提的都提掉，
+   而不是拿到一堆待办。挑最贴近的那一类，别因为不完美就放弃。
+2. 混合内容（既说商品又说卖家没回复）**照样要判**：看哪一方面是主要的就选哪一类。
+3. 常见情形照这样归：
+   - 收到的东西与描述/图片不符、数量少了、发错款式尺码、质量不行 → 203
+   - 未送达、空包、包裹破损、配送延误 → 若买家主要在说收到的东西不对就归 203，
+     否则归 not-listed 的 301；**不要**去选配送类
+   - 有脏话或人身攻击 → 102；出现电话、邮箱、住址等 → 103
+   - 通篇只是情绪、看不出具体问题 → not-listed 的 301
+4. 只有在留言完全无法理解（乱码、空白）时才返回 confident=false。
+5. 低分本身不是删除理由，但也不要因为分低就更谨慎——按内容判。
 
 只输出一个 JSON 对象，不要有别的文字：
 {{"confident": true/false, "category": "<slug 或 null>", "reason_code": "<码 或 null>", "note": "<一句中文理由>"}}"""
@@ -176,7 +184,6 @@ class FeedbackReasonClassifier:
         comment: str,
         rating: int,
         order_date: str | None = None,
-        fulfilled_by_amazon: bool = False,
     ) -> ReasonDecision | None:
         text = (comment or "").strip()
         if not text:
@@ -187,15 +194,9 @@ class FeedbackReasonClassifier:
         if endpoint is None:
             return None
 
-        channel = (
-            "是（亚马逊已就该订单声明由其负责配送）"
-            if fulfilled_by_amazon
-            else "否（亚马逊未作此声明）"
-        )
         user_prompt = (
             f"买家评分：{rating} 星\n"
             f"订单日期：{order_date or '未知'}\n"
-            f"是否亚马逊配送：{channel}\n"
             f"买家留言：\n{text}"
         )
         payload = {
@@ -242,12 +243,10 @@ class FeedbackReasonClassifier:
             logger.warning("Feedback classifier returned non-JSON body")
             return None
 
-        return _decision_from_body(body, fulfilled_by_amazon=fulfilled_by_amazon)
+        return _decision_from_body(body)
 
 
-def _decision_from_body(
-    body: Any, *, fulfilled_by_amazon: bool = False
-) -> ReasonDecision | None:
+def _decision_from_body(body: Any) -> ReasonDecision | None:
     text = _first_message(body)
     if not text:
         return None
@@ -264,11 +263,11 @@ def _decision_from_body(
     if not is_known_reason(category, reason_code):
         logger.warning("Feedback classifier proposed an unknown reason")
         return None
-    if reason_code in FULFILMENT_REASON_CODES and not fulfilled_by_amazon:
-        # These say "Amazon fulfilled this order" to Amazon.  The page did not
-        # state that, so the claim would rest on the model's reading rather
-        # than on a fact — and the request is one-shot.
-        logger.warning("Feedback classifier asserted an unconfirmed fulfilment channel")
+    if reason_code in EXCLUDED_REASON_CODES:
+        # Not offered in the prompt, so this is the model going off-menu.  These
+        # assert "Amazon fulfilled this order", which nothing on the page
+        # supports for an entry that is still actionable.
+        logger.warning("Feedback classifier chose an excluded reason")
         return None
     note = str(parsed.get("note") or "").strip()[:400]
     return ReasonDecision(category=category, reason_code=reason_code, note=note)
