@@ -547,7 +547,11 @@ async def _runtime_recovers_before_scheduler_and_closes_in_order(db_env):
         async def shutdown_identity_probes(self): events.append("probe-stop")
 
     class Manager:
-        async def start(self): events.append("scheduler-start")
+        async def start(self, *, recover_missed=True):
+            # 记下是否补跑：升级后的启动必须把它关掉。
+            events.append(
+                "scheduler-start" if recover_missed else "scheduler-start-no-recovery"
+            )
         async def shutdown(self, wait=False): events.append("scheduler-stop")
 
     class Controller:

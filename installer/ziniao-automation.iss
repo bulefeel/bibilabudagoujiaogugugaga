@@ -1,4 +1,4 @@
-; 紫鸟提现自动化 — Windows 安装包
+﻿; 紫鸟提现自动化 — Windows 安装包
 ;
 ; 用 installer\build.ps1 构建，不要直接在 IDE 里点编译：build.ps1 会先把源码
 ; 收集到一个干净的暂存目录，避免把 data\、.venv\、抽帧图片打进包里。
@@ -108,6 +108,7 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   StopScript: String;
+  MarkerFile: String;
   ResultCode: Integer;
 begin
   Result := '';
@@ -130,6 +131,21 @@ begin
          SW_HIDE, ewWaitUntilTerminated, ResultCode);
     { 给端口和文件句柄一点释放时间；失败不阻断安装，后面的文件替换会自己报错。 }
     Sleep(2000);
+
+    { 留一个标记：这次停机是安装程序造成的，不是操作员选的。
+
+      服务启动时会把停机期间错过的那一次定时任务补跑掉——这对崩溃后重启是对的，
+      但升级不该有"打开应用就自己开始干活"的副作用，提现尤其如此：亚马逊按滑动
+      24 小时从上一次请求起算，临时补跑会把整个窗口拖走。
+
+      服务读到这个文件就跳过补跑，并把它删掉（见 config.consume_upgrade_marker），
+      所以一个残留的标记最多只影响一次启动。
+
+      写在这个 if 里面是有意的：只有真的停掉了一个正在跑的服务才算升级，
+      首次安装不会走到这里。data 目录此时必然存在——服务跑过就有。 }
+    MarkerFile := ExpandConstant('{app}\app\data\upgrade-pending');
+    if DirExists(ExpandConstant('{app}\app\data')) then
+      SaveStringToFile(MarkerFile, 'installer stopped the service', False);
   end;
 end;
 

@@ -9,7 +9,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from .config import Settings
+from .config import Settings, consume_upgrade_marker
 from .models import ZiniaoAccount
 from .notifications import (
     CompositeNotifier,
@@ -76,7 +76,12 @@ class RuntimeComposition:
         # reconcile(), never start()/execute().  Recovery is awaited before
         # schedules become live so no due job can overtake it.
         await self.automation_service.recover_startup()
-        await self.schedule_manager.start()
+        # An installer upgrade stops the service; the operator did not choose
+        # that downtime, so opening the app afterwards must not set work going.
+        upgraded = consume_upgrade_marker(self.settings)
+        if upgraded:
+            logger.info("startup_after_upgrade schedule_recovery=skipped")
+        await self.schedule_manager.start(recover_missed=not upgraded)
 
     async def close(self) -> None:
         if self._closed:

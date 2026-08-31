@@ -91,3 +91,37 @@ class Settings:
         for directory in (self.data_dir, self.evidence_dir, self.log_dir, self.backup_dir):
             assert directory is not None
             directory.mkdir(parents=True, exist_ok=True)
+
+
+# The installer drops this file next to the ledger when it stops a RUNNING
+# service in order to upgrade it (installer/ziniao-automation.iss,
+# PrepareToInstall).  A first install never writes it, because there is no
+# service to stop.
+UPGRADE_MARKER_NAME = "upgrade-pending"
+
+
+def consume_upgrade_marker(settings: Settings) -> bool:
+    """True exactly once after an installer upgrade stopped the service.
+
+    The caller uses it to skip catching up occurrences missed during the
+    upgrade.  Stopping the service is the installer's own doing, so the
+    operator did not choose that downtime and should not have work start by
+    itself when they open the app afterwards.  A crash or a manual restart is
+    different and still recovers normally.
+
+    The marker is DELETED on read, so a stale one — written by an upgrade whose
+    service was never started afterwards — can suppress at most a single
+    recovery, and a later crash restart behaves normally again.
+    """
+
+    assert settings.data_dir is not None
+    marker = settings.data_dir / UPGRADE_MARKER_NAME
+    try:
+        marker.unlink()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        # Unreadable/locked marker: prefer the safe reading — treat it as an
+        # upgrade and skip recovery, rather than running work unexpectedly.
+        return True
+    return True

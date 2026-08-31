@@ -72,14 +72,24 @@ class ScheduleManager:
             self._scheduler = factory()
         return self._scheduler
 
-    async def start(self) -> None:
+    async def start(self, *, recover_missed: bool = True) -> None:
+        """Project the schedules, optionally catching up a missed occurrence.
+
+        ``recover_missed=False`` is for the one case where the downtime was not
+        the operator's: the installer stops the service to upgrade it, so work
+        must not start by itself the moment they open the app afterwards.
+        """
+
         if self._started:
             return
         # Start paused so a stale in-memory job can never fire between startup
         # and the authoritative SQLite rebuild.
         self.scheduler.start(paused=True)
         self._started = True
-        await self.recover_latest_missed()
+        if recover_missed:
+            await self.recover_latest_missed()
+        else:
+            logger.info("schedule_recovery_skipped reason=upgrade")
         await self.refresh()
         self.scheduler.resume()
 
