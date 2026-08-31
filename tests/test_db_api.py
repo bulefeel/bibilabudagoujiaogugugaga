@@ -836,7 +836,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260828-feedback-removal" in page.text
+    assert "/static/app.js?v=20260831-schedule-bulk" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text

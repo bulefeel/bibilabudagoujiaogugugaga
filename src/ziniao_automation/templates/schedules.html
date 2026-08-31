@@ -8,7 +8,16 @@
 
 <div class="toolbar">
   <p class="lead">同时到期的任务会按计划时间持久排队，前面的任务完成后再逐家执行。任务一旦入队就不会因等待超时而丢失；即使轮到时已经跨日，也会继续执行。</p>
-  <button type="button" class="button primary" data-action="open-schedule">＋ 新建排期</button>
+  <div class="toolbar-actions">
+    {% if schedules %}
+    <label class="bulk-check"><input type="checkbox" data-action="toggle-all-schedules"><span>全选</span></label>
+    <span class="bulk-count" data-bulk-count>未选择</span>
+    <button type="button" class="button ghost compact-button" data-action="bulk-enable-schedules" disabled>批量启用</button>
+    <button type="button" class="button ghost compact-button" data-action="bulk-disable-schedules" disabled>批量停用</button>
+    <button type="button" class="button danger compact-button" data-action="bulk-delete-schedules" disabled>批量删除</button>
+    {% endif %}
+    <button type="button" class="button primary" data-action="open-schedule">＋ 新建排期</button>
+  </div>
 </div>
 
 <div class="schedule-list">
@@ -26,6 +35,19 @@
   {% endif %}
   {% set run_blocked = (not workflow_meta) or (not item.store.enabled) or (requires_targets and ((not configured_codes) or validity.invalid)) or (requires_identity and ((not item.store.identity_confirmed) or (not item.store.expected_seller_id))) %}
   <article class="schedule-row">
+    {# 勾选框携带名称和当前启停状态：批量操作要能跳过本来就处于目标状态的条目，
+       并在回执里按名字点出哪几条失败了。 #}
+    <label class="row-check" title="选择这条排期">
+      <input
+        type="checkbox"
+        data-schedule-select
+        data-action="select-schedule"
+        value="{{ item.id }}"
+        data-schedule-name="{{ item.name }}"
+        data-store-name="{{ item.store.name }}"
+        data-schedule-enabled="{{ 'true' if item.enabled else 'false' }}"
+      >
+    </label>
     <div class="time-block">
       <strong>{{ item.interval_minutes|interval_label }}</strong>
       <small>每隔这么久跑一次</small>

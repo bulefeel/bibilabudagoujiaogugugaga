@@ -837,6 +837,12 @@
   async function confirmAction(message) {
     const dialog = $("#confirm-dialog"); if (!dialog) return window.confirm(message);
     $("#confirm-message", dialog).textContent = message;
+    // ⚠️ 必须先清空 returnValue。按 Esc 关闭对话框时，HTML 规范明确规定**不**写入
+    // returnValue（关闭步骤里那句 "If result is not null"，而 Esc 传的是 null），
+    // 于是它保留着上一次的值。上一次点过「确认」、而那次操作因为 409/503 失败没有
+    // 跳转的话，这个文档里之后每一次按 Esc 都会被读成「确认」——批量删除按 Esc
+    // 反而把勾中的排期全删了。
+    dialog.returnValue = "";
     dialog.showModal(); return new Promise(resolve => dialog.addEventListener("close", () => resolve(dialog.returnValue === "confirm"), {once:true}));
   }
   const scheduleModeLabels = {
@@ -980,6 +986,85 @@
   }
   function selectedScheduleStoreIds(form){return $$('input[name="target_store_ids"]:checked',form).map(input=>Number(input.value)).filter(validPositiveId);}
   function scheduleStoreRow(form, storeId){return $$("[data-store-option]", form).find(row => String(row.dataset.storeId || "") === String(storeId));}
+  // ---- 排期的批量操作 --------------------------------------------------
+  // 复用单条的 PATCH / DELETE 接口逐条发，而不是新造一个批量接口：那两个接口里
+  // 的校验是踩过坑才对的（停用不校验站点、启用才校验），投影刷新也在里面；复制
+  // 一份必然走样。代价是 N 次往返，但排期数量是几十条量级。
+  function scheduleChecks(){return $$("[data-schedule-select]");}
+  // 批量执行期间的闩。refreshScheduleBulkBar() 会按勾选数重算按钮的 disabled，
+  // 而勾选框在执行期间仍然可点——没有这个共享状态，点一下勾选框就把刚禁用的三个
+  // 按钮又放开了，操作员能在上一批的 reload 定时器还没触发时再发一批。
+  let scheduleBulkBusy = false;
+  function selectedSchedules(){
+    return scheduleChecks().filter(box => box.checked).map(box => {
+      const name = box.dataset.scheduleName || `排期 #${box.value}`;
+      const store = box.dataset.storeName || "";
+      return {
+        id: Number(box.value),
+        name,
+        // 线上五条排期名字完全相同（都叫「工作日自动化任务」），只报名字的话
+        // 确认框和失败回执都认不出是哪几条。店铺名才是区分度所在。
+        label: store ? `${store} · ${name}` : name,
+        enabled: box.dataset.scheduleEnabled === "true",
+      };
+    }).filter(item => validPositiveId(item.id));
+  }
+  function refreshScheduleBulkBar(){
+    const boxes = scheduleChecks();
+    if (!boxes.length) return;
+    const picked = selectedSchedules();
+    const label = $("[data-bulk-count]");
+    if (label) {
+      label.textContent = picked.length ? `已选 ${picked.length} 条` : "未选择";
+      label.classList.toggle("active", picked.length > 0);
+    }
+    ["bulk-enable-schedules", "bulk-disable-schedules", "bulk-delete-schedules"].forEach(name => {
+      const button = $(`[data-action="${name}"]`);
+      if (button) button.disabled = scheduleBulkBusy || picked.length === 0;
+    });
+    const all = $('[data-action="toggle-all-schedules"]');
+    if (all) {
+      all.checked = picked.length === boxes.length && boxes.length > 0;
+      // 部分选中时显示中间态，否则「全选」看起来像是没选。
+      all.indeterminate = picked.length > 0 && picked.length < boxes.length;
+      all.disabled = scheduleBulkBusy;
+    }
+    boxes.forEach(box => { box.disabled = scheduleBulkBusy; });
+  }
+  // 逐条执行并汇总。一条失败不影响其余——批量启用尤其如此：某个站点被关掉的排期
+  // 会被后端以 422 拒绝，而同批其它排期完全正常，全批回滚只会让人无从下手。
+  async function runScheduleBulk(items, {verb, act}){
+    const failures = [];
+    const stale = [];
+    let done = 0;
+    scheduleBulkBusy = true;
+    refreshScheduleBulkBar();
+    for (const item of items) {
+      try {
+        const data = await act(item);
+        done += 1;
+        // 单条删除会把这个情况当成需要警告的结果而不是成功；批量也不能吞掉它，
+        // 否则 SQLite 已经改了、内存里的定时器还没重建，而回执写着「已完成」。
+        if (data && data.scheduler_refreshed === false) stale.push(item.label);
+      } catch (exc) { failures.push(`${item.label}：${exc.message}`); }
+    }
+    const parts = [];
+    if (done) parts.push(`已${verb} ${done} 条`);
+    if (failures.length) {
+      // 全部列出，不只报第一条：不同排期失败的原因往往不同（站点被关、身份未确认、
+      // 有任务在跑），只看一条会让人以为其余是同一个毛病。
+      parts.push(`${failures.length} 条失败 —— ${failures.join("；")}`);
+    }
+    if (stale.length) {
+      parts.push(`另有 ${stale.length} 条已写入数据库但定时器尚未重载（${stale.join("、")}），请勿重复操作，重启后台会自动加载`);
+    }
+    if (!done && !failures.length) parts.push(`没有排期被${verb}`);
+    const bad = failures.length > 0 || stale.length > 0;
+    toast(parts.join("；"), bad);
+    // 出问题时多留一会儿让人读完；成功则尽快刷新。
+    setTimeout(() => location.reload(), bad ? 9000 : 600);
+  }
+
   function updateSelectedStoreCount(form){const count=selectedScheduleStoreIds(form),node=$("[data-selected-store-count]",form);if(node)node.textContent="已选择 "+count.length+" 家";}
   function buildScheduleTemplate(form){return{name:String($('[name="name"]',form)?.value||"").trim(),workflow:String($('[name="workflow"]',form)?.value||""),mode:String($('[name="mode"]',form)?.value||""),workflow_config:collectWorkflowConfig(form),first_run_at:scheduleFirstRunIso(form),interval_minutes:readScheduleInterval(form),timezone:"Asia/Singapore",enabled:Boolean($('[name="enabled"]',form)?.checked),misfire_grace_seconds:1800};}
   // datetime-local yields a bare wall clock. The operator is told UTC+8 on the
@@ -1321,6 +1406,47 @@
       } catch (exc) { toast(exc.message, true); target.disabled = false; }
       return;
     }
+    if (action === "select-schedule") { refreshScheduleBulkBar(); return; }
+    if (action === "toggle-all-schedules") {
+      const wanted = target.checked;
+      scheduleChecks().forEach(box => { box.checked = wanted; });
+      refreshScheduleBulkBar();
+      return;
+    }
+    if (action === "bulk-enable-schedules" || action === "bulk-disable-schedules") {
+      const enable = action === "bulk-enable-schedules";
+      const picked = selectedSchedules();
+      // 本来就处于目标状态的不发请求，也不该出现在回执的分母里。
+      const todo = picked.filter(item => item.enabled !== enable);
+      if (!todo.length) {
+        toast(picked.length ? `选中的 ${picked.length} 条本来就是${enable ? "启用" : "停用"}的` : "请先勾选排期");
+        return;
+      }
+      const verb = enable ? "启用" : "停用";
+      const names = todo.slice(0, 3).map(item => item.label).join("、");
+      const more = todo.length > 3 ? ` 等 ${todo.length} 条` : "";
+      if (!enable && !(await confirmAction(
+        `暂停「${names}」${more}吗？定时器会立刻停止，规则和运行历史都保留，随时可以再启用。`))) return;
+      await runScheduleBulk(todo, {
+        verb,
+        act: item => api(`/api/schedules/${item.id}`,
+          {method: "PATCH", body: JSON.stringify({enabled: enable})}),
+      });
+      return;
+    }
+    if (action === "bulk-delete-schedules") {
+      const picked = selectedSchedules();
+      if (!picked.length) { toast("请先勾选排期"); return; }
+      const names = picked.slice(0, 3).map(item => item.label).join("、");
+      const more = picked.length > 3 ? ` 等 ${picked.length} 条` : "";
+      if (!(await confirmAction(
+        `确定永久删除「${names}」${more}吗？删除后不会再自动运行，已有运行记录不会被删除。`))) return;
+      await runScheduleBulk(picked, {
+        verb: "删除",
+        act: item => api(`/api/schedules/${item.id}`, {method: "DELETE", body: "{}"}),
+      });
+      return;
+    }
     if (action === "toggle-schedule") {
       // 最小 PATCH：只发 enabled。不重发配置，所以站点状态变化不会把暂停这条路堵死，
       // 也不会在暂停时顺手把一份可能已经过期的配置写回去。
@@ -1511,6 +1637,7 @@
   // with no request, no toast and nothing in the log.
   const scheduleForm = $("[data-schedule-form]");
   if (scheduleForm) updateSelectedStoreCount(scheduleForm);
+  if ($("[data-bulk-count]")) refreshScheduleBulkBar();
   if ($('[data-action="detect-all-store-setups"]')) {
     restoreBulkStoreSetup();
     if (!bulkStoreSetup.queue.length) restoreBulkSetupCompletionSummary();
