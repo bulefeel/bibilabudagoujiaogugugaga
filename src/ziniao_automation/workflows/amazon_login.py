@@ -36,7 +36,13 @@ _SELLER_CENTRAL_HOSTS = frozenset(
         "sellercentral.amazon.com.au",
     }
 )
-_LOGIN_PATHS = frozenset({"/ap/signin", "/ap/mfa"})
+# ``/ap/mfa/new-otp`` is the two-step-verification METHOD CHOOSER Amazon started
+# showing when it cannot SMS the seller's number: three radios (WhatsApp, phone
+# call, authenticator app) and one submit.  It is listed explicitly rather than
+# by prefix — an unknown ``/ap/mfa/<something>`` must keep going to a human
+# instead of being auto-clicked on the strength of a path guess.
+_LOGIN_PATHS = frozenset({"/ap/signin", "/ap/mfa", "/ap/mfa/new-otp"})
+_OTP_METHOD_PATH = "/ap/mfa/new-otp"
 # Destinations that count as "the login is over, we are back on business".
 #
 # The statements page belongs here because the read-back navigates to it: after
@@ -67,8 +73,42 @@ _BUSINESS_EXACT_PATHS = frozenset(
     }
 )
 _PAYMENT_DETAILS_EXACT_PATH = "/payments/disburse/details"
+_OTP_METHOD_OPTIONS = """
+() => Array.from(document.querySelectorAll('input[type="radio"]')).map((el, index) => {
+    const byFor = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
+    const wrap = el.closest('label');
+    const node = byFor || wrap || el.parentElement;
+    return {
+        index: index,
+        id: el.id || '',
+        name: el.getAttribute('name') || '',
+        value: el.getAttribute('value') || '',
+        checked: el.checked === true,
+        disabled: el.disabled === true,
+        label: node ? (node.innerText || node.textContent || '').trim().slice(0, 160) : '',
+    };
+})
+"""
+
+_SELECT_OTP_METHOD = """
+(index) => {
+    const radios = Array.from(document.querySelectorAll('input[type="radio"]'));
+    const target = radios[index];
+    if (!target || target.disabled) return false;
+    target.click();
+    return target.checked === true;
+}
+"""
+
+
 _LoginAction = Literal[
-    "continue", "password_signin", "otp_signin", "managed_passkey"
+    "continue",
+    "password_signin",
+    "otp_signin",
+    "managed_passkey",
+    # Pick "authenticator app" on the method chooser so the flow reaches the
+    # ordinary OTP screen Ziniao already fills.
+    "otp_method_choice",
 ]
 _DispatchOutcome = Literal["dispatched", "not_dispatched", "uncertain"]
 _BusinessBaseline = tuple[tuple[Any, str], ...]
@@ -200,6 +240,31 @@ class AmazonLoginAdvancer:
     # ``#signInSubmit`` control; accepting a generic ``name=signIn`` element on
     # this route could target an unrelated or newly rendered action.
     _password_signin_control_selector = "#signInSubmit"
+
+    # The one option that keeps the code inside the browser Ziniao controls.
+    _otp_method_authenticator = re.compile(
+        r"认证器|認證器|验证器|驗證器|身份验证器应用|"
+        r"authenticat(?:or|ion)\s*app|one[-\s]?time\s*password.*app|"
+        r"totp|auth[_-]?app",
+        re.IGNORECASE,
+    )
+    # ⚠️ The options that reach the seller's real phone.  Submitting with one of
+    # these selected sends them a WhatsApp message or rings them.  This pattern
+    # is used as a NEGATIVE assertion immediately before the submit click: even
+    # if the positive match above were wrong, the dangerous branch is refused.
+    # Deliberately broad: over-matching only sends the page to a human, while
+    # under-matching is what actually messages the seller.
+    _otp_method_delivery = re.compile(
+        r"whatsapp|短信|简讯|簡訊|sms|text\s*(?:me|message)|"
+        r"打电话|打電話|来电|來電|拨打|撥打|phone\s*call|call\s+me|voice|"
+        r"发送(?:到|至)|send.*(?:to\s+my|code\s+to)|"
+        r"邮件|邮箱|電子郵件|e-?mail",
+        re.IGNORECASE,
+    )
+    _otp_method_submit_selector = (
+        'input[type="submit"], button[type="submit"], '
+        '#auth-send-code, #auth-continue, input#continue, button#continue'
+    )
 
     _continue_label = re.compile(r"^(?:continue|继续|繼續)$", re.IGNORECASE)
     _signin_label = re.compile(
@@ -964,6 +1029,20 @@ class AmazonLoginAdvancer:
     ) -> tuple[_DispatchOutcome, BaseException | None]:
         """Perform one fully revalidated click attempt without settling it."""
 
+        if action == "otp_method_choice":
+            try:
+                clicked = await self._choose_authenticator_otp_method(page)
+            except HumanAuthRequired:
+                raise
+            except _DispatchLimitReached:
+                raise
+            except Exception as exc:
+                _logger.warning(
+                    "OTP method choice was uncertain; bounded retry may follow"
+                )
+                return "uncertain", exc
+            return ("dispatched" if clicked else "not_dispatched"), None
+
         if action == "managed_passkey":
             try:
                 clicked = await self._with_managed_passkey_button(
@@ -1547,6 +1626,15 @@ class AmazonLoginAdvancer:
         auth_kind = "challenge" if path == "/ap/mfa" else "sign_in"
 
         body = await self._body_text(page)
+
+        # The method chooser has no field to fill and nothing prefilled, so it
+        # is classified purely by route.  Its dispatch does the safety work.
+        if path == _OTP_METHOD_PATH:
+            _logger.info(
+                "Amazon assisted login reached the OTP method chooser: "
+                "action=otp_method_choice"
+            )
+            return "otp_method_choice"
 
         # If the managed helper disappeared after a failed attempt, Ziniao can
         # leave Amazon's one prefilled password form behind.  Clicking only its
@@ -2232,6 +2320,91 @@ class AmazonLoginAdvancer:
                 # continue without leaking Playwright's TargetClosedError.
                 pass
         await asyncio.sleep(milliseconds / 1000)
+
+    async def _choose_authenticator_otp_method(self, page: Any) -> bool:
+        """Select "authenticator app" on the chooser, then submit.
+
+        ⚠️ The first option is preselected by Amazon and sends a WhatsApp
+        message to the seller's real phone; the second rings them.  So the
+        order here is load-bearing and every step is verified against the live
+        DOM before the next one:
+
+        1. read the radios with their label text
+        2. require EXACTLY ONE to look like the authenticator option
+        3. click it, then re-read and confirm it is the only checked one
+        4. refuse outright if the checked option looks like a delivery channel
+           — a negative assertion on the harmful outcome, so a wrong positive
+           match in step 2 still cannot ring the seller
+        5. only then click the single submit control
+
+        Anything ambiguous raises ``HumanAuthRequired``; the page is left
+        untouched for a person.
+        """
+
+        options = await page.evaluate(_OTP_METHOD_OPTIONS)
+        if not isinstance(options, list) or not options:
+            raise HumanAuthRequired(
+                "Amazon 两步验证方式页面没有读到任何选项",
+                kind="challenge",
+            )
+
+        def _text(option: Any) -> str:
+            return " ".join(
+                str(option.get(key) or "")
+                for key in ("label", "value", "id", "name")
+            )
+
+        wanted = [
+            option
+            for option in options
+            if self._otp_method_authenticator.search(_text(option))
+        ]
+        if len(wanted) != 1:
+            raise HumanAuthRequired(
+                "Amazon 两步验证方式页面无法唯一确定「认证器应用」选项，"
+                f"匹配到 {len(wanted)} 项，已停止自动点击",
+                kind="challenge",
+            )
+        target_index = int(wanted[0].get("index", -1))
+        if target_index < 0:
+            raise HumanAuthRequired(
+                "Amazon 两步验证方式选项缺少可定位的序号", kind="challenge"
+            )
+
+        if not await page.evaluate(_SELECT_OTP_METHOD, target_index):
+            raise HumanAuthRequired(
+                "Amazon 两步验证方式选项无法选中", kind="challenge"
+            )
+        await self._paced_pause(page)
+
+        after = await page.evaluate(_OTP_METHOD_OPTIONS)
+        checked = [
+            option for option in after if option.get("checked") is True
+        ]
+        if len(checked) != 1 or int(checked[0].get("index", -1)) != target_index:
+            raise HumanAuthRequired(
+                "Amazon 两步验证方式选项的选中状态与预期不符，已停止自动点击",
+                kind="challenge",
+            )
+        # ⚠️ The check that actually protects the seller's phone.
+        if self._otp_method_delivery.search(_text(checked[0])):
+            raise HumanAuthRequired(
+                "Amazon 两步验证当前选中的是短信/WhatsApp/电话方式，"
+                "自动化不会替卖家发起，请人工处理",
+                kind="challenge",
+            )
+
+        submits = await self._visible_elements(
+            page.locator(self._otp_method_submit_selector)
+        )
+        if len(submits) != 1:
+            raise HumanAuthRequired(
+                f"Amazon 两步验证方式页面的提交按钮不唯一（{len(submits)} 个）",
+                kind="challenge",
+            )
+        await submits[0].click()
+        _logger.info("Amazon assisted login selected the authenticator OTP method")
+        return True
 
     async def _dispatch_key(
         self,
