@@ -77,6 +77,41 @@ def _executable_for_pid(pid: int) -> Path | None:
         ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(process)
 
 
+def _log_startup_note(
+    settings: Settings, message: str, *, level: str = "ERROR", **fields: object
+) -> None:
+    """Write one JSONL line before logging is configured.
+
+    ``configure_logging`` only runs when ``ziniao_automation.main`` is imported,
+    which happens inside ``uvicorn.run``.  Every exit before that point is
+    therefore invisible unless it writes here — and an invisible exit is what
+    made the launcher tell an operator "多半是启动被安全软件拦下了" when the
+    real cause was a stale PID file.
+    """
+
+    try:
+        settings.log_dir.mkdir(parents=True, exist_ok=True)
+        with (settings.log_dir / "ziniao-automation.jsonl").open(
+            "a", encoding="utf-8"
+        ) as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "level": level,
+                        "logger": "ziniao_automation.runner",
+                        "message": message,
+                        **fields,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+    except OSError:
+        # A log we cannot write must not become a second failure mode.
+        pass
+
+
 def _is_managed_python(path: Path, settings: Settings) -> bool:
     """Accept uv's venv launcher and its project-local managed interpreter."""
     resolved = path.resolve()
@@ -98,7 +133,11 @@ def stop() -> int:
         pid_file.unlink(missing_ok=True)
         return 0
     if not _is_managed_python(observed, settings):
-        return 3
+        # The pid was recycled by an unrelated program.  There is nothing of
+        # ours to stop, and leaving the record in place is what kept the next
+        # ``serve()`` permanently blocked.  Drop it and report success.
+        pid_file.unlink(missing_ok=True)
+        return 0
     try:
         os.kill(pid, signal.SIGTERM)
     except PermissionError:
@@ -158,14 +197,64 @@ def last_error(settings: Settings | None = None, *, tail_bytes: int = 64_000) ->
 
 
 def serve() -> int:
+    """Start the local service, or explain in the log why it did not.
+
+    ⚠️ Everything up to ``uvicorn.run`` happens BEFORE ``configure_logging``
+    (which only runs when ``ziniao_automation.main`` is imported).  An
+    exception here used to kill a ``pythonw`` process with no console and no
+    log entry, and the launcher then told the operator the most plausible
+    wrong thing: 「多半是启动被安全软件拦下了」.  So this whole prologue is
+    wrapped — whatever goes wrong, the next person gets the exception type
+    instead of a guess.
+    """
+
+    try:
+        return _serve_inner()
+    except SystemExit:
+        raise
+    except BaseException as exc:
+        try:
+            _log_startup_note(
+                Settings.from_env(),
+                "runner failed before the web server started",
+                exception_type=type(exc).__name__,
+            )
+        except BaseException:
+            pass
+        raise
+
+
+def _serve_inner() -> int:
     _clear_codex_parent_markers()
     settings = Settings.from_env()
     run_dir = settings.data_dir / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
     pid_file = _pid_file(settings)
     previous = _read_pid(pid_file)
-    if previous is not None and _executable_for_pid(previous) is not None:
-        return 4
+    if previous is not None:
+        observed = _executable_for_pid(previous)
+        # ⚠️ It is not enough that SOME process owns this pid.  Windows recycles
+        # pids aggressively — after a reboot the number recorded by the previous
+        # service almost certainly belongs to something unrelated.  Treating
+        # that as "already running" refused every start, silently, and because
+        # ``data/`` is deliberately never touched by the installer the stale
+        # file survived every upgrade.  ``stop()`` has always made this
+        # distinction; ``serve()`` did not.
+        if observed is not None and _is_managed_python(observed, settings):
+            _log_startup_note(
+                settings,
+                "runner refused to start: this project's service is already running",
+                level="INFO",
+                other_pid=previous,
+            )
+            return 4
+        if observed is not None:
+            _log_startup_note(
+                settings,
+                "runner cleared a stale pid file whose pid now belongs to another program",
+                level="INFO",
+                stale_pid=previous,
+            )
     pid_file.unlink(missing_ok=True)
     _write_pid(pid_file, os.getpid())
 
@@ -204,23 +293,11 @@ def serve() -> int:
     except BaseException as exc:
         # pythonw has no console. Keep a JSONL-safe, secret-free clue in the
         # normal log rather than creating a second unrotated log file.
-        settings.log_dir.mkdir(parents=True, exist_ok=True)
-        with (settings.log_dir / "ziniao-automation.jsonl").open(
-            "a", encoding="utf-8"
-        ) as stream:
-            stream.write(
-                json.dumps(
-                    {
-                        "level": "ERROR",
-                        "logger": "ziniao_automation.runner",
-                        "message": "runner exited during startup",
-                        "exception_type": type(exc).__name__,
-                    },
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                + "\n"
-            )
+        _log_startup_note(
+            settings,
+            "runner exited during startup",
+            exception_type=type(exc).__name__,
+        )
         raise
     finally:
         remove_pid()
