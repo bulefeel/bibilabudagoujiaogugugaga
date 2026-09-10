@@ -16,11 +16,11 @@
 
 from __future__ import annotations
 
-import builtins
-import dis
-import importlib
-import pkgutil
+import json
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import ziniao_automation
@@ -28,15 +28,42 @@ import ziniao_automation
 
 SRC_ROOT = Path(ziniao_automation.__file__).resolve().parent
 
+# 扫描要 import 包里的每一个模块，而 ``main.py`` 是 ASGI 入口——**导入即副作用**：
+# 按 ZINIAO_* 环境解析 Settings、创建 data 目录、把 jsonl 日志 handler 挂上根
+# logger、还会按留存期清理 evidence/logs。在测试进程里直接导入，等于把这些副作用
+# 打进真实项目目录（安装包构建的 stage 防线就是这么被触发的），之后整个测试套件
+# 的日志都会灌进那个 handler。所以导入扫描放进子进程，并把环境指到临时目录。
+_SCAN_SCRIPT = """
+import builtins, dis, importlib, json, pkgutil, sys
+from pathlib import Path
+import ziniao_automation
 
-def _all_code_objects(code):
+def code_objects(code):
     yield code
     for const in code.co_consts:
         if hasattr(const, "co_names"):
-            yield from _all_code_objects(const)
+            yield from code_objects(const)
+
+missing = []
+for info in pkgutil.walk_packages(ziniao_automation.__path__, "ziniao_automation."):
+    module = importlib.import_module(info.name)
+    source = getattr(module, "__file__", None)
+    if not source:
+        continue
+    code = compile(Path(source).read_text(encoding="utf-8-sig"), source, "exec")
+    for code_object in code_objects(code):
+        for instruction in dis.get_instructions(code_object):
+            if instruction.opname != "LOAD_GLOBAL":
+                continue
+            name = instruction.argval
+            if name in vars(module) or hasattr(builtins, name):
+                continue
+            missing.append(f"{info.name}.{code_object.co_name}: {name}")
+print(json.dumps(sorted(set(missing))))
+"""
 
 
-def test_every_load_global_resolves_to_a_real_name() -> None:
+def test_every_load_global_resolves_to_a_real_name(tmp_path: Path) -> None:
     """引用了不存在的全局名 = 一颗只在错误分支爆炸的地雷。
 
     ``python -m compileall`` 和 import 都不查名字是否存在，NameError 要等运行
@@ -44,24 +71,27 @@ def test_every_load_global_resolves_to_a_real_name() -> None:
     字节码扫 LOAD_GLOBAL，名字必须在模块全局或 builtins 里。
     """
 
-    missing: list[str] = []
-    for info in pkgutil.walk_packages(ziniao_automation.__path__, "ziniao_automation."):
-        module = importlib.import_module(info.name)
-        source = getattr(module, "__file__", None)
-        if not source:
-            continue
-        code = compile(
-            Path(source).read_text(encoding="utf-8-sig"), source, "exec"
-        )
-        for code_object in _all_code_objects(code):
-            for instruction in dis.get_instructions(code_object):
-                if instruction.opname != "LOAD_GLOBAL":
-                    continue
-                name = instruction.argval
-                if name in vars(module) or hasattr(builtins, name):
-                    continue
-                missing.append(f"{info.name}.{code_object.co_name}: {name}")
-    assert not missing, f"引用了不存在的全局名：{sorted(set(missing))}"
+    env = {
+        **os.environ,
+        "ZINIAO_PROJECT_ROOT": str(tmp_path),
+        "ZINIAO_DATA_DIR": str(tmp_path / "data"),
+        "ZINIAO_DATABASE_URL": f"sqlite:///{(tmp_path / 'scan.db').as_posix()}",
+        "ZINIAO_TESTING": "1",
+    }
+    completed = subprocess.run(
+        [sys.executable, "-c", _SCAN_SCRIPT],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, f"导入扫描本身失败：{completed.stderr[-2000:]}"
+    missing = json.loads(completed.stdout.strip().splitlines()[-1])
+    assert not missing, f"引用了不存在的全局名：{missing}"
+    # 钉住沙箱确实接住了 main.py 的导入副作用：目录建在了 tmp 而不是项目里。
+    # 这条断言失败 = ZINIAO_* 环境没生效，副作用又会去打真实项目目录（那正是
+    # 安装包构建 stage\data 防线拦下的事故）。
+    assert (tmp_path / "data" / "logs").is_dir(), "main.py 的副作用没有落进沙箱"
 
 
 def test_no_mojibake_question_runs_in_source() -> None:
