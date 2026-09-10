@@ -596,6 +596,20 @@ class AmazonDisbursementWorkflow:
                 _log_site_outcome(marketplace, "SKIPPED", "platform_duplicate")
                 self._auth_cursors[cursor_key] = index + 1
                 continue
+            except Exception as exc:
+                # Intentional process/runtime failures must still reach the
+                # engine recovery path; isolate ordinary browser/page errors
+                # such as locator timeouts before ARMED.
+                if isinstance(exc, RuntimeError):
+                    raise
+                # A locator timeout or page-contract failure before ARMED is
+                # isolated to this marketplace. Continue later sites, while
+                # preserving the exact sanitized error for the report.
+                await self._fail_site_and_continue(
+                    run, marketplace, exc, reason_code="site_execution_failed"
+                )
+                self._auth_cursors[cursor_key] = index + 1
+                continue
 
             intent = OperationIntent(
                 guard_key=guard_key,

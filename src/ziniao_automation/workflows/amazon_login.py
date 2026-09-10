@@ -262,8 +262,13 @@ class AmazonLoginAdvancer:
         re.IGNORECASE,
     )
     _otp_method_submit_selector = (
-        'input[type="submit"], button[type="submit"], '
-        '#auth-send-code, #auth-continue, input#continue, button#continue'
+        '#auth-send-code, #auth-continue, input#continue, button#continue, '
+        'button[type="submit"], input[type="submit"], button[type="button"]'
+    )
+    _otp_method_send_label = re.compile(
+        r"(?:\u53d1\u9001|\u83b7\u53d6|\u7ee7\u7eed).*?(?:\u4e00\u6b21\u6027\u5bc6\u7801|\u9a8c\u8bc1\u7801)|"
+        r"(?:send|request|get|continue).*?(?:one[-\s]?time|otp|verification)\s*(?:password|code)?",
+        re.IGNORECASE,
     )
 
     _continue_label = re.compile(r"^(?:continue|继续|繼續)$", re.IGNORECASE)
@@ -2394,16 +2399,30 @@ class AmazonLoginAdvancer:
                 kind="challenge",
             )
 
-        submits = await self._visible_elements(
+        candidates = await self._visible_elements(
             page.locator(self._otp_method_submit_selector)
         )
+        submits: list[Any] = []
+        for candidate in candidates:
+            try:
+                text = " ".join(str(value or "") for value in (
+                    await candidate.inner_text(),
+                    await candidate.get_attribute("value"),
+                    await candidate.get_attribute("aria-label"),
+                    await candidate.get_attribute("id"),
+                ))
+            except Exception:
+                text = ""
+            if self._otp_method_send_label.search(text):
+                submits.append(candidate)
         if len(submits) != 1:
             raise HumanAuthRequired(
-                f"Amazon 两步验证方式页面的提交按钮不唯一（{len(submits)} 个）",
+                "Amazon ??????????????????????"
+                f"???? {len(candidates)} ?????? {len(labelled)} ?????????",
                 kind="challenge",
             )
         await submits[0].click()
-        _logger.info("Amazon assisted login selected the authenticator OTP method")
+        _logger.info("Amazon assisted login selected authenticator and sent OTP request")
         return True
 
     async def _dispatch_key(
@@ -2967,3 +2986,4 @@ def _cdp_attributes(node: dict[str, Any]) -> dict[str, str]:
 
 
 __all__ = ["AmazonLoginAdvanceResult", "AmazonLoginAdvancer"]
+

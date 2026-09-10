@@ -442,6 +442,7 @@ class AmazonPaymentsPage:
             raise DomContractError("打开确认页前身份、站点或页面结构发生变化")
         if not current.can_submit:
             raise DomContractError("当前标准订单余额不可请求付款")
+        await self._dismiss_feedback_survey(page)
         row = await self._unique_payable_row(page)
         buttons = await self._payout_buttons(row)
         if len(buttons) != 1 or not await self._is_enabled(buttons[0]):
@@ -579,6 +580,7 @@ class AmazonPaymentsPage:
             raise DomContractError("重开确认页前身份、站点或页面结构发生变化")
         if not current.can_submit:
             raise DomContractError("重开确认页时标准订单余额已不可请求付款")
+        await self._dismiss_feedback_survey(page)
         row = await self._unique_payable_row(page)
         buttons = await self._payout_buttons(row)
         if len(buttons) != 1 or not await self._is_enabled(buttons[0]):
@@ -1675,6 +1677,58 @@ class AmazonPaymentsPage:
         if [kind for kind, _ in result] != ["PAYABLE", "DEFERRED", "ALL"]:
             raise DomContractError("余额列卡账户类型顺序或标签不符合契约")
         return result
+
+    async def _dismiss_feedback_survey(self, page: Any) -> None:
+        """Close Amazon's optional satisfaction survey if it covers the page.
+
+        This is deliberately fail-closed: only a visible dialog whose text
+        identifies the survey is touched. No rating or free-text field is ever
+        submitted.
+        """
+        locator = getattr(page, "locator", None)
+        if not callable(locator):
+            return
+        dialogs = locator('kat-modal, [role="dialog"], dialog')
+        count = await dialogs.count()
+        for index in range(count):
+            dialog = dialogs.nth(index)
+            try:
+                if not await dialog.is_visible():
+                    continue
+                text = (await dialog.inner_text()).strip().lower()
+            except Exception:
+                continue
+            if not any(marker in text for marker in (
+                "?????????", "???????",
+                "we'd love your feedback", "we value your feedback",
+            )):
+                continue
+            close = dialog.locator(
+                '[aria-label="Close"], [aria-label="??"], button.close, .close-button'
+            )
+            if await close.count() == 1 and await close.first.is_visible():
+                await close.first.click(no_wait_after=True)
+            else:
+                remind = dialog.get_by_text(
+                    "???????", exact=True
+                )
+                if await remind.count() == 1 and await remind.first.is_visible():
+                    await remind.first.click(no_wait_after=True)
+                else:
+                    raise DomContractError("?????????????????")
+            try:
+                await page.wait_for_timeout(300)
+            except Exception:
+                pass
+            try:
+                if await dialog.is_visible():
+                    raise DomContractError("????????????")
+            except DomContractError:
+                raise
+            except Exception:
+                pass
+            logger.info("Amazon satisfaction survey dismissed before payout click")
+            return
 
     async def _unique_payable_row(self, page: Any) -> Any:
         matches = [row for kind, row in await self._classified_rows(page) if kind == "PAYABLE"]

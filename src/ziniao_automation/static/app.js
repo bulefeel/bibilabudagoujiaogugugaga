@@ -39,6 +39,22 @@
     }
     return data;
   }
+  function startRunDetailPolling() {
+    const node = $("[data-run-live-poll]");
+    if (!node) return;
+    const terminal = new Set(["SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "SKIPPED", "NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL"]);
+    const id = node.dataset.runId;
+    let last = node.dataset.runStatus || "";
+    const timer = setInterval(async () => {
+      if (terminal.has(last)) { clearInterval(timer); return; }
+      try {
+        const current = await api(`/api/runs/${encodeURIComponent(id)}`);
+        const status = String(current.status || "");
+        if (status && status !== last) { clearInterval(timer); location.reload(); return; }
+      } catch (_) { /* ??????????????? */ }
+    }, 2000);
+  }
+
   async function apiResult(url, options = {}) {
     const headers = {"Content-Type":"application/json", ...options.headers};
     if ((options.method || "GET") !== "GET") headers["X-CSRF-Token"] = csrf();

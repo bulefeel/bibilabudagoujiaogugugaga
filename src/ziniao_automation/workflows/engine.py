@@ -113,16 +113,34 @@ class WorkflowEngine:
         await workflow.preflight(run, page)
         plan = await workflow.plan(run, page)
         await self.repository.save_plan(plan)
-        if run.mode is RunMode.DRY_RUN:
-            await self.repository.set_run_status(
-                run.id, RunStatus.SUCCEEDED, allowed_from=(RunStatus.RUNNING,)
-            )
-            await self._notify(workflow, run, RunStatus.SUCCEEDED)
-            return PrepareResult(run.id, RunStatus.SUCCEEDED, plan)
         if not plan.lines:
-            # No payable line means either a normal zero/no-data skip or a
-            # setup-only account enrollment.  Neither may create an empty
-            # approval, an ARMED guard, or reach a final submit control.
+            # An empty plan is only a successful no-op when every site was
+            # actually read and explicitly skipped/completed.  A failed or
+            # authentication-blocked site must never be reported as "no money".
+            site_outcomes = await self._site_outcomes(run)
+            if any(value is SiteStatus.NEEDS_HUMAN_AUTH for value in site_outcomes):
+                empty_status = RunStatus.NEEDS_HUMAN_AUTH
+            elif any(value is SiteStatus.FAILED for value in site_outcomes):
+                empty_status = RunStatus.PARTIAL
+            elif not site_outcomes or all(value is SiteStatus.SKIPPED for value in site_outcomes):
+                # A zero/no-data plan is a normal completed no-op.
+                empty_status = RunStatus.SUCCEEDED
+            elif site_outcomes and all(
+                value in {SiteStatus.SKIPPED, SiteStatus.DRY_RUN_COMPLETE}
+                for value in site_outcomes
+            ):
+                empty_status = RunStatus.SUCCEEDED
+            else:
+                # Some non-financial workflow adapters do not maintain site
+                # rows. Preserve their successful empty-plan behavior; only an
+                # explicit FAILED or NEEDS_HUMAN_AUTH outcome changes status.
+                empty_status = RunStatus.SUCCEEDED
+            await self.repository.set_run_status(
+                run.id, empty_status, allowed_from=(RunStatus.RUNNING,)
+            )
+            await self._notify(workflow, run, empty_status)
+            return PrepareResult(run.id, empty_status, plan)
+        if run.mode is RunMode.DRY_RUN:
             await self.repository.set_run_status(
                 run.id, RunStatus.SUCCEEDED, allowed_from=(RunStatus.RUNNING,)
             )

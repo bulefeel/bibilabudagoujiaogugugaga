@@ -1,4 +1,4 @@
-"""Application and build identity.
+﻿"""Application and build identity.
 
 ``__version__`` is the only hand-edited release number in the repository.
 Setuptools reads it for package metadata, while the installer build script
@@ -17,7 +17,7 @@ import re
 import subprocess
 
 
-__version__ = "0.6.2"
+__version__ = "0.6.3"
 
 _COMMIT_PATTERN = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
@@ -57,3 +57,4 @@ def build_commit(project_root: str | Path | None = None) -> str:
     except (OSError, subprocess.SubprocessError):
         return "unknown"
     return _valid_commit(completed.stdout) or "unknown"
+
