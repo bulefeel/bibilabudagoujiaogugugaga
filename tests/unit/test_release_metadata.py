@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from pathlib import Path
@@ -15,7 +15,7 @@ def test_release_number_has_one_hand_edited_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     installer = (ROOT / "installer/ziniao-automation.iss").read_text(encoding="utf-8")
 
-    assert __version__ == "0.6.2"
+    assert __version__ == "0.6.3"
     assert project["project"]["dynamic"] == ["version"]
     assert project["tool"]["setuptools"]["dynamic"]["version"] == {
         "attr": "ziniao_automation.version.__version__"
@@ -132,3 +132,4 @@ def test_inno_aborts_when_environment_install_fails() -> None:
     assert "ResultCode <> 0" in code_section
     assert "RaiseException" in code_section
     assert "Install.bat" in code_section
+

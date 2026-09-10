@@ -1,4 +1,4 @@
-# 构建安装包
+﻿# 构建安装包
 
 ```powershell
 winget install --id JRSoftware.InnoSetup      # 只需一次
@@ -64,7 +64,7 @@ powershell -File installer\build.ps1 -CertificatePath cert.pfx -CertificatePassw
 ## 静默安装（批量部署 / 自动化验证）
 
 ```powershell
-.\ZiniaoAutomation-Setup-0.6.2.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
+.\ZiniaoAutomation-Setup-0.6.3.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
     /DIR="C:\某个目录" /LOG=install.log
 ```
 
@@ -75,3 +75,4 @@ powershell -File installer\build.ps1 -CertificatePath cert.pfx -CertificatePassw
 
 `app.ico` 由 `installer/make_icon.py` 生成（纯 zlib + struct 手写 PNG/ICO，
 不引 Pillow——为了一个只生成一次的图标加一个图像库不划算）。
+

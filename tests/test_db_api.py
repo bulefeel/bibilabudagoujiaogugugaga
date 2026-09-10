@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -1275,7 +1275,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
 
     assert page.status_code == 200
     assert "应用版本 / 构建" in page.text
-    assert "0.6.2" in page.text
+    assert "0.6.3" in page.text
     assert "数据库迁移版本" in page.text
     assert "0009" in page.text
 
@@ -1443,3 +1443,4 @@ def test_schedules_page_renders_a_real_row_not_just_an_empty_list(app_client):
     # 'T' form, and the period must survive the round trip.
     assert "2026-01-01T09:00" in page.text, "编辑按钮里的首次时间要按 UTC+8 回填"
     assert '"interval_minutes": 1500' in page.text
+
