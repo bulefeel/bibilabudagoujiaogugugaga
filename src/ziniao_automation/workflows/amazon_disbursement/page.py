@@ -1678,6 +1678,22 @@ class AmazonPaymentsPage:
             raise DomContractError("余额列卡账户类型顺序或标签不符合契约")
         return result
 
+    # ⚠️ 这组中文判据是推断值，还没在真机上见过这个弹窗（截图/日志里都没留下
+    # 原文）——和 0.6.1 的两步验证方式页同一个口径。判据故意收窄：认不出就整段
+    # 什么都不做，让后面「付款按钮必须唯一且可点」的既有判据去响亮失败，绝不
+    # 为了关弹窗去点一个身份不明的按钮。下次真机遇到时把原文抄回来。
+    _survey_markers = (
+        "满意度",
+        "调查问卷",
+        "评价您的体验",
+        "we'd love your feedback",
+        "we value your feedback",
+        "rate your experience",
+    )
+    _survey_dismiss_label = re.compile(
+        r"以后再提醒我|稍后再提醒我|稍后提醒|remind me later|maybe later", re.IGNORECASE
+    )
+
     async def _dismiss_feedback_survey(self, page: Any) -> None:
         """Close Amazon's optional satisfaction survey if it covers the page.
 
@@ -1698,31 +1714,26 @@ class AmazonPaymentsPage:
                 text = (await dialog.inner_text()).strip().lower()
             except Exception:
                 continue
-            if not any(marker in text for marker in (
-                "?????????", "???????",
-                "we'd love your feedback", "we value your feedback",
-            )):
+            if not any(marker in text for marker in self._survey_markers):
                 continue
             close = dialog.locator(
-                '[aria-label="Close"], [aria-label="??"], button.close, .close-button'
+                '[aria-label="Close"], [aria-label="关闭"], button.close, .close-button'
             )
             if await close.count() == 1 and await close.first.is_visible():
                 await close.first.click(no_wait_after=True)
             else:
-                remind = dialog.get_by_text(
-                    "???????", exact=True
-                )
+                remind = dialog.get_by_text(self._survey_dismiss_label)
                 if await remind.count() == 1 and await remind.first.is_visible():
                     await remind.first.click(no_wait_after=True)
                 else:
-                    raise DomContractError("?????????????????")
+                    raise DomContractError("满意度问卷弹窗没有可辨认的关闭按钮，已停止操作")
             try:
                 await page.wait_for_timeout(300)
             except Exception:
                 pass
             try:
                 if await dialog.is_visible():
-                    raise DomContractError("????????????")
+                    raise DomContractError("满意度问卷弹窗关闭后仍然可见")
             except DomContractError:
                 raise
             except Exception:

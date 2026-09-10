@@ -39,19 +39,28 @@
     }
     return data;
   }
+  // 终态就是「这个任务不会再自己变了」，轮询没有意义。非终态：QUEUED /
+  // RUNNING / WAITING_APPROVAL / WAITING_AUTH / RECONCILING。
+  const RUN_TERMINAL_STATUSES = new Set([
+    "SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "SKIPPED",
+    "NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL",
+  ]);
   function startRunDetailPolling() {
     const node = $("[data-run-live-poll]");
     if (!node) return;
-    const terminal = new Set(["SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "SKIPPED", "NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL"]);
     const id = node.dataset.runId;
-    let last = node.dataset.runStatus || "";
+    const last = node.dataset.runStatus || "";
+    // 打开时就已经是终态，一次请求都不要发。
+    if (!id || RUN_TERMINAL_STATUSES.has(last)) return;
     const timer = setInterval(async () => {
-      if (terminal.has(last)) { clearInterval(timer); return; }
       try {
         const current = await api(`/api/runs/${encodeURIComponent(id)}`);
         const status = String(current.status || "");
-        if (status && status !== last) { clearInterval(timer); location.reload(); return; }
-      } catch (_) { /* ??????????????? */ }
+        if (status && status !== last) { clearInterval(timer); location.reload(); }
+      } catch (_) {
+        // 后台重启、短暂 5xx 都会走到这里。刷新页面靠的是状态真的变了，
+        // 所以这里安静重试即可；401 已经由 api() 跳到登录页。
+      }
     }, 2000);
   }
 
@@ -890,8 +899,6 @@
   let scheduleWorkflowReady = null;
   let schedulePreviewSequence = 0;
   function invalidateSchedulePreview(form){const nonce=String(++schedulePreviewSequence);form.dataset.previewNonce=nonce;delete form.dataset.previewed;delete form.dataset.batchPreviewHash;delete form.dataset.batchPreviewPayload;return nonce;}
-  function selectedValues(form,name){return $$('input[name="'+name+'"]:checked',form).map(input=>input.value);}
-  function setCheckedValues(form,name,values){const wanted=new Set(values||[]); $$('input[name="'+name+'"]',form).forEach(input=>{input.checked=wanted.has(input.value);});}
   function workflowMeta(form){const key=$('[name="workflow"]',form)?.value; return scheduleWorkflows.find(item=>item.key===key)||scheduleWorkflows[0]||fallbackScheduleWorkflows[0];}
   function safeWorkflowKey(value){return String(value||"").trim().replace(/[^a-zA-Z0-9_.-]/g,"");}
   function resolveWorkflowFieldSchema(meta,source){
@@ -1654,6 +1661,7 @@
   const scheduleForm = $("[data-schedule-form]");
   if (scheduleForm) updateSelectedStoreCount(scheduleForm);
   if ($("[data-bulk-count]")) refreshScheduleBulkBar();
+  startRunDetailPolling();   // 自己判页面，非运行详情页直接返回
   if ($('[data-action="detect-all-store-setups"]')) {
     restoreBulkStoreSetup();
     if (!bulkStoreSetup.queue.length) restoreBulkSetupCompletionSummary();

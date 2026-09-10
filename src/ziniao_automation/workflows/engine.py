@@ -114,26 +114,20 @@ class WorkflowEngine:
         plan = await workflow.plan(run, page)
         await self.repository.save_plan(plan)
         if not plan.lines:
-            # An empty plan is only a successful no-op when every site was
-            # actually read and explicitly skipped/completed.  A failed or
-            # authentication-blocked site must never be reported as "no money".
+            # 空计划本身什么都不说明：可能是「这几站真的没钱可提」，也可能是
+            # 压根没读成（被弹回登录页、页面结构不符）。只有站点结果能区分，
+            # 所以状态由站点结果决定 —— 绝不把登录失败报成「没钱可提」。
+            #
+            # ⚠️ 这一段必须排在 DRY_RUN 短路之前，否则空跑的店铺永远显示成功，
+            # 而目前多数店铺是刻意保持 dry_run 的，等于把问题全盖住。
             site_outcomes = await self._site_outcomes(run)
             if any(value is SiteStatus.NEEDS_HUMAN_AUTH for value in site_outcomes):
                 empty_status = RunStatus.NEEDS_HUMAN_AUTH
             elif any(value is SiteStatus.FAILED for value in site_outcomes):
                 empty_status = RunStatus.PARTIAL
-            elif not site_outcomes or all(value is SiteStatus.SKIPPED for value in site_outcomes):
-                # A zero/no-data plan is a normal completed no-op.
-                empty_status = RunStatus.SUCCEEDED
-            elif site_outcomes and all(
-                value in {SiteStatus.SKIPPED, SiteStatus.DRY_RUN_COMPLETE}
-                for value in site_outcomes
-            ):
-                empty_status = RunStatus.SUCCEEDED
             else:
-                # Some non-financial workflow adapters do not maintain site
-                # rows. Preserve their successful empty-plan behavior; only an
-                # explicit FAILED or NEEDS_HUMAN_AUTH outcome changes status.
+                # 其余都是正常空跑：站点全部跳过／空跑完成，或者这个流程根本
+                # 不维护站点行（`_site_outcomes` 返回空表）。
                 empty_status = RunStatus.SUCCEEDED
             await self.repository.set_run_status(
                 run.id, empty_status, allowed_from=(RunStatus.RUNNING,)

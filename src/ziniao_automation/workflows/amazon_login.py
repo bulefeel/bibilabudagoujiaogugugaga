@@ -2417,8 +2417,9 @@ class AmazonLoginAdvancer:
                 submits.append(candidate)
         if len(submits) != 1:
             raise HumanAuthRequired(
-                "Amazon ??????????????????????"
-                f"???? {len(candidates)} ?????? {len(labelled)} ?????????",
+                "Amazon 两步验证方式页面找不到唯一的「发送一次性密码」按钮，"
+                f"可见候选 {len(candidates)} 个、文案命中 {len(submits)} 个，"
+                "已停止自动点击",
                 kind="challenge",
             )
         await submits[0].click()
