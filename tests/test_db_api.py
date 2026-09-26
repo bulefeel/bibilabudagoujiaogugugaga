@@ -19,6 +19,7 @@ from ziniao_automation.models import (
     RunEvent,
     RunQueueEntry,
     Schedule,
+    SiteRun,
     StoreMarketplace,
     SystemSetting,
     ZiniaoAccount,
@@ -26,6 +27,34 @@ from ziniao_automation.models import (
 from ziniao_automation.repositories import StoreRepository, WorkflowRepository
 from ziniao_automation.web import create_app
 from ziniao_automation.ziniao.errors import ZiniaoCredentialError
+
+
+def _cache_key() -> str:
+    """当前的静态资源缓存键，从 base.html 读出来而不是写死。"""
+
+    import re
+
+    base = (
+        Path(__file__).resolve().parents[1]
+        / "src/ziniao_automation/templates/base.html"
+    ).read_text(encoding="utf-8")
+    keys = set(re.findall(r"app\.(?:js|css)'\) }}\?v=([\w.-]+)", base))
+    assert len(keys) == 1, f"app.js 和 app.css 的缓存键必须一致，读到：{keys}"
+    return keys.pop()
+
+
+def _head_revision() -> str:
+    """迁移链当前的 head，从脚本里读而不是写死。"""
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[1]
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "migrations"))
+    head = ScriptDirectory.from_config(config).get_current_head()
+    assert head is not None
+    return head
 
 
 class FakeAutomation:
@@ -341,10 +370,6 @@ def test_operation_guard_is_unique_and_never_rearmed(app_client):
         )
         assert is_new_next_day is True
         assert next_day.id != guard1.id
-        assert repo.has_financial_guard(run1.id)
-        assert sorted(g.id for g in repo.recovery_guards()) == sorted(
-            [guard1.id, next_day.id]
-        )
         assert repo.transition_guard(
             guard1.id,
             expected_states=("ARMED",),
@@ -416,6 +441,8 @@ def test_release_endpoint_clears_a_guard_that_never_dispatched(app_client):
     csrf = bootstrap(client)
     sessions = app.state.sessions
     run_id, guard_id, guard_key = _guard_store_with_one_armed_guard(sessions)
+    # 释放只在任务结束之后:运行还在跑时,ARMED 可能正处在点击的那十几秒里。
+    _pin_run_uncertain(sessions, run_id)
 
     response = client.post(
         f"/api/runs/{run_id}/guards/{guard_key}/release",
@@ -510,7 +537,8 @@ def test_acknowledge_endpoint_settles_a_dispatch_amazon_never_published(app_clie
             )
         ).all()
         assert len(events) == 1
-        assert "系统本身并未回读到该记录" in events[0].message
+        assert "人工核对" in events[0].message
+        assert "回读" not in events[0].message
 
 
 def _pin_run_uncertain(sessions, run_id: str) -> None:
@@ -524,10 +552,10 @@ def _pin_run_uncertain(sessions, run_id: str) -> None:
 def test_settle_refuses_while_any_guard_is_still_undecided(app_client):
     """Closing a run must never be a way to skip the money questions.
 
-    The whole point of the block is that a recorded payout has not been read
-    back. Ending the run while a guard is still ARMED/SUBMITTED/UNCERTAIN would
-    let an operator clear the schedule without ever deciding what happened to
-    the transfer.
+    Ending the run while a guard is still ARMED/UNCERTAIN (nobody knows whether
+    the click went out) would let an operator clear the schedule without ever
+    deciding what happened to the transfer.  SUBMITTED is *not* in that set any
+    more: since the read-back was removed on 2026-09-23 it is the success state.
     """
 
     app, client, _ = app_client
@@ -615,12 +643,12 @@ def test_settle_reports_failed_when_every_guard_was_released(app_client):
     csrf = bootstrap(client)
     sessions = app.state.sessions
     run_id, _, guard_key = _guard_store_with_one_armed_guard(sessions)
+    _pin_run_uncertain(sessions, run_id)
     released = client.post(
         f"/api/runs/{run_id}/guards/{guard_key}/release",
         headers={"X-CSRF-Token": csrf},
     )
     assert released.status_code == 200, released.text
-    _pin_run_uncertain(sessions, run_id)
 
     response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
 
@@ -642,12 +670,14 @@ def test_settle_only_applies_to_a_run_waiting_on_a_funds_verdict(app_client):
         assert db.get(Run, run_id).status == "QUEUED"
 
 
-def test_acknowledge_endpoint_refuses_a_guard_that_never_dispatched(app_client):
-    """Never let the two exits blur: this one must not invent a payout.
+def test_acknowledge_accepts_an_uncertain_guard_with_no_recorded_dispatch(app_client):
+    """「系统没记录到派发」≠「没有派发」:点击之后、写 SUBMITTED 之前服务被停掉,
+    就是 UNCERTAIN + ``submitted_at`` 为空,而钱可能已经发出去了。
 
-    A guard with no dispatch recorded is the release case.  Acknowledging it
-    would assert that money moved on no evidence at all — the exact claim this
-    whole workflow exists to get right.
+    ⚠️ 这里原来拒绝结案、叫人去「释放」—— 可释放会删掉记录、**重新放开当天的
+    提现**:操作员在卖家后台明明看到了这笔,页面却只给一个会引来第二笔的选项
+    (2026-09-23 自审复核)。结案是操作员凭卖家后台做的裁定,只改状态、不删行、
+    不补写 ``submitted_at``。
     """
 
     app, client, _ = app_client
@@ -659,16 +689,67 @@ def test_acknowledge_endpoint_refuses_a_guard_that_never_dispatched(app_client):
             guard_id, expected_states=("ARMED",), to_state="UNCERTAIN"
         )
         db.commit()
+    _pin_run_uncertain(sessions, run_id)
+
+    response = client.post(
+        f"/api/runs/{run_id}/guards/{guard_key}/acknowledge",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert response.status_code == 200, response.text
+
+    with sessions() as db:
+        guard = db.get(OperationGuard, guard_id)
+        assert guard.state == "CONFIRMED"
+        assert guard.submitted_at is None, "不伪造派发时间"
+
+    # 结案之后不能再被释放:释放只接受 ARMED/UNCERTAIN。
+    released = client.post(
+        f"/api/runs/{run_id}/guards/{guard_key}/release",
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert released.status_code == 409
+
+
+def test_acknowledge_refuses_a_click_that_has_no_verdict_yet(app_client):
+    """ARMED 属于还在跑(或还没收口)的任务:这一下还没有结论,不许人工替它下结论。"""
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, guard_id, guard_key = _guard_store_with_one_armed_guard(sessions)
 
     response = client.post(
         f"/api/runs/{run_id}/guards/{guard_key}/acknowledge",
         headers={"X-CSRF-Token": csrf},
     )
     assert response.status_code == 409
-    assert "确认从未发出" in response.json()["detail"]
-
     with sessions() as db:
-        assert db.get(OperationGuard, guard_id).state == "UNCERTAIN"
+        assert db.get(OperationGuard, guard_id).state == "ARMED"
+
+
+@pytest.mark.parametrize("status", ["QUEUED", "RUNNING", "RECONCILING", "WAITING_AUTH"])
+def test_release_refuses_while_the_run_is_still_going(app_client, status):
+    """⚠️ 任务还在跑时,ARMED 可能正处在「已锁定、点击还没返回」的那十几秒里。
+    这时删掉记录,点击照样发出去,而它唯一的记录已经没了(09-23 自审复核)。"""
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, guard_id, guard_key = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        db.get(Run, run_id).status = status
+        db.commit()
+
+    response = client.post(
+        f"/api/runs/{run_id}/guards/{guard_key}/release",
+        headers={"X-CSRF-Token": csrf},
+    )
+
+    assert response.status_code == 409, response.text
+    with sessions() as db:
+        assert db.get(OperationGuard, guard_id) is not None
+    page = client.get(f"/runs/{run_id}")
+    assert 'data-run-action="release-guard"' not in page.text, "按钮也不该出现"
 
 
 
@@ -836,7 +917,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert page.status_code == 200
     assert f'data-store-id="{store["id"]}"' in page.text
     assert 'type="button" data-action="detect-store-setup"' in page.text
-    assert "/static/app.js?v=20260831-schedule-bulk" in page.text
+    assert f"/static/app.js?v={_cache_key()}" in page.text
     assert "detect-identity" not in page.text
     assert 'data-store-setup-auth-panel hidden' in page.text
     assert 'data-action="continue-store-setup"' in page.text
@@ -1277,7 +1358,10 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
     assert "应用版本 / 构建" in page.text
     assert "0.6.3" in page.text
     assert "数据库迁移版本" in page.text
-    assert "0009" in page.text
+    # 从迁移脚本读 head，而不是写死版本号。写死的话每加一条迁移都会多出一条
+    # 无关的红，久而久之就训练成「看到红就改断言」——这条断言的意思是
+    # 「诊断页显示的是数据库当前真实的迁移版本」，不是「版本号等于某个字面量」。
+    assert _head_revision() in page.text
 
 
 def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client):
@@ -1286,7 +1370,8 @@ def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client
     _, client, fake = app_client
     csrf = bootstrap(client)
 
-    async def busy() -> dict[str, object]:
+    async def busy(*, force: bool = False) -> dict[str, object]:
+        assert force is False, "默认不该强制"
         return {
             "ok": False,
             "status": "busy",
@@ -1298,18 +1383,52 @@ def test_webdriver_switch_is_refused_while_a_payout_holds_the_browser(app_client
     fake.start_webdriver_mode = busy
 
     response = client.post(
-        "/api/ziniao/webdriver/start", headers={"X-CSRF-Token": csrf}
+        "/api/ziniao/webdriver/start", json={}, headers={"X-CSRF-Token": csrf}
     )
 
     assert response.status_code == 409
     assert "资金锁" in response.json()["detail"]
 
 
+def test_webdriver_switch_passes_the_operators_force_through(app_client):
+    """强制开关必须真的到达运行服务，而且默认是关的。
+
+    前两类阻止是服务进程内的 asyncio 锁，手动关掉紫鸟窗口清不掉。锁被卡住时
+    （持锁的协程在等一个已经被关掉的浏览器），除了重启服务没有别的出路 ——
+    运营 2026-09-22 明确要了这个出口。
+    """
+
+    _, client, fake = app_client
+    csrf = bootstrap(client)
+    seen: list[bool] = []
+
+    async def starter(*, force: bool = False) -> dict[str, object]:
+        seen.append(force)
+        return {
+            "ok": True,
+            "status": "ready",
+            "message": "已就绪",
+            "closed_processes": 1,
+            "details": {},
+        }
+
+    fake.start_webdriver_mode = starter
+
+    client.post("/api/ziniao/webdriver/start", json={}, headers={"X-CSRF-Token": csrf})
+    client.post(
+        "/api/ziniao/webdriver/start",
+        headers={"X-CSRF-Token": csrf},
+        json={"force": True},
+    )
+
+    assert seen == [False, True]
+
+
 def test_webdriver_switch_reports_success_with_what_it_closed(app_client):
     _, client, fake = app_client
     csrf = bootstrap(client)
 
-    async def ready() -> dict[str, object]:
+    async def ready(*, force: bool = False) -> dict[str, object]:
         return {
             "ok": True,
             "status": "ready",
@@ -1321,7 +1440,7 @@ def test_webdriver_switch_reports_success_with_what_it_closed(app_client):
     fake.start_webdriver_mode = ready
 
     response = client.post(
-        "/api/ziniao/webdriver/start", headers={"X-CSRF-Token": csrf}
+        "/api/ziniao/webdriver/start", json={}, headers={"X-CSRF-Token": csrf}
     )
 
     assert response.status_code == 200, response.text
@@ -1444,3 +1563,273 @@ def test_schedules_page_renders_a_real_row_not_just_an_empty_list(app_client):
     assert "2026-01-01T09:00" in page.text, "编辑按钮里的首次时间要按 UTC+8 回填"
     assert '"interval_minutes": 1500' in page.text
 
+
+
+@pytest.mark.parametrize(
+    ("workflow", "expected"),
+    [
+        ("amazon_disbursement", ["CA"]),
+        ("amazon_feedback_removal", ["CA"]),
+        ("amazon_gpsr_attestation", ["DE"]),
+    ],
+)
+def test_start_check_defaults_to_sites_the_workflow_can_run(tmp_path, workflow, expected):
+    """「发起检查」不带站点时，取「已启用 ∩ 这个流程能跑」的站点。
+
+    ⚠️ 2026-09-23 实测：迁移 0010 给线上每家店补了 enabled 的 DE，而默认值只取
+    「已启用」，于是提现的「发起检查」对**所有**店一律 422「工作流参数不符合当前
+    版本的固定定义」。
+    """
+
+    from ziniao_automation.workflows.amazon_disbursement import (
+        build_amazon_disbursement_definition,
+    )
+    from ziniao_automation.workflows.amazon_feedback import (
+        build_amazon_feedback_definition,
+    )
+    from ziniao_automation.workflows.amazon_gpsr import build_amazon_gpsr_definition
+    from ziniao_automation.workflows.registry import WorkflowRegistry
+
+    settings = Settings(
+        project_root=tmp_path,
+        data_dir=tmp_path / "data",
+        evidence_dir=tmp_path / "evidence",
+        database_url=f"sqlite:///{(tmp_path / 'test.db').as_posix()}",
+        testing=True,
+    )
+    fake = FakeAutomation()
+    registry = WorkflowRegistry(
+        (
+            build_amazon_disbursement_definition(),
+            build_amazon_feedback_definition(),
+            build_amazon_gpsr_definition(),
+        )
+    )
+    app = create_app(settings, automation_service=fake, workflow_registry=registry)
+    with TestClient(app) as client:
+        headers = {"X-CSRF-Token": bootstrap(client)}
+        store = client.post(
+            "/api/stores",
+            json={
+                "name": "Two-Site Store",
+                "selector_type": "id",
+                "selector_value": "two-site-1",
+                "expected_seller_id": "A1SELLER",
+            },
+            headers=headers,
+        ).json()
+        patched = client.patch(
+            f"/api/stores/{store['id']}",
+            json={
+                "identity_confirmed": True,
+                "enabled": True,
+                "marketplaces": [
+                    {"code": "CA", "enabled": True},
+                    {"code": "DE", "enabled": True},
+                ],
+            },
+            headers=headers,
+        )
+        assert patched.status_code == 200, patched.text
+
+        response = client.post(
+            "/api/runs",
+            json={"store_id": store["id"], "workflow": workflow, "mode": "dry_run"},
+            headers=headers,
+        )
+
+    assert response.status_code == 202, response.text
+    run = response.json()
+    assert run["workflow_config"]["marketplace_codes"] == expected
+    assert ("enqueue", run["id"]) in fake.calls
+
+
+def _add_site(sessions, run_id: str, code: str, status: str) -> None:
+    with sessions() as db:
+        run = db.get(Run, run_id)
+        market = StoreMarketplace(
+            store_id=run.store_id,
+            code=code,
+            domain=f"sellercentral.amazon.{code.lower()}",
+            currency="CAD",
+            enabled=True,
+        )
+        db.add(market)
+        db.flush()
+        db.add(
+            SiteRun(
+                run_id=run_id,
+                marketplace_id=market.id,
+                marketplace_code=code,
+                status=status,
+                currency="CAD",
+            )
+        )
+        db.commit()
+
+
+@pytest.mark.parametrize(
+    ("other_site", "expected"),
+    [
+        # 余额为零被跳过不是失败:全额付清的运行就是成功。
+        ("SKIPPED", "SUCCEEDED"),
+        # 另一站真的没做完(失败 / 被释放后留在 UNCERTAIN_FINANCIAL)才是部分完成。
+        ("FAILED", "PARTIAL"),
+        ("UNCERTAIN_FINANCIAL", "PARTIAL"),
+    ],
+)
+def test_manual_settle_reaches_the_same_verdict_as_the_engine(
+    app_client, other_site, expected
+):
+    """人工收尾与引擎收口用**同一个**判据(``engine.run_status_from_facts``)。
+
+    ⚠️ 原来这里按「已派发条数 == 站点行数」算:一个因余额为零被跳过的站点就让
+    全额付清的运行变成 PARTIAL,而引擎对同一组事实报 SUCCEEDED(09-23 自审复核)。
+    同时钉住:只剩 SUBMITTED 的记录算已裁定,可以收尾。
+    """
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, guard_id, _ = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        WorkflowRepository(db).transition_guard(
+            guard_id, expected_states=("ARMED",), to_state="SUBMITTED"
+        )
+        db.commit()
+    _add_site(sessions, run_id, "CA", other_site)
+    _pin_run_uncertain(sessions, run_id)
+
+    response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == expected
+
+
+def test_start_check_on_a_store_with_no_supported_site_says_so(app_client):
+    """只开了 DE 的店点「发起检查」(默认是提现流程):对话框里没有站点选择框,
+    「请至少选择一个站点」让人无从下手。要直说这家店没启用这个流程能跑的站点。"""
+
+    app, client, fake = app_client
+    headers = {"X-CSRF-Token": bootstrap(client)}
+    store = client.post(
+        "/api/stores",
+        json={
+            "name": "DE Only",
+            "selector_type": "id",
+            "selector_value": "de-only-1",
+            "expected_seller_id": "A1SELLER",
+        },
+        headers=headers,
+    ).json()
+    patched = client.patch(
+        f"/api/stores/{store['id']}",
+        json={
+            "identity_confirmed": True,
+            "enabled": True,
+            "marketplaces": [{"code": "DE", "enabled": True}],
+        },
+        headers=headers,
+    )
+    assert patched.status_code == 200, patched.text
+
+    response = client.post(
+        "/api/runs", json={"store_id": store["id"], "mode": "dry_run"}, headers=headers
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert "没有启用这个流程支持的站点" in detail
+    assert "CA" in detail and "UK" in detail and "AU" in detail
+    assert not [call for call in fake.calls if call[0] == "enqueue"]
+
+
+def test_manual_settle_closes_sites_that_were_still_waiting(app_client):
+    """人工收尾也一样:还停在「等待验证 / 等待审核」的站点是本次没做的站点。"""
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, guard_id, _ = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        WorkflowRepository(db).transition_guard(
+            guard_id, expected_states=("ARMED",), to_state="SUBMITTED"
+        )
+        db.commit()
+    _add_site(sessions, run_id, "CA", "WAITING_AUTH")
+    _pin_run_uncertain(sessions, run_id)
+
+    response = client.post(f"/api/runs/{run_id}/settle", headers={"X-CSRF-Token": csrf})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "PARTIAL"
+    with sessions() as db:
+        ca = db.scalar(
+            select(SiteRun).where(SiteRun.run_id == run_id, SiteRun.marketplace_code == "CA")
+        )
+        assert ca.status == "CANCELLED"
+
+
+def test_an_expired_approval_does_not_leave_a_zombie_run(app_client):
+    """审批一超时,卡片(和那颗唯一的「取消任务」按钮)就消失了。运行还停在
+    WAITING_APPROVAL —— 一个活跃状态 —— 于是永远否决这条排期的「立即执行」、
+    删除排期和店铺建档重置,只能重启(2026-09-26 自审)。"""
+
+    from datetime import timedelta
+
+    from ziniao_automation.db import utc_now
+
+    app, client, _ = app_client
+    csrf = bootstrap(client)
+    sessions = app.state.sessions
+    run_id, _, _ = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        db.query(OperationGuard).delete()
+        run = db.get(Run, run_id)
+        run.status = "WAITING_APPROVAL"
+        db.add(
+            ApprovalRequest(
+                run_id=run_id,
+                status="PENDING",
+                plan_hash="c" * 64,
+                snapshot_hash="d" * 64,
+                expires_at=utc_now() - timedelta(hours=1),
+            )
+        )
+        site = db.scalar(select(SiteRun).where(SiteRun.run_id == run_id))
+        site.status = "WAITING_APPROVAL"
+        db.commit()
+
+    assert client.get("/approvals").status_code == 200  # 这一下会把过期审批收掉
+
+    with sessions() as db:
+        run = db.get(Run, run_id)
+        assert run.status == "CANCELLED"
+        assert "审批已超时" in run.error
+        assert run.finished_at is not None
+        site = db.scalar(select(SiteRun).where(SiteRun.run_id == run_id))
+        assert site.status == "CANCELLED"
+    # 排期不再被它挡住
+    page = client.get(f"/runs/{run_id}")
+    assert page.status_code == 200
+    del csrf
+
+
+def test_started_at_is_stamped_once_not_on_every_claim(app_client):
+    """审批通过、人工验证恢复、收口认领都会再进一次 RUNNING。每次重盖的话,
+    卡片上的「实际开始」「排队等待」会把两小时的审批时间算成排队(2026-09-26 自审)。"""
+
+    app, client, _ = app_client
+    bootstrap(client)
+    sessions = app.state.sessions
+    run_id, _, _ = _guard_store_with_one_armed_guard(sessions)
+    with sessions() as db:
+        repo = WorkflowRepository(db)
+        assert repo.set_run_status(run_id, "RUNNING", allowed_from=("QUEUED",))
+        db.commit()
+        first = db.get(Run, run_id).started_at
+        assert first is not None
+        assert repo.set_run_status(run_id, "WAITING_AUTH", allowed_from=("RUNNING",))
+        assert repo.set_run_status(run_id, "RUNNING", allowed_from=("WAITING_AUTH",))
+        db.commit()
+        assert db.get(Run, run_id).started_at == first

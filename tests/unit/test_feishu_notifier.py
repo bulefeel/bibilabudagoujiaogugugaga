@@ -15,7 +15,7 @@ from ziniao_automation.workflows.types import RunStatus, WorkflowReport
 
 
 def notice(
-    kind: NotificationKind = NotificationKind.PAYMENT_CONFIRMED,
+    kind: NotificationKind = NotificationKind.PAYMENT_SUBMITTED,
     **overrides,
 ) -> SafeRunNotice:
     values = {
@@ -136,8 +136,9 @@ async def test_generic_success_without_confirmed_operation_sends_neutral_card() 
     assert len(cards) == 1
     assert cards[0]["header"]["template"] == "blue"
     text = cards[0]["elements"][0]["text"]["content"]
-    assert "任务检查已完成（非提现确认）" in text
-    assert "这不代表提现成功" in text
+    # 没有资金记录的成功运行:中性蓝卡,明说「本次没有发出提现」。
+    assert "任务已完成（本次未发出提现）" in text
+    assert "本次没有发出任何提现请求" in text
     assert "只读检查" in text
 
 
@@ -393,6 +394,21 @@ def test_guard_states_say_whether_the_payout_actually_went_out() -> None:
 
     assert "已锁定（未确认发出）" in card
     assert "已发出请求" in card
+    # 金额前缀也要跟着说实话：说不清的那笔不能写成「已请求提现」。
+    uk, au = [line for line in card.splitlines() if line.startswith("- **")]
+    assert "锁定金额 GBP" in uk and "已请求提现" not in uk
+    assert "已请求提现 AUD" in au
+
+    uncertain = _message(
+        notice(
+            kind=NotificationKind.UNCERTAIN_FINANCIAL,
+            sites=(
+                SafeSiteNotice(code="CA", currency="CAD", payable=Decimal("3.00"), outcome="UNCERTAIN"),
+            ),
+        )
+    )
+    (line,) = [row for row in uncertain.splitlines() if row.startswith("- **")]
+    assert "锁定金额 CAD" in line and "已请求提现" not in line
 
 
 def test_exception_class_names_never_reach_the_card() -> None:

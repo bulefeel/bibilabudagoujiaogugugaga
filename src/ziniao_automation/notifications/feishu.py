@@ -270,7 +270,7 @@ def _message(notice: SafeRunNotice) -> str:
     lines = [
         f"**任务：** `{_code(notice.run_short_id or '未知')}`",
         f"**店铺：** {_md(notice.store_name or '未知店铺')}",
-        f"**状态：** {_md(_kind_label(notice.kind, notice.workflow))}",
+        f"**状态：** {_md(_kind_label(notice.kind, notice.workflow, notice.mode))}",
     ]
     if notice.schedule_name:
         lines.append(f"**排期：** {_md(notice.schedule_name)}")
@@ -307,7 +307,9 @@ def _message(notice: SafeRunNotice) -> str:
         lines.extend(_feedback_line(item) for item in notice.feedback_items)
         if notice.feedback_omitted:
             lines.append(f"- 另有 {notice.feedback_omitted} 条，见本地后台「反馈处理台」")
-    action = notice.next_action or _default_next_action(notice.kind, notice.workflow)
+    action = notice.next_action or _default_next_action(
+        notice.kind, notice.workflow, notice.mode
+    )
     if action:
         lines.extend(("", f"**下一步：** {_md(action)}"))
     return "\n".join(lines)
@@ -316,7 +318,10 @@ def _message(notice: SafeRunNotice) -> str:
 # Guard states mean a payout was actually requested for that site, so the
 # figure alongside them is the amount Amazon was asked to transfer — the
 # database builder already prefers ``guard.amount`` over the planned balance.
-_REQUESTED_OUTCOMES = frozenset({"ARMED", "SUBMITTED", "CONFIRMED", "UNCERTAIN"})
+# 金额前缀跟着「发没发出去」走。ARMED/UNCERTAIN 说不清是否已发出,写「已请求提现」
+# 就和同一行的「已锁定（未确认发出）」自相矛盾(09-23 渲染真卡片时读到的)。
+_REQUESTED_OUTCOMES = frozenset({"SUBMITTED", "CONFIRMED"})
+_LOCKED_OUTCOMES = frozenset({"ARMED", "UNCERTAIN"})
 
 
 def _site_line(site: SafeSiteNotice, workflow: str = "") -> str:
@@ -325,11 +330,13 @@ def _site_line(site: SafeSiteNotice, workflow: str = "") -> str:
         # "可提现" is the dashboard balance and keeps moving as orders settle.
         # Once a payout has been requested, report what was requested instead —
         # that is the number the operator actually cares about.
-        label = (
-            "已请求提现"
-            if str(site.outcome).upper() in _REQUESTED_OUTCOMES
-            else "可提现"
-        )
+        outcome_key = str(site.outcome).upper()
+        if outcome_key in _REQUESTED_OUTCOMES:
+            label = "已请求提现"
+        elif outcome_key in _LOCKED_OUTCOMES:
+            label = "锁定金额"
+        else:
+            label = "可提现"
         parts.append(f"{label} {_money(site.currency, site.payable)}")
     if site.delayed is not None:
         parts.append(f"延迟资金 {_money(site.currency, site.delayed)}")
@@ -410,7 +417,7 @@ def _feedback_line(item: SafeFeedbackNotice) -> str:
 
 
 def _card_colour(kind: NotificationKind) -> str:
-    if kind is NotificationKind.PAYMENT_CONFIRMED:
+    if kind is NotificationKind.PAYMENT_SUBMITTED:
         return "green"
     if kind in (NotificationKind.WAITING_APPROVAL, NotificationKind.WAITING_AUTH):
         return "orange"
@@ -431,13 +438,14 @@ def _default_title(kind: NotificationKind) -> str:
     return {
         NotificationKind.WAITING_APPROVAL: "提现任务待审核",
         NotificationKind.WAITING_AUTH: "亚马逊自动登录已转人工处理",
-        NotificationKind.AUTH_TIMEOUT: "登录验证等待超时",
-        NotificationKind.PAYMENT_CONFIRMED: "提现结果已确认",
-        NotificationKind.RUN_COMPLETED: "任务检查已完成（非提现确认）",
+        # 不说「超时」:服务重启让验证作废也走这张卡。说明行会讲清是哪一种。
+        NotificationKind.AUTH_TIMEOUT: "登录验证未完成",
+        NotificationKind.PAYMENT_SUBMITTED: "提现已提交",
+        NotificationKind.RUN_COMPLETED: "任务已完成（本次未发出提现）",
         NotificationKind.RUN_FAILED: "提现任务失败",
         NotificationKind.RUN_PARTIAL: "提现任务部分失败",
-        NotificationKind.RUN_SKIPPED: "本次无站点可提现",
-        NotificationKind.UNCERTAIN_FINANCIAL: "提现已发出，平台尚未显示结果",
+        NotificationKind.RUN_SKIPPED: "本次没有发起提现",
+        NotificationKind.UNCERTAIN_FINANCIAL: "资金结果待人工核对",
         NotificationKind.CROSS_DAY_STARTED: "排队任务跨日开始",
     }[kind]
 
@@ -460,11 +468,53 @@ _FEEDBACK_NEXT_ACTIONS: dict[NotificationKind, str] = {
     ),
     NotificationKind.RUN_FAILED: "请进入本地后台查看已清洗的失败原因。",
     NotificationKind.RUN_PARTIAL: "请进入本地后台的「反馈处理台」查看哪些站点没跑完。",
-    NotificationKind.RUN_SKIPPED: "无需操作。本次没有新的中差评需要处理。",
+    # 全跳过的反馈运行也可能刚记下了「待人工」—— 正文里会列出积压数,这里不能说「无需操作」。
+    NotificationKind.RUN_SKIPPED: "本次没有可提交的新反馈；若说明里列出「待人工」，请到反馈处理台选原因。",
 }
 
 
-def _kind_label(kind: NotificationKind, workflow: str = "") -> str:
+# GPSR 同样一分钱都不碰，下面的提现措辞对它也是假话。
+_GPSR_WORKFLOW_KEY = "amazon_gpsr_attestation"
+
+_GPSR_KIND_LABELS: dict[NotificationKind, str] = {
+    NotificationKind.RUN_COMPLETED: "安全证明已完成",
+    NotificationKind.RUN_FAILED: "安全证明失败",
+    NotificationKind.RUN_PARTIAL: "安全证明部分失败",
+    NotificationKind.RUN_SKIPPED: "本次没有提交安全证明",
+}
+
+_GPSR_NEXT_ACTIONS: dict[NotificationKind, str] = {
+    # 「确认判定无误后再把排期切成自动提交」是 supported_modes 只有 DRY_RUN 那阵子
+    # 写的。AUTO 2026-09-17 已经放开，这句话挂在一次 auto 运行上就是错的指引。
+    NotificationKind.RUN_COMPLETED: "无需操作。逐条明细在本地后台的运行详情时间线里。",
+    NotificationKind.RUN_FAILED: "请进入本地后台查看已清洗的失败原因。",
+    NotificationKind.RUN_PARTIAL: "请进入本地后台的运行详情查看哪些站点没跑完。",
+    NotificationKind.RUN_SKIPPED: "本次没有提交安全证明；逐站原因见下方站点明细。",
+}
+
+
+# 空跑只读取与判定,什么都没提交:状态不能写「已完成」,下一步要指向「核对后再切自动」。
+_DRY_RUN_WORKFLOWS = {
+    _GPSR_WORKFLOW_KEY: "空跑只读取与判定，没有提交任何安全证明。核对候选条目无误后，再把排期切成自动提交。",
+    _FEEDBACK_WORKFLOW_KEY: "空跑只读取与判定，没有向亚马逊提交任何请求。核对反馈处理台里的判定无误后，再切到自动提交。",
+}
+
+
+def _is_dry_run_completion(kind: NotificationKind, workflow: str, mode: str) -> bool:
+    return (
+        kind is NotificationKind.RUN_COMPLETED
+        and mode == "dry_run"
+        and workflow in _DRY_RUN_WORKFLOWS
+    )
+
+
+def _kind_label(kind: NotificationKind, workflow: str = "", mode: str = "") -> str:
+    if _is_dry_run_completion(kind, workflow, mode):
+        return "空跑完成（未提交）"
+    if workflow == _GPSR_WORKFLOW_KEY:
+        label = _GPSR_KIND_LABELS.get(kind)
+        if label is not None:
+            return label
     if workflow == _FEEDBACK_WORKFLOW_KEY:
         label = _FEEDBACK_KIND_LABELS.get(kind)
         if label is not None:
@@ -472,7 +522,15 @@ def _kind_label(kind: NotificationKind, workflow: str = "") -> str:
     return _default_title(kind)
 
 
-def _default_next_action(kind: NotificationKind, workflow: str = "") -> str:
+def _default_next_action(
+    kind: NotificationKind, workflow: str = "", mode: str = ""
+) -> str:
+    if _is_dry_run_completion(kind, workflow, mode):
+        return _DRY_RUN_WORKFLOWS[workflow]
+    if workflow == _GPSR_WORKFLOW_KEY:
+        action = _GPSR_NEXT_ACTIONS.get(kind)
+        if action is not None:
+            return action
     if workflow == _FEEDBACK_WORKFLOW_KEY:
         action = _FEEDBACK_NEXT_ACTIONS.get(kind)
         if action is not None:
@@ -481,17 +539,19 @@ def _default_next_action(kind: NotificationKind, workflow: str = "") -> str:
         NotificationKind.WAITING_APPROVAL: "请进入本地后台核对金额并批准或取消。",
         NotificationKind.WAITING_AUTH: "自动尝试已停止；请在对应紫鸟店铺窗口处理验证，再回到本地后台继续。",
         NotificationKind.AUTH_TIMEOUT: "请在本地后台重新发起并人工完成登录验证。",
-        NotificationKind.PAYMENT_CONFIRMED: "无需操作，可在本地后台查看完整运行证据。",
-        NotificationKind.RUN_COMPLETED: "无需操作；如需确认提现结果，请以绿色“提现结果已确认”通知为准。",
+        NotificationKind.PAYMENT_SUBMITTED: "是否到账请在亚马逊卖家后台核对；本地后台无需操作。",
+        NotificationKind.RUN_COMPLETED: "无需操作。本次没有发出提现请求。",
         NotificationKind.RUN_FAILED: "请进入本地后台查看已清洗的失败原因。",
         NotificationKind.RUN_PARTIAL: "请进入本地后台检查失败站点，已成功站点不要重复运行。",
+        # 全跳过有两类原因:亚马逊 24 小时限流 / 零余额(无需操作),和读不出站点
+        # (需要人看)。卡片只能按 kind 选一句,所以两类都要说到,不能一律「无需操作」。
         NotificationKind.RUN_SKIPPED: (
-            "无需操作。若站点显示被亚马逊限制 24 小时，等提示的时间过后会自动重试；"
-            "资金仍在亚马逊账户里继续累积，不会丢失。"
+            "逐站原因见下方。被亚马逊限制 24 小时的，等提示的时间过后会自动重试，"
+            "资金仍在亚马逊账户里累积；读取失败的站点请到本地后台查看。"
         ),
         NotificationKind.UNCERTAIN_FINANCIAL: (
-            "亚马逊通常数小时甚至次日才显示结果；稍后回到本地后台点“只回读，不重提”"
-            "即可确认。切勿重新提交。"
+            "请到亚马逊卖家后台核对这笔是否已发出，再回本地后台运行详情页选择"
+            "「我已在亚马逊核对，结案」或「确认未发出，释放」。切勿手动重新提交。"
         ),
         NotificationKind.CROSS_DAY_STARTED: "任务已按原队列顺序开始，无需重新创建。",
     }[kind]
@@ -513,7 +573,7 @@ def _trigger_label(value: str) -> str:
         "manual": "手动执行",
         "approval": "审核批准",
         "continue_auth": "验证恢复",
-        "reconcile": "资金回读",
+        "reconcile": "资金收口",
         "recovery": "启动恢复",
     }.get(str(value).lower(), _plain(value))
 
@@ -530,16 +590,18 @@ _OUTCOME_LABELS = {
     # look for something to approve that does not exist.
     "WAITING_APPROVAL": "等待审核",
     "WAITING_AUTH": "等待验证",
-    "NEEDS_HUMAN_AUTH": "验证超时",
-    "UNCERTAIN_FINANCIAL": "已发出，平台尚未显示",
-    "UNCERTAIN": "已发出，平台尚未显示",
+    # 不写「验证超时」:自动模式是**立刻跳过、根本没等过**,只有真的等满才叫超时。
+    # 是哪一种由同一行的原因文字说(2026-09-26 自审)。
+    "NEEDS_HUMAN_AUTH": "需人工登录",
+    "UNCERTAIN_FINANCIAL": "待人工核对",
+    "UNCERTAIN": "待人工核对",
     "FAILED": "执行失败",
     "SKIPPED": "已跳过",
     "CANCELLED": "已取消",
     "PENDING": "待处理",
     "PREFLIGHT": "检查中",
     "PLANNED": "已读取金额",
-    "RECONCILING": "回读核对中",
+    "RECONCILING": "收口中",
     "DRY_RUN_COMPLETE": "只读检查完成",
     # Guard states.  ARMED means the database recorded the intent but this
     # system never saw the payout click return, which is emphatically not the
@@ -554,13 +616,25 @@ _OUTCOME_LABELS = {
 # text beside them says which.
 _FEEDBACK_OUTCOME_LABELS = {
     "SKIPPED": "已读取，无需提交",
+    "PLANNED": "待提交",
     "CONFIRMED": "已提交请求",
+    "PREFLIGHT": "读取中",
+}
+
+
+_GPSR_OUTCOME_LABELS = {
+    # 不写「已读取」:跳过也可能是页面根本没读到(停在选择页),原因栏自己会说。
+    "SKIPPED": "已跳过",
+    "PLANNED": "待提交",
+    "CONFIRMED": "已提交安全证明",
     "PREFLIGHT": "读取中",
 }
 
 
 def _outcome_label(value: str, workflow: str = "") -> str:
     key = value.upper()
+    if workflow == _GPSR_WORKFLOW_KEY and key in _GPSR_OUTCOME_LABELS:
+        return _GPSR_OUTCOME_LABELS[key]
     if workflow == _FEEDBACK_WORKFLOW_KEY and key in _FEEDBACK_OUTCOME_LABELS:
         return _FEEDBACK_OUTCOME_LABELS[key]
     return _OUTCOME_LABELS.get(key, _plain(value))

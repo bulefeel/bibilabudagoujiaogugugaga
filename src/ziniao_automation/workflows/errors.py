@@ -64,9 +64,23 @@ class SubmissionNotDispatched(DomContractError):
 class HumanAuthRequired(WorkflowError):
     code = "human_auth_required"
 
-    def __init__(self, message: str, *, kind: str = "unknown") -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "unknown",
+        dispatch_recorded: bool | None = None,
+    ) -> None:
         super().__init__(message)
         self.kind = kind
+        # 这一下不可逆点击到底点没点下去。
+        #
+        # ``None`` = 不知道(默认,也是**唯一安全的默认**):调用方一个字都不许动那条
+        # 资金记录。只有从 ``submit_once`` 里抛出来时才会被填成真/假 —— 那里有
+        # ``consumed`` 标记,它就写在 ``click()`` 的上一行,是本仓库对「点没点」
+        # 唯一有凭据的答案。``False`` 才允许撤销 ARMED 锁定(2026-09-26 自审:
+        # 原来拿 ``submitted_at`` 是否为空当判据,而它是**点击之后**才写的)。
+        self.dispatch_recorded = dispatch_recorded
 
 
 class ApprovalRequired(WorkflowError):

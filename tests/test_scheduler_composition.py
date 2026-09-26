@@ -724,7 +724,12 @@ async def _startup_crash_recovery_classification_and_actions(db_env):
 
     loader = DatabaseRunLoader(factory, artifact_root=settings.evidence_dir)
     plan = await loader.startup_recovery_plan()
-    assert {run.id for run in plan.financial} == {ids.financial, ids.financial_auth}
+    # 只有**说不清**的记录(ARMED)进「资金待修复」组;已提交(SUBMITTED)的运行有结论,
+    # 归「历史资金记录、只需收口」组。两组都会被收口、都不会被重跑 —— 下面的断言钉的是这个。
+    # (2026-09-23 之前 SUBMITTED 也进前一组,于是每次重启都会把成功提现改写成
+    # UNCERTAIN_FINANCIAL。)
+    assert {run.id for run in plan.financial} == {ids.financial}
+    assert ids.financial_auth in plan.reconciling_ids
     assert plan.queued_ids == (ids.queued,)
     assert plan.running_ids == (ids.running,)
     assert plan.waiting_auth_ids == (ids.waiting_auth,)
@@ -752,7 +757,7 @@ async def _startup_crash_recovery_classification_and_actions(db_env):
             self.expired: list[str] = []
         async def start(self, run):
             self.started.append(run.id)
-        async def reconcile(self, run):
+        async def settle(self, run):
             self.reconciled.append(run.id)
         async def expire_auth(self, run):
             self.expired.append(run.id)

@@ -129,6 +129,28 @@ class ZiniaoBrowserHandle:
             raise RuntimeError("closed browser handle cannot be resumed")
         self._paused = False
 
+    async def ensure_live_page(self) -> Any:
+        """Re-acquire the automation tab if it died while the handle was paused.
+
+        A human-auth pause can last many minutes, and Ziniao replaces or closes
+        tabs on its own schedule.  Handing the workflow back its original
+        ``Page`` then fails on the very next navigation with ``TargetClosedError``
+        — which throws away the verification the person just completed.  Opening
+        a fresh tab in the *same* persistent context preserves the store's
+        proxy, fingerprint and freshly authenticated session.
+
+        上下文里还有活着的标签页就先用它（最后打开的那个，通常就是人刚完成验证的
+        那一页）；都没了才新开 —— 紫鸟会把自动化新开的标签页当场关掉，能不开就不开。
+        """
+
+        if self._closed:
+            raise RuntimeError("closed browser handle has no page")
+        if not self.page.is_closed():
+            return self.page
+        alive = [page for page in self.context.pages if not page.is_closed()]
+        self.page = alive[-1] if alive else await self.context.new_page()
+        return self.page
+
     async def close(self) -> None:
         if self._closed or self._paused or self._closing:
             return

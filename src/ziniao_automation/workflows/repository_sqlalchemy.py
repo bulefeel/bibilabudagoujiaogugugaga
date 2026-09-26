@@ -117,6 +117,15 @@ class SqlAlchemyWorkflowRepository:
             )
             return SiteStatus(value) if value is not None else None
 
+    async def list_site_statuses(self, run_id: str) -> dict[str, SiteStatus]:
+        with self.session_factory() as session:
+            rows = session.execute(
+                select(SiteRun.marketplace_code, SiteRun.status).where(
+                    SiteRun.run_id == run_id
+                )
+            ).all()
+        return {str(code): SiteStatus(status) for code, status in rows}
+
     async def save_site_snapshot(
         self,
         run_id: str,

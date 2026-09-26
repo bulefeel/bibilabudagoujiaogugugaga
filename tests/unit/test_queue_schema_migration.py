@@ -497,6 +497,13 @@ def test_0006_failed_downgrade_rolls_back_every_schema_change(tmp_path: Path) ->
     database = tmp_path / "failed-downgrade-0006.db"
     engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
     init_database(engine)
+    engine.dispose()
+    # 坏数据必须在**降到 0006 之后**才注入。每一条用整表重建配方的迁移都会在
+    # 收尾跑 PRAGMA foreign_key_check，而那个检查是全库范围的，所以一条预先存在
+    # 的坏外键会让降级链上第一条重建型迁移就中止——于是永远走不到 0006，这个
+    # 测试要验的东西一次都没被执行。
+    _downgrade(database, "0006")
+    engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
     with engine.connect() as connection:
         connection.commit()
         connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
@@ -536,10 +543,8 @@ def test_0006_failed_downgrade_rolls_back_every_schema_change(tmp_path: Path) ->
         item["name"] for item in inspector.get_check_constraints("stores")
     }
     with unchanged.connect() as connection:
-        # 0006, not head: downgrading to 0005 runs 0007's downgrade first and
-        # that one succeeds, so the stamp has legitimately moved back one step
-        # before 0006's downgrade fails and rolls itself back. The value is the
-        # same as before 0007 existed, for a different reason.
+        # 停在 0006：上面已经先降到了 0006，随后 0006 自己的降级因为完整性检查
+        # 失败并整体回滚，所以标记原地不动。
         assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0006"
         assert connection.exec_driver_sql("PRAGMA foreign_key_check").all()
         assert connection.scalar(sa.text("PRAGMA integrity_check")) == "ok"
@@ -1031,9 +1036,14 @@ def test_0005_drops_the_baseline_and_adds_the_observed_tail(tmp_path: Path) -> N
                 "AND name = 'ix_store_marketplaces_store_id'"
             )
         ) == 1
+        # UK 是这个 fixture 自己建的，必须原样活过 0005 的改表；DE 那行是链上
+        # 更后面的 0010 给每个店铺补的，一并断言出来，免得它悄悄消失也没人发现。
         assert connection.execute(
-            sa.text("SELECT code, currency, enabled FROM store_marketplaces")
-        ).all() == [("UK", "GBP", 1)]
+            sa.text(
+                "SELECT code, currency, enabled FROM store_marketplaces "
+                "ORDER BY code"
+            )
+        ).all() == [("DE", "EUR", 1), ("UK", "GBP", 1)]
 
         guards = connection.scalar(
             sa.text("SELECT sql FROM sqlite_master WHERE name = 'operation_guards'")
@@ -1168,3 +1178,288 @@ def test_0007_round_trips_back_to_the_cron_shape(tmp_path: Path) -> None:
         }
         assert "first_run_at" not in columns
         assert "interval_minutes" not in columns
+
+
+def _database_before_de(database: Path) -> sa.Engine:
+    """建出 0010 之前的真实形状：store_marketplaces 的 CHECK 只认 CA/UK/AU。
+
+    ⚠️ 不能用「新建库升到 0009」来代替：0001 是按 **live metadata** 建表的，而
+    models.py 现在已经带着放宽后的 CHECK，那样造出来的库一开始就是新形状，
+    这个测试会变成永远绿的摆设。
+    """
+
+    engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE stores (
+                id INTEGER PRIMARY KEY NOT NULL,
+                name VARCHAR(120) NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            """
+            CREATE TABLE store_marketplaces (
+                id INTEGER PRIMARY KEY NOT NULL,
+                store_id INTEGER NOT NULL,
+                code VARCHAR(2) NOT NULL,
+                domain VARCHAR(255) NOT NULL,
+                currency VARCHAR(3) NOT NULL,
+                enabled BOOLEAN NOT NULL,
+                created_at DATETIME NOT NULL,
+                updated_at DATETIME NOT NULL,
+                CONSTRAINT uq_store_marketplace_code UNIQUE (store_id, code),
+                CONSTRAINT ck_v1_marketplace_code CHECK (code IN ('CA', 'UK', 'AU')),
+                CONSTRAINT ck_marketplace_currency CHECK (length(currency) = 3),
+                FOREIGN KEY(store_id) REFERENCES stores (id) ON DELETE CASCADE
+            )
+            """
+        )
+        connection.exec_driver_sql(
+            "CREATE INDEX ix_store_marketplaces_store_id "
+            "ON store_marketplaces (store_id)"
+        )
+        connection.exec_driver_sql(
+            "CREATE TABLE alembic_version "
+            "(version_num VARCHAR(32) NOT NULL PRIMARY KEY)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO alembic_version (version_num) VALUES ('0009')"
+        )
+        for store_id, name in ((1, "店铺甲"), (2, "店铺乙"), (3, "店铺丙")):
+            connection.execute(
+                sa.text(
+                    "INSERT INTO stores (id, name, created_at, updated_at) "
+                    "VALUES (:id, :name, :ts, :ts)"
+                ),
+                {"id": store_id, "name": name, "ts": "2026-09-14 00:00:00"},
+            )
+        # 甲有两站，乙只有一站，丙一站都没有——三种形状都要能补上 DE。
+        for store_id, code, domain, currency in (
+            (1, "CA", "sellercentral.amazon.ca", "CAD"),
+            (1, "UK", "sellercentral.amazon.co.uk", "GBP"),
+            (2, "AU", "sellercentral.amazon.com.au", "AUD"),
+        ):
+            connection.execute(
+                sa.text(
+                    "INSERT INTO store_marketplaces "
+                    "(store_id, code, domain, currency, enabled, created_at, updated_at) "
+                    "VALUES (:sid, :code, :domain, :cur, 1, :ts, :ts)"
+                ),
+                {
+                    "sid": store_id,
+                    "code": code,
+                    "domain": domain,
+                    "cur": currency,
+                    "ts": "2026-09-14 00:00:00",
+                },
+            )
+    return engine
+
+
+def test_0010_widens_the_check_and_gives_every_store_a_de_row(tmp_path: Path) -> None:
+    """运营要求德国站适用于**所有**现有账号，所以补行是迁移的职责，不是运维的记性。
+
+    漏补的后果不是「少一个站点」，而是排期创建时被挡下并报
+    「排期包含尚未在该店铺建档的站点」——那条消息根本不会提 DE。
+    """
+
+    database = tmp_path / "pre_0010.db"
+    engine = _database_before_de(database)
+
+    _upgrade(database)
+
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sa.text(
+                "SELECT store_id, domain, currency, enabled FROM store_marketplaces "
+                "WHERE code = 'DE' ORDER BY store_id"
+            )
+        ).all()
+        # 一站都没有的店铺（丙）也要补上，否则它永远排不了 GPSR。
+        assert rows == [
+            (1, "sellercentral.amazon.de", "EUR", 1),
+            (2, "sellercentral.amazon.de", "EUR", 1),
+            (3, "sellercentral.amazon.de", "EUR", 1),
+        ]
+        # 原有的行一条都不能动。
+        assert connection.execute(
+            sa.text(
+                "SELECT store_id, code FROM store_marketplaces "
+                "WHERE code <> 'DE' ORDER BY store_id, code"
+            )
+        ).all() == [(1, "CA"), (1, "UK"), (2, "AU")]
+
+        schema = connection.scalar(
+            sa.text("SELECT sql FROM sqlite_master WHERE name = 'store_marketplaces'")
+        )
+        # 重建必须保留其余结构，这正是 0005 当年踩过的地方。
+        assert "uq_store_marketplace_code" in schema
+        assert "ck_marketplace_currency" in schema
+        assert schema.count("FOREIGN KEY") == 1
+        assert connection.scalar(
+            sa.text(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' "
+                "AND name = 'ix_store_marketplaces_store_id'"
+            )
+        ) == 1
+        assert connection.execute(sa.text("PRAGMA foreign_key_check")).all() == []
+        assert connection.scalar(sa.text("PRAGMA integrity_check")) == "ok"
+
+
+def test_0010_accepts_de_but_still_refuses_an_unlisted_code(tmp_path: Path) -> None:
+    """放宽不等于拆掉。
+
+    这条断言的用途是：谁要是嫌 CHECK 麻烦直接删了它，这里会红。
+    """
+
+    database = tmp_path / "pre_0010.db"
+    engine = _database_before_de(database)
+    _upgrade(database)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO stores (id, name, created_at, updated_at) "
+                "VALUES (9, :name, :ts, :ts)"
+            ),
+            {"name": "新店", "ts": "2026-09-14 00:00:00"},
+        )
+        # DE 本身可用。
+        connection.execute(
+            sa.text(
+                "INSERT INTO store_marketplaces "
+                "(store_id, code, domain, currency, enabled, created_at, updated_at) "
+                "VALUES (9, 'DE', 'sellercentral.amazon.de', 'EUR', 1, :ts, :ts)"
+            ),
+            {"ts": "2026-09-14 00:00:00"},
+        )
+
+    for rejected in ("US", "FR", "JP"):
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    sa.text(
+                        "INSERT INTO store_marketplaces "
+                        "(store_id, code, domain, currency, enabled, created_at, updated_at) "
+                        "VALUES (3, :code, 'example.test', 'EUR', 1, :ts, :ts)"
+                    ),
+                    {"code": rejected, "ts": "2026-09-14 00:00:00"},
+                )
+
+
+def test_0010_backfill_leaves_an_existing_de_row_alone(tmp_path: Path) -> None:
+    """已经有 DE 的店铺不能被补成第二行，也不能被改写。
+
+    唯一约束会让重复插入直接炸掉整条迁移，所以 WHERE NOT EXISTS 是承重的。
+    """
+
+    database = tmp_path / "pre_0010.db"
+    engine = _database_before_de(database)
+    # 先把约束放宽再塞一行 DE，模拟「运营已经自己加过了」。
+    with engine.begin() as connection:
+        connection.exec_driver_sql("PRAGMA writable_schema=ON")
+        connection.execute(
+            sa.text(
+                "UPDATE sqlite_master SET sql = REPLACE(sql, "
+                ":old_check, :new_check) WHERE name = 'store_marketplaces'"
+            ),
+            {
+                "old_check": "CHECK (code IN ('CA', 'UK', 'AU'))",
+                "new_check": "CHECK (code IN ('CA', 'UK', 'AU', 'DE'))",
+            },
+        )
+        connection.exec_driver_sql("PRAGMA writable_schema=OFF")
+    engine.dispose()
+    engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO store_marketplaces "
+                "(store_id, code, domain, currency, enabled, created_at, updated_at) "
+                "VALUES (1, 'DE', 'sellercentral.amazon.de', 'EUR', 0, :ts, :ts)"
+            ),
+            {"ts": "2026-09-14 00:00:00"},
+        )
+
+    _upgrade(database)
+
+    with engine.connect() as connection:
+        # 已存在的那行保持 enabled=0 不被改写；其余两家补 enabled=1。
+        assert connection.execute(
+            sa.text(
+                "SELECT store_id, enabled FROM store_marketplaces "
+                "WHERE code = 'DE' ORDER BY store_id"
+            )
+        ).all() == [(1, 0), (2, 1), (3, 1)]
+
+
+def test_0010_round_trip_narrows_the_check_and_drops_only_de(tmp_path: Path) -> None:
+    """降级要能真的回到旧形状，否则这条迁移没法回滚。"""
+
+    database = tmp_path / "pre_0010.db"
+    engine = _database_before_de(database)
+    _upgrade(database)
+    _downgrade(database, "0009")
+
+    with engine.connect() as connection:
+        schema = connection.scalar(
+            sa.text("SELECT sql FROM sqlite_master WHERE name = 'store_marketplaces'")
+        )
+        assert "'DE'" not in schema
+        assert connection.scalar(
+            sa.text("SELECT COUNT(*) FROM store_marketplaces WHERE code = 'DE'")
+        ) == 0
+        assert connection.execute(
+            sa.text(
+                "SELECT store_id, code FROM store_marketplaces ORDER BY store_id, code"
+            )
+        ).all() == [(1, "CA"), (1, "UK"), (2, "AU")]
+        assert connection.scalar(sa.text("PRAGMA integrity_check")) == "ok"
+
+    _upgrade(database)
+    with engine.connect() as connection:
+        assert connection.scalar(
+            sa.text("SELECT COUNT(*) FROM store_marketplaces WHERE code = 'DE'")
+        ) == 3
+
+
+def test_a_fresh_install_carries_the_widened_check(tmp_path: Path) -> None:
+    """全新库由 0001 按 live metadata 建表，所以它天生就该认 DE。
+
+    升级库和新装库必须长成同一个样子——两者分叉正是这批迁移测试存在的理由。
+    """
+
+    database = tmp_path / "fresh.db"
+    _upgrade(database)
+    engine = sa.create_engine(f"sqlite:///{database.as_posix()}")
+    with engine.connect() as connection:
+        schema = connection.scalar(
+            sa.text("SELECT sql FROM sqlite_master WHERE name = 'store_marketplaces'")
+        )
+        assert "'DE'" in schema
+        assert connection.scalar(
+            sa.text("SELECT version_num FROM alembic_version")
+        ) == _head_revision()
+
+
+def test_de_is_schedulable_but_deliberately_not_probeable() -> None:
+    """两个白名单分工不同，不要「顺手统一」。
+
+    ``V1_MARKETPLACES`` 管店铺建档与排期；``ALLOWED_MARKETPLACES`` 管统一建档探针，
+    而探针要读**付款页**才能核验卖家身份——德国站没有那条链路。把 DE 塞进后者，
+    操作员在唯一能勾 DE 的那个界面上会收到「统一建档站点只能是…；无效站点：DE」。
+    """
+
+    from ziniao_automation.repositories import V1_MARKETPLACES
+    from ziniao_automation.workflows.amazon_disbursement.config import (
+        ALLOWED_MARKETPLACES,
+    )
+
+    assert V1_MARKETPLACES["DE"] == ("sellercentral.amazon.de", "EUR")
+    assert "DE" not in ALLOWED_MARKETPLACES
+    # 探针白名单必须是建档白名单的真子集，不能各自漂移。
+    assert set(ALLOWED_MARKETPLACES) < set(V1_MARKETPLACES)

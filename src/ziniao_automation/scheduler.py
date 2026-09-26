@@ -120,7 +120,10 @@ class ScheduleManager:
                         trigger=trigger,
                         args=(row.id,),
                         id=job_id,
-                        name=f"{row.name} · {row.store.name}",
+                        # ⚠️ 只用 id。APScheduler 会把任务名写进 INFO 日志
+                        # (「Added job …」「Running job …」),而店铺名 = 卖家名,
+                        # 不许进 data/logs(09-23 自审在线上日志里读到过)。
+                        name=job_id,
                         replace_existing=True,
                         coalesce=True,
                         max_instances=1,

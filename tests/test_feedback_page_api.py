@@ -274,7 +274,9 @@ def test_a_payout_run_still_gets_the_payout_card(client) -> None:
     assert notice is not None
     assert "紫鸟提现" in notice.title
     assert "提现" in notice.summary
-    assert "提现结果已确认" in _message(notice)
+    # 2026-09-23 之前这里钉的是「提现结果已确认」—— 那是叫人去等一张绿卡的说法,
+    # 回读删掉之后那张卡永远不会来。现在的提现专属措辞是这一句。
+    assert "本次没有发出提现请求" in _message(notice)
 
 
 # --------------------------------------------------------------------------
@@ -426,3 +428,19 @@ def test_the_page_can_be_filtered_to_one_site(client) -> None:
     assert "CA 的留言" not in only_uk
     # The per-site breakdown counts the whole ledger, not the filtered view.
     assert "各店各站点已收录的条数" in only_uk
+
+
+def test_a_clicked_but_unconfirmed_request_counts_as_sent(client) -> None:
+    """UNCERTAIN 的意思是**点了但页面没确认** —— 那一下同样不可逆。
+
+    只数 SUBMITTED 的话：两条都点出去却全是 UNCERTAIN 时，卡片写「本次没有提交
+    任何请求审核」，而同一张卡的「本次已提交」底下正列着这两条（2026-09-26 自审）。
+    """
+
+    app, _, _ = client
+    run_id = _seed_reviewed_run(app, mode="auto", state="UNCERTAIN", comment="包裹寄丢了")
+
+    body = _card_body(app, run_id)
+
+    assert "已提交 1 条请求审核（其中 1 条页面未确认）" in body
+    assert "本次没有提交任何请求审核" not in body

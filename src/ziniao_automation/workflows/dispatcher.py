@@ -94,8 +94,8 @@ class WorkflowDispatcher:
     async def continue_auth(self, run: Any) -> Any:
         return await self.engine_for(run.workflow).continue_auth(run)
 
-    async def reconcile(self, run: Any) -> Any:
-        return await self.engine_for(run.workflow).reconcile(run)
+    async def settle(self, run: Any) -> Any:
+        return await self.engine_for(run.workflow).settle(run)
 
     async def expire_auth(self, run: Any) -> Any:
         return await self.engine_for(run.workflow).expire_auth(run)

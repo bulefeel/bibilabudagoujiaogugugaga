@@ -8,7 +8,6 @@ import pytest
 
 from ziniao_automation.workflows.amazon_disbursement import (
     AmazonDisbursementWorkflow,
-    DisbursementPolicy,
 )
 from ziniao_automation.workflows.engine import WorkflowEngine
 from ziniao_automation.workflows.errors import (
@@ -169,7 +168,6 @@ async def test_auth_on_uk_resumes_same_handle_at_uk_not_ca() -> None:
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     sessions = VisibleZiniaoSessions()
     engine = WorkflowEngine(
@@ -233,7 +231,6 @@ async def test_auto_still_parks_when_the_site_already_armed() -> None:
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     sessions = VisibleZiniaoSessions()
     engine = WorkflowEngine(
@@ -282,7 +279,6 @@ async def test_one_sites_contract_failure_does_not_stop_the_others() -> None:
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -337,7 +333,6 @@ async def test_changed_payout_account_fails_only_its_own_site() -> None:
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -396,7 +391,6 @@ async def test_provably_undispatched_site_releases_its_guard_and_others_continue
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -426,7 +420,7 @@ async def test_provably_undispatched_site_releases_its_guard_and_others_continue
 async def test_a_failed_site_with_no_payout_is_not_reported_as_completed() -> None:
     """Green 「已完成」 on a run that paid nothing and failed a site is a lie.
 
-    ``_status_from_operations`` returns SUCCEEDED for an empty operation list,
+    ``run_status_from_facts`` returns SUCCEEDED for an empty operation list,
     and the all-skipped downgrade needs EVERY site to be SKIPPED, so one FAILED
     site left the run showing as complete while real money sat unpaid.
     """
@@ -444,7 +438,6 @@ async def test_a_failed_site_with_no_payout_is_not_reported_as_completed() -> No
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -487,7 +480,6 @@ async def test_rate_limited_site_is_skipped_and_the_others_still_pay() -> None:
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -553,7 +545,6 @@ async def test_every_site_throttled_ends_as_skipped_with_a_reason_per_site() -> 
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -608,7 +599,6 @@ async def test_a_site_dropped_for_auth_makes_the_run_partial_not_completed() -> 
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -641,7 +631,6 @@ async def test_existing_guard_skips_only_that_site_instead_of_killing_the_run() 
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -730,7 +719,6 @@ async def test_growing_balance_no_longer_aborts_and_the_real_amount_is_recorded(
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -788,7 +776,6 @@ async def test_identity_change_still_aborts_even_though_amounts_are_free() -> No
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -828,7 +815,6 @@ async def test_any_payout_account_is_accepted_and_recorded_not_judged() -> None:
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -872,7 +858,6 @@ async def test_a_site_with_no_prior_setup_pays_out_on_its_very_first_run() -> No
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(reconcile_attempts=1, reconcile_interval_seconds=0),
     )
     engine = WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),

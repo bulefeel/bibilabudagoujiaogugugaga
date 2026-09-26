@@ -7,7 +7,6 @@ import unittest
 
 from ziniao_automation.workflows.amazon_disbursement import (
     AmazonDisbursementWorkflow,
-    DisbursementPolicy,
 )
 from ziniao_automation.workflows.engine import WorkflowEngine
 from ziniao_automation.workflows.errors import PlanChanged
@@ -77,6 +76,9 @@ class FakePageAdapter:
         self.snapshot = make_snapshot()
         self.submit_calls = 0
         self.open_confirmation_calls = 0
+        # 回读已被删除。留着这个计数器是为了**钉住它不再被调用** ——
+        # 适配器上那个方法还在(lookup_existing 与它共用页面代码),但收口不该碰它。
+        self.reconcile_calls = 0
         self.crash_on_submit = False
         self.crash_after_confirmation = False
 
@@ -116,6 +118,7 @@ class FakePageAdapter:
         return SubmissionReceipt(utc_now(), receipt_id="local-click")
 
     async def reconcile(self, page, run, marketplace, operation):
+        self.reconcile_calls += 1
         return ReconcileResult(
             ReconcileStatus.CONFIRMED,
             utc_now(),
@@ -152,9 +155,6 @@ def make_engine(repo, adapter):
     workflow = AmazonDisbursementWorkflow(
         repository=repo,
         page_adapter=adapter,
-        policy=DisbursementPolicy(
-            reconcile_attempts=1, reconcile_interval_seconds=0
-        ),
     )
     return WorkflowEngine(
         registry=WorkflowRegistry((workflow,)),
@@ -201,7 +201,19 @@ class DisbursementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(adapter.submit_calls, 0)
         self.assertEqual(await repo.list_operations(run.id), ())
 
-    async def test_armed_crash_recovers_by_readback_without_second_click(self) -> None:
+    async def test_an_armed_crash_never_clicks_again_and_waits_for_a_human(self) -> None:
+        """arm 之后崩溃 → 停在说不清,**绝不第二次点击**,交给人工。
+
+        ⚠️ 这里有一处**刻意接受的能力损失**。2026-09-23 删掉回读之前,重启时会开一次
+        紫鸟去亚马逊结算页查这笔到底有没有出去,查到就自动转成 CONFIRMED。现在不查了,
+        所以 arm 之后崩溃的记录只能由人在运行详情页收尾
+        (「确认未发出，释放」/「我已在亚马逊核对，结案」)。
+
+        换来的是:不再有开机自动开浏览器、不再有查不到就堆一条待办。
+        而**真正的红线**——「恢复绝不再点一次提现」——和回读无关,由 ARM 屏障保证,
+        下面那条 submit_calls 断言钉的就是它。
+        """
+
         repo = InMemoryWorkflowRepository()
         adapter = FakePageAdapter()
         adapter.crash_on_submit = True
@@ -221,10 +233,14 @@ class DisbursementRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
         adapter.crash_on_submit = False
         recovered = await engine.start(run)
-        self.assertEqual(recovered.status, RunStatus.SUCCEEDED)
+
+        self.assertEqual(recovered.status, RunStatus.UNCERTAIN_FINANCIAL)
         self.assertEqual(adapter.submit_calls, 1, "recovery must never click again")
+        self.assertEqual(adapter.reconcile_calls, 0, "收口不许联网")
         records = await repo.list_operations(run.id)
-        self.assertEqual(records[0].state, GuardState.CONFIRMED)
+        # 收口把它定性成「说不清」并写清理由,而不是留着 ARMED 让人猜。
+        self.assertEqual(records[0].state, GuardState.UNCERTAIN)
+        self.assertIn("未能确认", records[0].details["reason"])
 
     async def test_readback_never_claims_a_payout_that_was_never_dispatched(
         self,
@@ -232,17 +248,16 @@ class DisbursementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         """The one fact this workflow exists to get right must not be invented.
 
         A guard that armed and then failed before the click carries no
-        ``submitted_at``.  The read-back finds nothing on the statements page —
-        of course it does, nothing was ever requested — and used to write
-        「已提交提现请求，回读时亚马逊尚未显示结果」 regardless, announcing a
-        payout on no evidence.  Worse, it happens unattended: a service restart
-        auto-reconciles every pending guard.
+        ``submitted_at``.  Claiming 「已提交提现请求」 for it announces a payout on
+        no evidence —— 这正是整条流程唯一必须说准的那件事。
+
+        删掉回读之后这一条更要紧:没有任何东西会去亚马逊求证了,所以文案只能说
+        「系统没有记录到派发」,由人去裁定。
         """
 
         repo = InMemoryWorkflowRepository()
         adapter = FakePageAdapter()
         adapter.crash_on_submit = True
-        adapter.reconcile = lambda *args, **kwargs: _not_found()
         run = make_run(RunMode.AUTO, "run-phantom")
         await repo.add_run(run)
         engine = make_engine(repo, adapter)
@@ -253,32 +268,40 @@ class DisbursementRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(armed.state, GuardState.ARMED)
         self.assertFalse(armed.dispatch_recorded)
 
-        await engine.reconcile(run)
+        await engine.settle(run)
 
         record = (await repo.list_operations(run.id))[0]
         self.assertEqual(record.state, GuardState.UNCERTAIN)
         self.assertFalse(record.details["dispatch_recorded"])
         self.assertNotIn("已提交", record.details["reason"])
         self.assertIn("未能确认", record.details["reason"])
+        self.assertEqual(adapter.reconcile_calls, 0, "收口不许联网")
 
     async def test_readback_still_says_submitted_when_a_click_was_recorded(
         self,
     ) -> None:
-        """The honest half: a real dispatch that Amazon has not published yet."""
+        """诚实的另一半:点击确实返回过,那就是**成功**,不是「说不清」。
+
+        ⚠️ 这条的期望在 2026-09-23 翻转了。有回读的时候,查不到就写 UNCERTAIN ——
+        而亚马逊常隔天才显示,于是每一笔正常提现都会留下一条待办(面板上堆了 43 笔)。
+        删掉回读之后,``submitted_at`` 非空就是终态 ``SUBMITTED``、运行 ``SUCCEEDED``。
+        不这么改的话,每一次**成功的**提现都会收在红色的 UNCERTAIN_FINANCIAL,
+        比删之前还糟。
+        """
 
         repo = InMemoryWorkflowRepository()
         adapter = FakePageAdapter()
-        adapter.reconcile = lambda *args, **kwargs: _not_found()
         run = make_run(RunMode.AUTO, "run-real-submit")
         await repo.add_run(run)
         engine = make_engine(repo, adapter)
 
-        await engine.start(run)
+        result = await engine.start(run)
 
         record = (await repo.list_operations(run.id))[0]
-        self.assertEqual(record.state, GuardState.UNCERTAIN)
+        self.assertEqual(record.state, GuardState.SUBMITTED)
         self.assertTrue(record.dispatch_recorded)
-        self.assertIn("已提交提现请求", record.details["reason"])
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        self.assertEqual(adapter.reconcile_calls, 0, "提交完不许再联网回读")
 
     async def test_the_irreversible_click_is_written_to_the_event_stream(self) -> None:
         """"A payout request went out" must be visible in the audit trail.

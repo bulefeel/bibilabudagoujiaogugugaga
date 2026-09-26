@@ -121,8 +121,11 @@ class ZiniaoController:
         """Pause in-place while the user completes Passkey/CAPTCHA.
 
         Call this *inside* ``session``/``financial_session``.  It keeps the
-        same Playwright page, per-store lock and (for financial sessions) the
-        global funds lock. The web endpoint calls :meth:`continue_auth`.
+        per-store lock and (for financial sessions) the global funds lock, and
+        returns a handle whose ``page`` is live: the original tab is reused when
+        it survived the pause, and a fresh tab in the same persistent context
+        replaces it when Ziniao closed it.  The web endpoint calls
+        :meth:`continue_auth`.
         """
         key = str(auth_key).strip()
         if not key:
@@ -157,6 +160,7 @@ class ZiniaoController:
                 await handle.expire()
                 raise AuthWaitCancelled("人工验证已取消")
             handle.resume()
+            await handle.ensure_live_page()
             return handle
         except asyncio.CancelledError:
             await handle.expire()

@@ -132,3 +132,88 @@ def test_every_named_function_in_app_js_is_referenced() -> None:
         if len(re.findall(rf"\b{re.escape(name)}\b", source)) < 2
     ]
     assert not unreferenced, f"定义了但没有任何调用点：{unreferenced}"
+
+
+def test_wait_for_function_never_passes_its_argument_positionally() -> None:
+    """Playwright 的 ``arg`` 是关键字参数，写成位置参数会当场 TypeError。
+
+    2026-09-18 实测：四个调用点全部写成了位置参数，每一次都抛 TypeError 并被
+    外层的 ``except Exception`` 吞掉。后果不是报错，而是**等待窗口静默失效**——
+    登录助手 15 秒的邮箱/密码预填等待从未真正等过一次，紫鸟晚 5 秒填好密码就会
+    被判成「紫鸟尚未填好 Amazon 登录密码」，交给人工。（OTP 走的是另一条轮询等待
+    ``_wait_for_stable_otp``，不经过 ``wait_for_function``，那条没坏。）
+
+    测试当时全绿，因为假替身把 ``arg`` 声明成了位置参数——替身与真实 API 的调用
+    约定不一致，等于整块测试是假绿。所以这里按**类**扫源码，而不是逐个调用点
+    断言：新写的第五个调用点也会被抓住。
+    """
+
+    import ast
+
+    def aliases(tree: ast.AST) -> set[str]:
+        """``wait = getattr(page, "wait_for_function", None)`` 之后调用的是 ``wait``。
+
+        只认字面的方法名会漏掉这种绑定——本仓库四个调用点里有三个是这么写的，
+        扫描器第一版就因此只抓到一个。
+        """
+
+        found = {"wait_for_function"}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+                continue
+            call = node.value
+            if not (isinstance(call.func, ast.Name) and call.func.id == "getattr"):
+                continue
+            if len(call.args) < 2 or not isinstance(call.args[1], ast.Constant):
+                continue
+            if call.args[1].value != "wait_for_function":
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    found.add(target.id)
+        return found
+
+    offenders: list[str] = []
+    for path in sorted(SRC_ROOT.rglob("*.py")):
+        # utf-8-sig：仓库里至少有一个模块带 BOM，用 utf-8 读会让 ast.parse 报
+        # invalid non-printable character 而不是扫描出结果。
+        tree = ast.parse(path.read_text(encoding="utf-8-sig"), filename=str(path))
+        bound = aliases(tree)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            target = node.func
+            if isinstance(target, ast.Attribute):
+                matched = target.attr == "wait_for_function"
+            elif isinstance(target, ast.Name):
+                matched = target.id in bound
+            else:
+                matched = False
+            if not matched:
+                continue
+            # 允许的形状只有一种：表达式是唯一的位置参数，其余全部具名。
+            if len(node.args) > 1:
+                offenders.append(
+                    f"{path.relative_to(SRC_ROOT)}:{node.lineno} "
+                    f"传了 {len(node.args)} 个位置参数"
+                )
+    assert not offenders, "wait_for_function 的 arg 必须具名传入：\n" + "\n".join(offenders)
+
+
+def test_the_login_page_fake_matches_playwrights_real_signature() -> None:
+    """替身的传参约定必须与 Playwright 一致，否则上面那类 bug 会重新变得不可见。"""
+
+    import inspect
+
+    from playwright.async_api import Page as RealPage
+
+    from tests.unit.test_amazon_login_advancer import _Page as FakePage
+
+    real = inspect.signature(RealPage.wait_for_function).parameters
+    fake = inspect.signature(FakePage.wait_for_function).parameters
+    for name in ("expression", "arg", "polling", "timeout"):
+        assert name in fake, f"替身缺少参数 {name}"
+        assert fake[name].kind is real[name].kind, (
+            f"替身的 {name} 传参方式（{fake[name].kind}）"
+            f"与 Playwright（{real[name].kind}）不一致"
+        )

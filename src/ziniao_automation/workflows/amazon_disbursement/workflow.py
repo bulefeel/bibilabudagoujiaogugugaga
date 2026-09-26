@@ -89,28 +89,6 @@ def _log_site_outcome(
     )
 
 
-@dataclass(frozen=True, slots=True)
-class DisbursementPolicy:
-    # One read-back, no waiting.  Amazon publishes a disbursement to the
-    # statements page hours later — often not until the next day — so the old
-    # 3 × 30s window could never resolve it and simply held the browser for 90
-    # extra seconds per disbursement.  At the intended scale (dozens of stores
-    # plus other automations on one machine) that is the dominant cost of a
-    # read that structurally cannot succeed.  The single attempt is kept
-    # because the statements row is occasionally already there.  Nothing about
-    # the ARMED barrier, the single-dispatch guard or the "never resubmit"
-    # rule changes: a miss just lands in UNCERTAIN, which now says
-    # "已发出，平台尚未显示".
-    reconcile_attempts: int = 1
-    reconcile_interval_seconds: float = 30.0
-
-    def __post_init__(self) -> None:
-        if not 1 <= self.reconcile_attempts <= 3:
-            raise ValueError("V1 回读次数必须在 1 到 3 次之间")
-        if self.reconcile_interval_seconds < 0:
-            raise ValueError("回读间隔不能小于 0")
-
-
 class AmazonDisbursementWorkflow:
     name = "amazon_disbursement"
 
@@ -119,12 +97,10 @@ class AmazonDisbursementWorkflow:
         *,
         repository: WorkflowRepository,
         page_adapter: MarketplacePageAdapter,
-        policy: DisbursementPolicy | None = None,
         sleep: Any = asyncio.sleep,
     ) -> None:
         self.repository = repository
         self.page_adapter = page_adapter
-        self.policy = policy or DisbursementPolicy()
         self._sleep = sleep
         # In-memory cursors are valid only while WorkflowEngine retains the
         # same live Ziniao handle during WAITING_AUTH.  They are not recovery
@@ -188,18 +164,21 @@ class AmazonDisbursementWorkflow:
         if guard_key is not None:
             if await self.repository.get_operation(guard_key) is not None:
                 return False
+        # 原因必须留下来:它是唯一能说明「卡在哪一步」的东西(登录?选站?),
+        # 和引擎 WAITING_AUTH 那条路径的做法一致(09-23 第二轮复核)。
         await self.repository.set_site_status(
             run.id,
             marketplace.code,
             SiteStatus.NEEDS_HUMAN_AUTH,
-            error=f"需要人工验证（{exc.kind}），自动模式已跳过该站点",
+            # 「已跳过」放最前:卡片的原因栏只截到第一个「；」。
+            error=f"自动模式已跳过该站点（{exc.kind}）：{exc}",
         )
         await self.repository.append_event(
             run.id,
             "site_needs_human_auth",
-            "自动模式不等待人工验证：该站点已跳过，继续处理后续站点",
+            f"自动模式不等待人工处理，该站点已跳过（{exc}）；下次运行会重新尝试",
             marketplace_code=marketplace.code,
-            details={"kind": exc.kind},
+            details={"kind": exc.kind, "reason": str(exc)},
         )
         return True
 
@@ -400,10 +379,24 @@ class AmazonDisbursementWorkflow:
         lines_by_code = {line.marketplace.code: line for line in plan.lines}
         cursor_key = (run.id, "execute")
         start_index = self._auth_cursors.get(cursor_key, 0)
+        # 本运行已经动过钱的站点。人工验证续跑时 execute 会再进来一次 ——
+        # 那些站点**绝不能再 arm**。只查今天的 ``guard_key`` 不够:续跑跨过午夜时
+        # 日期变了、key 也变了,旧逻辑会给同一站点重新 arm、再点一次提现。
+        # (2026-09-23 删回读之后,引擎不再对已 SUBMITTED 的运行一律只收口,
+        # 这一道逐站点的闸就成了续跑时防二次点击的承重墙。)
+        already_touched = {
+            record.intent.marketplace_code: record
+            for record in await self.repository.list_operations(run.id)
+        }
         for index, marketplace in enumerate(run.marketplaces[start_index:], start_index):
             line = lines_by_code.get(marketplace.code)
             if line is None:
                 # Planning already recorded a precise per-site skip reason.
+                self._auth_cursors[cursor_key] = index + 1
+                continue
+            touched = already_touched.get(marketplace.code)
+            if touched is not None:
+                result.append(touched)
                 self._auth_cursors[cursor_key] = index + 1
                 continue
             original = line.snapshot
@@ -433,10 +426,9 @@ class AmazonDisbursementWorkflow:
             )
             existing_local = await self.repository.get_operation(guard_key)
             if existing_local is not None:
-                if (
-                    existing_local.intent.run_id == run.id
-                    and existing_local.state is GuardState.CONFIRMED
-                ):
+                if existing_local.intent.run_id == run.id:
+                    # 本运行的记录已在循环开头按站点拦下;走到这里说明站点码
+                    # 对不上(历史数据),同样只计入、不再 arm。
                     result.append(existing_local)
                 else:
                     # Any other record for this store/site/day — settled by an
@@ -671,7 +663,7 @@ class AmazonDisbursementWorkflow:
             await self.repository.append_event(
                 run.id,
                 "operation_armed",
-                "确认页身份和金额已核对；数据库已提交 ARMED，后续异常只允许回读",
+                "确认页身份和金额已核对；数据库已提交 ARMED，此后任何异常都只收口、绝不重新提交",
                 marketplace_code=marketplace.code,
                 details={
                     "guard_key": guard_key,
@@ -684,6 +676,48 @@ class AmazonDisbursementWorkflow:
                 receipt = await self.page_adapter.submit_once(
                     page, run, marketplace, confirmation
                 )
+            except HumanAuthRequired as exc:
+                # 亚马逊在最终点击**之前**又要求认证(付款区的 step-up 重认证)。
+                #
+                # ⚠️ 判据只认适配器给的 ``dispatch_recorded``,它来自写在 ``click()``
+                # 上一行的标记。**不能**拿「``submitted_at`` 还空着」当判据 ——
+                # 那一列是点击之后才写的,点完抛异常时它同样是空的,照它释放就会把
+                # 一笔**已经花出去**的钱的当日屏障删掉(2026-09-26 自审时第一版写错过)。
+                # 不知道(None)就当点过了:一个字不动,交回引擎。
+                if exc.dispatch_recorded is not False:
+                    self._auth_cursors[cursor_key] = index
+                    raise
+                # 确知没点下去。锁定原样留着的话:引擎按「有说不清的记录」只收口不
+                # 续跑,人验证完点继续,整条运行落 UNCERTAIN_FINANCIAL、后面的站点
+                # 一个没试,而那笔钱一分没动。释放之后按**未锁定**时的老路径处理:
+                # 自动模式跳过该站点,审批/空跑模式照常停下来等人。
+                released = await self.repository.release_operation(guard_key)
+                await self.repository.append_event(
+                    run.id,
+                    "operation_released",
+                    "最终提交前亚马逊要求重新认证，已撤销本站点的资金锁定；未发出任何提现请求",
+                    marketplace_code=marketplace.code,
+                    details={
+                        "guard_key": guard_key,
+                        "released": released,
+                        "kind": exc.kind,
+                        "reason": _safe_site_error(exc),
+                    },
+                )
+                if not released:
+                    # 双保险:``release_operation`` 自己要求 submitted_at 为空。
+                    # 删不掉说明这条记录已经记下了派发,与上面的判据矛盾 —— 那就
+                    # 什么都不动,交回引擎。
+                    self._auth_cursors[cursor_key] = index
+                    raise
+                if await self._auto_drops_site_needing_human(run, marketplace, exc):
+                    self._auth_cursors[cursor_key] = index + 1
+                    continue
+                self._auth_cursors[cursor_key] = index
+                await self.repository.set_site_status(
+                    run.id, marketplace.code, SiteStatus.WAITING_AUTH
+                )
+                raise
             except SubmissionNotDispatched as exc:
                 # The adapter proved the irreversible click never happened: the
                 # marker it sets one line above ``click()`` was never written.
@@ -741,10 +775,8 @@ class AmazonDisbursementWorkflow:
                 run.id, marketplace.code, SiteStatus.SUBMITTED
             )
             _log_site_outcome(marketplace, "SUBMITTED", "dispatched")
-            reconciled = await self._reconcile_one(
-                run, page, marketplace, submitted
-            )
-            result.append(reconciled)
+            # 提交完当场收口,不再回头去亚马逊查。见 _settle_one 的说明。
+            result.append(await self._settle_one(run, marketplace, submitted))
             self._auth_cursors[cursor_key] = index + 1
         self._auth_cursors.pop(cursor_key, None)
         return tuple(result)
@@ -755,6 +787,31 @@ class AmazonDisbursementWorkflow:
         page: Any,
         operations: Sequence[OperationRecord] | None = None,
     ) -> Sequence[OperationRecord]:
+        """把还没收口的资金记录一次性落到终态。**不联网。**
+
+        这里原本会开浏览器去亚马逊结算页回读每一笔到没到。运营 2026-09-23 要求
+        删掉那套:它只在那次任务里跑约一分钟(最多三次),而亚马逊常隔天才把提现
+        显示到结算页——代码库自己早就写下了结论(repositories.py:113-122):
+        「the read-back **structurally cannot resolve it**」。于是它几乎必然失败、
+        留下一条 UNCERTAIN、下次服务启动再排一次回读、再开一次紫鸟、再失败。
+        实测面板上堆了 43 笔,最老的一条是 09-10 的。
+
+        现在按**本地已有事实**判,当场落终态:
+
+        * ``submitted_at`` 非空 —— 那一下不可逆点击**返回过**,请求确实发出去了。
+          停在 ``SUBMITTED``,这就是终态。
+        * ``submitted_at`` 为空(只 ARMED)—— 系统**从没看到**点击返回,不知道点没点。
+          落 ``UNCERTAIN``,留给人工。
+
+        ⚠️ **不自动落 CONFIRMED。**「已确认」的含义是「在亚马逊那边看到了这笔」,
+        而我们不再去看;自动写 CONFIRMED 就是声称一件没验证过的事。
+        ``CONFIRMED`` 今后只由人工结案写入(运行详情页那颗「我已在亚马逊核对，结案」)。
+
+        ⚠️ 防重提现不受影响:它靠的是 ``guard_key`` UNIQUE 的**存在性**,
+        不是状态(见 plan 里引的 workflow.py:441-448)。
+        """
+
+        del page  # 收口不需要页面;形参留着是为了不动 Workflow 协议
         records = tuple(
             operations
             or await self.repository.list_operations(
@@ -767,97 +824,64 @@ class AmazonDisbursementWorkflow:
         for record in records:
             marketplace = by_code.get(record.intent.marketplace_code)
             if marketplace is None:
-                uncertain = await self.repository.transition_operation(
-                    record.intent.guard_key,
-                    expected=(record.state,),
-                    target=GuardState.UNCERTAIN,
-                    details={"reason": "站点配置已不存在"},
-                )
-                result.append(uncertain)
+                # 站点配置后来被删了。已提交 / 已结案的记录**有结论**,原样保留 ——
+                # 把一笔成功的提现改成 UNCERTAIN 是在说假话(自审抓到过)。
+                # 只有从没看到点击返回的 ARMED 才需要人裁定。
+                if record.state is GuardState.ARMED and not record.dispatch_recorded:
+                    record = await self.repository.transition_operation(
+                        record.intent.guard_key,
+                        expected=(record.state,),
+                        target=GuardState.UNCERTAIN,
+                        details={"reason": "站点配置已不存在"},
+                    )
+                result.append(record)
                 continue
-            result.append(await self._reconcile_one(run, page, marketplace, record))
+            result.append(await self._settle_one(run, marketplace, record))
         return tuple(result)
 
-    async def _reconcile_one(
+    async def _settle_one(
         self,
         run: WorkflowRun,
-        page: Any,
         marketplace: MarketplaceRef,
         record: OperationRecord,
     ) -> OperationRecord:
-        await self.repository.set_site_status(
-            run.id, marketplace.code, SiteStatus.RECONCILING
-        )
-        last = None
-        for attempt in range(1, self.policy.reconcile_attempts + 1):
-            last = await self.page_adapter.reconcile(
-                page, run, marketplace, record
-            )
-            await self.repository.append_event(
-                run.id,
-                "reconcile_attempt",
-                f"第 {attempt} 次回读付款记录",
-                marketplace_code=marketplace.code,
-                details={
-                    "result": last.status.value,
-                    "platform_reference": last.platform_reference,
-                    "platform_status": last.platform_status,
-                },
-            )
-            if last.status is ReconcileStatus.CONFIRMED:
-                confirmed = await self.repository.transition_operation(
-                    record.intent.guard_key,
-                    expected=(
-                        GuardState.ARMED,
-                        GuardState.SUBMITTED,
-                        GuardState.UNCERTAIN,
-                    ),
-                    target=GuardState.CONFIRMED,
-                    receipt_id=last.platform_reference,
-                    details={"platform_status": last.platform_status},
-                )
-                await self.repository.set_site_status(
-                    run.id, marketplace.code, SiteStatus.CONFIRMED
-                )
-                evidence = await self.page_adapter.capture_evidence(
-                    page, run, marketplace, label="confirmed"
-                )
-                if evidence is not None:
-                    await self.repository.save_evidence(
-                        run.id, marketplace.code, evidence
-                    )
-                return confirmed
-            if attempt < self.policy.reconcile_attempts:
-                await self._sleep(self.policy.reconcile_interval_seconds)
+        """按本地事实给一条资金记录收口。**不开浏览器、不轮询、不 sleep。**
 
+        判据只有一个:那一下不可逆点击**返回过**没有。它写在 ``submitted_at`` 上
+        (``record.dispatch_recorded``),是本地记录,不需要问亚马逊。
+        """
+
+        if record.state in (GuardState.CONFIRMED, GuardState.UNCERTAIN):
+            # 已有结论(人工结案)或已在等人裁定:自动化没什么可做的,**原样返回**,
+            # 也不去动站点状态 —— 否则会把一个等人的站点静默改写成 SUBMITTED。
+            # (SQLAlchemy 仓储的 ``set_site_status`` 不校验站点状态机,写错了不会报错。)
+            return record
+
+        if record.dispatch_recorded:
+            # 请求确实发出去了。``SUBMITTED`` 就是终态——不自动升成 CONFIRMED,
+            # 因为「已确认」意味着在亚马逊那边看到了这笔,而我们不再去看。
+            # execute 在点击之后已经写过站点状态并记过一行日志,这里只在恢复路径
+            # (崩在点击之后、写站点之前)补齐站点状态,不再重复记日志。
+            await self.repository.set_site_status(
+                run.id, marketplace.code, SiteStatus.SUBMITTED
+            )
+            return record
+
+        # 从没看到点击返回。声称「已提交」就是在这个流程唯一必须说准的事情上
+        # 无凭据地断言,所以只说已知的,交给人工(运行详情页的「确认未发出，释放」)。
         uncertain = await self.repository.transition_operation(
             record.intent.guard_key,
-            expected=(GuardState.ARMED, GuardState.SUBMITTED, GuardState.UNCERTAIN),
+            expected=(GuardState.ARMED,),
             target=GuardState.UNCERTAIN,
             details={
-                # Two different facts used to share one sentence.
-                #
-                # With a recorded dispatch, Amazon publishes a disbursement to
-                # the statements page hours later — often not until the next day
-                # — so a read-back bounded to about a minute cannot resolve it.
-                # That genuinely means "submitted, result not shown yet".
-                #
-                # Without one, this system never saw the irreversible click
-                # return, so claiming the request was submitted asserts the one
-                # fact the whole workflow exists to get right, on no evidence.
-                # Say what is actually known and let a human settle it.
-                "reason": (
-                    "已提交提现请求，回读时亚马逊尚未显示结果"
-                    if record.dispatch_recorded
-                    else "未能确认是否已发出提现请求（系统没有记录到派发）"
-                ),
-                "dispatch_recorded": record.dispatch_recorded,
-                "last_status": last.status.value if last else None,
+                "reason": "未能确认是否已发出提现请求（系统没有记录到派发）",
+                "dispatch_recorded": False,
             },
         )
         await self.repository.set_site_status(
             run.id, marketplace.code, SiteStatus.UNCERTAIN_FINANCIAL
         )
+        _log_site_outcome(marketplace, "UNCERTAIN_FINANCIAL", "dispatch_not_recorded")
         return uncertain
 
     async def report(self, run: WorkflowRun, status: RunStatus) -> WorkflowReport:
@@ -878,13 +902,13 @@ class AmazonDisbursementWorkflow:
             ],
         }
         summary = {
-            RunStatus.SUCCEEDED: "任务完成，已回读确认付款记录。",
+            RunStatus.SUCCEEDED: "任务完成；已发出的提现请求见站点明细。",
             RunStatus.WAITING_APPROVAL: "金额清单已生成，请在本地后台审核。",
             RunStatus.WAITING_AUTH: "浏览器等待人工完成安全验证。",
             RunStatus.NEEDS_HUMAN_AUTH: "人工验证等待已超时。",
             RunStatus.UNCERTAIN_FINANCIAL: (
-                "已提交提现请求，结果等待审核；亚马逊通常数小时甚至次日才显示，"
-                "届时回读即可确认。切勿重新提交。"
+                "有资金记录无法确认是否已发出提现请求；请去亚马逊卖家后台核对，"
+                "再在运行详情页结案或释放。切勿重新提交。"
             ),
             RunStatus.FAILED: "任务在资金提交前失败。",
             RunStatus.CANCELLED: "任务已取消。",

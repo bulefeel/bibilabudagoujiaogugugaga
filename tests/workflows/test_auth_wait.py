@@ -136,6 +136,67 @@ class AuthWaitTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(page is sessions.handle.page for page in workflow.pages))
 
 
+class _ReplacedPageSessions(AuthSessions):
+    """紫鸟在人工验证期间把自动化标签页换掉了——恢复时必须拿到新的那个。"""
+
+    async def wait_for_auth(self, handle, auth_key, *, timeout_seconds=1800):
+        await super().wait_for_auth(handle, auth_key, timeout_seconds=timeout_seconds)
+        handle.page = _Page()
+        return handle
+
+
+class AuthReasonAndHandleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_reason_the_login_stopped_is_persisted(self) -> None:
+        """否则事后没人答得出「为什么又要人工登录」。
+
+        2026-09-18 正香的德国站停在 /ap/signin，运行记录里只剩 kind=sign_in；
+        真正的原因（登录助手判定按钮缺失）只存在于一个没有落盘的异常对象里，
+        现场早就没了。
+        """
+
+        repo = InMemoryWorkflowRepository()
+        run = make_run(RunMode.DRY_RUN, "auth-reason-run")
+        await repo.add_run(run)
+        engine = WorkflowEngine(
+            registry=WorkflowRegistry((AuthWorkflow(),)),
+            repository=repo,
+            browser_sessions=AuthSessions(),
+        )
+
+        await engine.start(run)
+
+        paused = [e for e in repo.events if e["event_type"] == "human_auth_required"]
+        self.assertEqual(len(paused), 1)
+        self.assertEqual(paused[0]["details"]["kind"], "captcha")
+        self.assertEqual(paused[0]["details"]["reason"], "challenge")
+        self.assertIn("challenge", paused[0]["message"])
+
+    async def test_resume_uses_the_page_the_controller_handed_back(self) -> None:
+        """人工验证后紫鸟可能已经换了标签页，续跑必须用新的那个。
+
+        拿着旧引用重放的结果是 ``TargetClosedError: Page.goto``——人刚做完的验证
+        被整个丢掉，运行直接判失败。
+        """
+
+        repo = InMemoryWorkflowRepository()
+        run = make_run(RunMode.DRY_RUN, "auth-replaced-page-run")
+        await repo.add_run(run)
+        workflow = AuthWorkflow()
+        sessions = _ReplacedPageSessions()
+        engine = WorkflowEngine(
+            registry=WorkflowRegistry((workflow,)),
+            repository=repo,
+            browser_sessions=sessions,
+        )
+
+        result = await engine.start(run)
+
+        self.assertEqual(result.status, RunStatus.SUCCEEDED)
+        self.assertEqual(workflow.calls, 2)
+        self.assertIsNot(workflow.pages[0], workflow.pages[1])
+        self.assertIs(workflow.pages[1], sessions.handle.page)
+
+
 if __name__ == "__main__":
     unittest.main()
 

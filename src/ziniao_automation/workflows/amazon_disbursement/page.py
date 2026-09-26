@@ -20,6 +20,7 @@ from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 from weakref import WeakKeyDictionary
 
+from ..amazon_account_switcher import AmazonAccountSwitcher
 from ..amazon_login import AmazonLoginAdvancer
 from ..contracts import MarketplacePageAdapter
 from ..errors import (
@@ -34,7 +35,6 @@ from ..types import (
     EvidenceRef,
     MarketplaceRef,
     MarketplaceSnapshot,
-    OperationRecord,
     PreflightResult,
     ReconcileResult,
     ReconcileStatus,
@@ -92,6 +92,7 @@ class AmazonPaymentsPage:
         pacing_range_ms: tuple[int, int] = (1_200, 2_400),
         pacing_random: Callable[[float, float], float] = random.uniform,
         login_advancer: AmazonLoginAdvancer | None = None,
+        account_switcher: AmazonAccountSwitcher | None = None,
     ) -> None:
         self.contract = contract or AmazonDomContract()
         self.navigation_timeout_ms = navigation_timeout_ms
@@ -137,6 +138,8 @@ class AmazonPaymentsPage:
         self._login_advancer = login_advancer or AmazonLoginAdvancer(
             pacing_random=pacing_random
         )
+        # 多站点账号登录后会被落到账户/站点切换页(用户 2026-09-23 拍板:自动选站)。
+        self._account_switcher = account_switcher or AmazonAccountSwitcher()
         self._last_business_navigation_at: float | None = None
 
     async def preflight(
@@ -189,7 +192,11 @@ class AmazonPaymentsPage:
 
         page = self.resolved_page_for(page)
         await self._goto_dashboard(page, marketplace)
-        page = await self._raise_if_auth(page, marketplace)
+        # 只读:建档探针绝不在切换页上点国家。落到切换页时,下面的回退本来就是
+        # 从那一页读当前账号(09-23 第二轮复核:默认选站让探针卡进「等待登录」)。
+        page = await self._raise_if_auth(
+            page, marketplace, select_marketplace_on_switcher=False
+        )
         self._require_host(page, marketplace)
         try:
             return await self._detect_identity(page)
@@ -556,11 +563,14 @@ class AmazonPaymentsPage:
         if key in self._nonfinal_retry_used:
             return page
         self._nonfinal_retry_used.add(key)
+        # ⚠️ 只写 path。整条 URL 上挂着亚马逊登录回跳的 ``ssoResponse`` /
+        # ``clientContext``(会话级凭证材料),和 ``mons_sel_dir_mcid`` 之类的账号标识,
+        # 一律不进日志文件(2026-09-26 自审)。
         logger.info(
             "Re-dispatching the non-final disbursement transition: "
-            "marketplace=%s url=%s",
+            "marketplace=%s path=%s",
             marketplace.code,
-            str(getattr(page, "url", "") or ""),
+            urlparse(str(getattr(page, "url", "") or "")).path,
             extra={"marketplace": marketplace.code, "event": "nonfinal_redispatch"},
         )
 
@@ -628,6 +638,9 @@ class AmazonPaymentsPage:
                 page,
                 marketplace,
                 allow_payment_details_handoff=True,
+                # ⚠️ ARMED 之后不选站:这个窗口里不多做任何导航。落到切换页的话,
+                # 下面「只允许在付款详情页提交」会拒绝并释放 ARMED 锁,什么都不点。
+                select_marketplace_on_switcher=False,
             )
             # _raise_if_auth may hand off to a different tab, which carries the
             # markers with it; re-read from whichever Page is now current.
@@ -658,7 +671,10 @@ class AmazonPaymentsPage:
                 submitted_at=utc_now(),
                 observed_status="success_banner" if success else "click_dispatched",
             )
-        except HumanAuthRequired:
+        except HumanAuthRequired as exc:
+            # 亚马逊在这一步要求重新认证。把「点没点」一并带出去:标记就写在
+            # ``click()`` 上一行,所以它是有凭据的。调用方据此决定能不能撤销锁定。
+            exc.dispatch_recorded = bool(consumed is not None and code in consumed)
             raise
         except Exception as exc:
             if consumed is not None and code in consumed:
@@ -666,37 +682,6 @@ class AmazonPaymentsPage:
                 # earlier one did.  Both mean the caller must not release.
                 raise
             raise SubmissionNotDispatched(str(exc)) from exc
-
-    async def reconcile(
-        self,
-        page: Any,
-        run: WorkflowRun,
-        marketplace: MarketplaceRef,
-        operation: OperationRecord,
-    ) -> ReconcileResult:
-        page = self.resolved_page_for(page)
-        await self._goto_statements(page, marketplace)
-        page = await self._raise_if_auth(page, marketplace)
-        self._require_host(page, marketplace)
-        await self._verify_identity(page, run.store.expected_seller_id, marketplace)
-        if "/payments/allstatements/" not in urlparse(str(page.url)).path.lower():
-            await self._goto_statements(page, marketplace)
-            page = await self._raise_if_auth(page, marketplace)
-            self._require_host(page, marketplace)
-        expected = MarketplaceSnapshot(
-            marketplace_code=marketplace.code,
-            domain=marketplace.domain,
-            seller_id=run.store.expected_seller_id,
-            payment_account=operation.intent.payout_account_tail,
-            currency=operation.intent.currency,
-            payable_amount=operation.intent.amount,
-            delayed_amount=Decimal("0"),
-            settlement_key=operation.intent.settlement_key,
-            can_submit=False,
-            contract_version=self.contract.version,
-            page_fingerprint="reconcile",
-        )
-        return await self._find_payment(page, expected, require_today=False)
 
     def _validate_static_configuration(
         self,
@@ -767,7 +752,7 @@ class AmazonPaymentsPage:
                     || document.querySelector(selectors.signin)
                     || document.querySelector(selectors.auth)
                 )""",
-                selectors,
+                arg=selectors,
                 timeout=min(self.navigation_timeout_ms, 15_000),
             )
         except Exception:
@@ -805,7 +790,10 @@ class AmazonPaymentsPage:
 
     async def _wait_for_dashboard_contract(self, page: Any) -> None:
         wait = getattr(page, "wait_for_function", None)
-        if not callable(wait):
+        if not callable(wait) or self._on_auth_or_switcher_route(page):
+            # 落在登录页/切换页上时,这两段等待等不到任何东西:交给 _raise_if_auth
+            # 去推进,它处理完会按落地页重新等。2026-09-23 修好 wait_for_function
+            # 的传参之后这里**第一次真的开始等**,被弹一次就白耗 25 秒。
             return
         selectors = {
             "rows": self.contract.balance_rows,
@@ -821,7 +809,7 @@ class AmazonPaymentsPage:
                     || document.querySelector(selectors.signin)
                     || document.querySelector(selectors.auth)
                 )""",
-                selectors,
+                arg=selectors,
                 timeout=min(self.navigation_timeout_ms, 15_000),
             )
         except Exception:
@@ -837,16 +825,31 @@ class AmazonPaymentsPage:
             and await page.locator(self.contract.alerts).count() < 1
         ):
             try:
+                # 登录/验证标记也算「等到了」，和第一段一致：被弹出去时不白等 10 秒。
                 await wait(
                     """selectors => Boolean(
                         document.querySelector(selectors.rows)
                         || document.querySelector(selectors.alerts)
+                        || document.querySelector(selectors.signin)
+                        || document.querySelector(selectors.auth)
                     )""",
-                    selectors,
+                    arg=selectors,
                     timeout=min(self.navigation_timeout_ms, 10_000),
                 )
             except Exception:
                 pass
+
+    @staticmethod
+    def _on_sign_in_route(page: Any) -> bool:
+        path = urlparse(str(getattr(page, "url", "") or "")).path.lower()
+        return path.startswith("/ap/")
+
+    @staticmethod
+    def _on_auth_or_switcher_route(page: Any) -> bool:
+        path = urlparse(str(getattr(page, "url", "") or "")).path.lower()
+        return path.startswith("/ap/") or AmazonAccountSwitcher.is_switcher_url(
+            str(getattr(page, "url", "") or "")
+        )
 
     async def _wait_for_details_contract(
         self,
@@ -1327,7 +1330,10 @@ class AmazonPaymentsPage:
             page,
             f"https://{marketplace.domain}/account-switcher/default/merchantMarketplace",
         )
-        page = await self._raise_if_auth(page, marketplace)
+        # 这里是**故意**打开切换页读卖家身份,绝不能在这一页点国家。
+        page = await self._raise_if_auth(
+            page, marketplace, select_marketplace_on_switcher=False
+        )
         self._require_host(page, marketplace)
 
         # Account data is loaded asynchronously after DOMContentLoaded.
@@ -1417,10 +1423,13 @@ class AmazonPaymentsPage:
         marketplace: MarketplaceRef | None = None,
         *,
         allow_payment_details_handoff: bool = False,
+        select_marketplace_on_switcher: bool = True,
+        _bounced_after_switch: bool = False,
     ) -> Any:
         source_page = page
         assisted_login_advanced = False
-        url = str(getattr(page, "url", "") or "").lower()
+        entry_url = str(getattr(page, "url", "") or "")
+        url = entry_url.lower()
         if "/ap/signin" in url or "/ap/mfa" in url:
             resolved_page = await self._login_advancer.advance_or_raise(
                 page,
@@ -1441,6 +1450,28 @@ class AmazonPaymentsPage:
             # business-page host/identity validation is allowed to continue.
         if assisted_login_advanced:
             await self._wait_for_assisted_login_dom_handoff(page)
+        if select_marketplace_on_switcher and AmazonAccountSwitcher.is_switcher_url(
+            str(getattr(page, "url", "") or "")
+        ):
+            page = await self._select_marketplace_on_switcher(page, marketplace)
+            if self._on_sign_in_route(page):
+                # 确认选站之后亚马逊又要求登录(每个站点各自的会话)。这正是登录助手
+                # 的活:回到上面那段再走一次。只回一次 —— 再被弹就交给人,不绕圈。
+                if _bounced_after_switch:
+                    # 只陈述事实。「去紫鸟里处理、回后台继续」由等待卡片的下一步来说;
+                    # 自动模式不等人,这句话写进异常就会被原样记成「请…后继续」,
+                    # 而那里根本没有「继续」可点(09-23 第三轮复核)。
+                    raise HumanAuthRequired(
+                        "选定站点后亚马逊再次要求登录，自动登录未能完成",
+                        kind="sign_in",
+                    )
+                return await self._raise_if_auth(
+                    page,
+                    marketplace,
+                    allow_payment_details_handoff=allow_payment_details_handoff,
+                    select_marketplace_on_switcher=True,
+                    _bounced_after_switch=True,
+                )
         if await page.locator(self.contract.signin_marker).count() > 0:
             raise HumanAuthRequired("Amazon 登录已失效", kind="sign_in")
         if await page.locator(self.contract.auth_marker).count() > 0:
@@ -1448,6 +1479,65 @@ class AmazonPaymentsPage:
         body = await self._body_text(page)
         if self.contract.auth_text_pattern.search(body[:100_000]):
             raise HumanAuthRequired("页面出现人工验证提示", kind="challenge")
+        if str(getattr(page, "url", "") or "") != entry_url:
+            # 这一趟把页面换到了别处(助手登完、或选完站落回来):落地页的内容是
+            # **异步**画上去的,得重新等一次它的契约。
+            #
+            # 不等的话:``lookup_existing`` 会在结算表还没渲染时就去找记录,读到
+            # NOT_FOUND,于是「亚马逊那边今天已经有同额记录」这道点击前的平台侧
+            # 防重直接失效,面板照样按下去(2026-09-26 自审)。直接选站那条路径
+            # 本来就等(``_select_marketplace_on_switcher`` 末尾),登录这条漏了。
+            await self._wait_for_landed_contract(page)
+        return page
+
+    async def _wait_for_landed_contract(self, page: Any) -> None:
+        """按落地路径等对应的页面契约。不认识的页面不等 —— 那不是我们的活。"""
+
+        landed = urlparse(str(getattr(page, "url", "") or "")).path.lower()
+        if landed.startswith("/payments/dashboard/"):
+            await self._wait_for_dashboard_contract(page)
+        elif landed.startswith("/payments/allstatements/"):
+            await self._wait_for_statements_contract(page)
+
+    async def _select_marketplace_on_switcher(
+        self, page: Any, marketplace: MarketplaceRef | None
+    ) -> Any:
+        """页面停在账户/站点切换页:自己选定目标站点,再落回原来要去的那一页。
+
+        选不定(没有整串精确匹配、不唯一、被挡住、点了没落地,或者不知道选完该回哪)
+        → ``HumanAuthRequired``,回到「转人工、在紫鸟里选一下、点继续」的老路径。
+        **绝不**因为选不到站就把站点记成跳过 —— 那会把「只差人工选一次站」的有余额
+        站点报成「本次没有发起提现」。
+
+        选完之后,主机校验、卖家身份校验、金额绑定校验照常在业务页上跑:选错账号会
+        被身份校验挡住。
+        """
+
+        url = str(getattr(page, "url", "") or "")
+        target = AmazonAccountSwitcher.return_path(url)
+        if marketplace is None or target is None:
+            raise HumanAuthRequired(
+                "页面停在亚马逊账户/站点选择页，且无法确定选完应回到哪一页",
+                kind="marketplace_switch",
+            )
+        outcome = await self._account_switcher.select_marketplace(
+            page, marketplace.domain, expected_path=target
+        )
+        if outcome.reason == "auth_required":
+            # 站点已经选上了,是亚马逊要求重新登录 —— 不是「没选定」。
+            # 交回 ``_raise_if_auth`` 走登录助手。
+            return page
+        if not outcome.ok:
+            # kind 不叫 sign_in:这不是登录问题,运行详情和卡片要说对是哪一步卡住了。
+            raise HumanAuthRequired(
+                f"页面停在亚马逊账户/站点选择页，未能自动选定 {marketplace.code}"
+                f"（{outcome.reason}）",
+                kind="marketplace_switch",
+            )
+        # 页面契约原本是在切换页上等的,落回业务页之后要重新等一次,
+        # 否则余额行还没渲染就会被判成「页面结构不符」。
+        await self._settle(page)
+        await self._wait_for_landed_contract(page)
         return page
 
     async def _wait_for_assisted_login_dom_handoff(self, page: Any) -> None:

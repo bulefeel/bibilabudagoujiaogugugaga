@@ -485,3 +485,29 @@ def test_missed_recovery_continues_after_corrupt_schedule(database):
             assert corrupt_runs == []
 
     asyncio.run(scenario())
+
+
+def test_the_scheduler_never_logs_the_store_name(database, caplog):
+    """APScheduler 把任务名写进 INFO 日志(「Added job …」「Running job …」)。
+    任务名原来是「排期名 · 店铺名」,店铺名 = 卖家名,于是进了 data/logs
+    (09-23 自审在线上日志里读到过)。用真的 APScheduler 跑一次投影再看日志。"""
+
+    import logging
+
+    async def scenario() -> None:
+        seed_daily_schedule(database, created_at=datetime(2026, 8, 1, tzinfo=timezone.utc))
+        manager = ScheduleManager(database, RecordingAutomation())
+        with caplog.at_level(logging.DEBUG):
+            # 必须真的启动:没启动的 APScheduler 只记一句不带任务名的「tentatively」。
+            await manager.start(recover_missed=False)
+            try:
+                await manager.refresh()
+            finally:
+                await manager.shutdown()
+
+    asyncio.run(scenario())
+    logged = [record.getMessage() for record in caplog.records]
+    assert any("db-schedule:" in line for line in logged), "前提:任务确实被加进去并记了日志"
+    for line in logged:
+        assert "Persistent schedule store" not in line, line
+

@@ -26,6 +26,8 @@ from typing import Any, Callable, Literal
 from urllib.parse import urlparse
 from weakref import WeakKeyDictionary
 
+from playwright.async_api import Error as PlaywrightError
+
 from .errors import HumanAuthRequired
 
 
@@ -34,6 +36,9 @@ _SELLER_CENTRAL_HOSTS = frozenset(
         "sellercentral.amazon.ca",
         "sellercentral.amazon.co.uk",
         "sellercentral.amazon.com.au",
+        # 德国站（GPSR 安全证明流程）。它有自己的 ``assoc_handle``
+        # （``sc_de_amazon_v2``），所以别站登录过不算数，必须单独走一遍。
+        "sellercentral.amazon.de",
     }
 )
 # ``/ap/mfa/new-otp`` is the two-step-verification METHOD CHOOSER Amazon started
@@ -70,9 +75,35 @@ _BUSINESS_EXACT_PATHS = frozenset(
         # Angular app appends a "#/" fragment, which urlparse keeps out of the
         # path, so the exact match still holds.
         "/feedback-manager/index.html",
+        # 监管合规性页（GPSR 安全证明流程的落地页）。同一个坑第三次：漏了它，
+        # 登录其实成功了也会被判成「需要人工」。``?t=regulatory-compliance``
+        # 是查询串，urlparse 不会算进 path，所以精确匹配仍然成立。
+        #
+        # 白名单它是安全的：这一页本身只是一张只读列表，动手的控件都在点开
+        # 「提交」之后的侧栏里，不在这个路径上。
+        "/performance/account/health/product-policies",
     }
 )
 _PAYMENT_DETAILS_EXACT_PATH = "/payments/disburse/details"
+# 亚马逊自己的账户/站点切换页。**同一个坑第四次。**
+#
+# 落到这里意味着登录**成功了** —— 是 Seller Central 在问「开哪个站点」，不是
+# 认证没过。不把它列进来，助手就会在 ``advance`` 里报「登录后进入了未列入白名单
+# 的页面」，或者（因为找不到业务页）把成功的 OTP 报成「OTP 已变化、过期或更换
+# 输入框」。2026-09-18 正香-张刚CA 德国站实测撞到的就是后者：繼續、密码、OTP
+# 三步全过，最后卡在这一句上。
+#
+# 前缀匹配，因为切换页有子路径（``/account-switcher/default/merchantMarketplace``）。
+# 白名单它是安全的：这个子树上没有任何动钱的控件。
+#
+# ⚠️ 登录助手认出它、**不操作它**；落到这里之后由调用方自己选站(用户 2026-09-18 /
+# 09-23 拍板)。现在 ``advance_or_raise`` 的两个调用方都处理了:提现
+# ``AmazonPaymentsPage._raise_if_auth`` 与 GPSR ``AmazonGpsrPage.open_policies``,
+# 都用 ``amazon_account_switcher``。**新增调用方必须同样处理这一页**,否则登录成功
+# 之后会拿着一个停在切换页的 page 往下走。
+# 这和 ``_account_choice_selector`` 转人工的那一页不是一回事:那是**登录页上**
+# 选用哪个账号登录,属于凭据决定;这一页发生在登录之后,只是换个站点视图。
+_BUSINESS_PATH_PREFIXES = ("/account-switcher",)
 _OTP_METHOD_OPTIONS = """
 () => Array.from(document.querySelectorAll('input[type="radio"]')).map((el, index) => {
     const byFor = el.id ? document.querySelector('label[for="' + el.id + '"]') : null;
@@ -140,6 +171,20 @@ class _ManagedPasskeyCandidate:
 
 class _DispatchLimitReached(RuntimeError):
     """The bounded automatic click budget for one document stage is spent."""
+
+
+class _ManagedPasskeyAppeared(RuntimeError):
+    """紫鸟在分类之后、点击之前才把托管 Passkey 对话框注入进来。
+
+    这**不是**故障，而是「该走的路变了」：分类给出的 ``password_signin`` 已经过期，
+    此刻正确的动作是 ``managed_passkey``。分类与点击之间隔着好几段可能改变页面的
+    等待（2–3 秒 pacing、最长 15 秒的密码 prefill 轮询），逐个等待点去补判断是打
+    地鼠；用一条「本轮不点、回去重新分类」的转移，一次覆盖全部，也覆盖以后新增的。
+
+    之前这个条件和另外四个挤在同一个 ``or`` 里、抛同一句
+    「密码登录页在点击前已变化」，于是唯一出口是转人工——而实际上该走的路就在旁边。
+    2026-09-18 正香-张刚CA 德国站实测到的正是这一幕。
+    """
 
 
 class _AlreadyOnBusinessPage(RuntimeError):
@@ -1090,6 +1135,17 @@ class AmazonLoginAdvancer:
                 action,
             )
             return "not_dispatched", None
+        except _ManagedPasskeyAppeared:
+            # 和上面一路：报一次「没点」，让调用方现成的重新分类去走正确的那条路
+            # （下一轮 ``_classify`` 会返回 ``managed_passkey``）。轮次上限
+            # ``transition_limit`` 仍然管着，不会变成死循环。
+            _logger.info(
+                "Amazon assisted login saw the managed Passkey dialog appear "
+                "before the click; reclassifying instead of handing over: "
+                "action=%s",
+                action,
+            )
+            return "not_dispatched", None
         await self._reserve_dispatch(page, action)
         try:
             await control.click(no_wait_after=True)
@@ -1157,14 +1213,19 @@ class AmazonLoginAdvancer:
                 or len(passwords) != 1
                 or otps
                 or not await self._password_is_ready(passwords[0])
-                or await self._managed_passkey_available(
-                    page, expected_host=expected_host
-                )
             ):
                 raise HumanAuthRequired(
                     "Amazon 密码登录页在点击前已变化，已停止本次自动点击",
                     kind="sign_in",
                 )
+            # ⚠️ 这一条**必须和上面四条分开**。上面四条说的是「页面坏了/说不清」，
+            # 只能转人工；而托管 Passkey 出现说的是「该走的路变了」，旁边就有一条
+            # 正确的路。挤在同一个 ``or`` 里抛同一句话，等于把一个可恢复的转移
+            # 伪装成死胡同——2026-09-18 正香德国站就是这么被判成需要人工的。
+            if await self._managed_passkey_available(
+                page, expected_host=expected_host
+            ):
+                raise _ManagedPasskeyAppeared()
             # Resolve the exact control again after all field and overlay
             # checks.  This catches a duplicate/replaced/disabled submit button
             # before the previously selected locator is dispatched.
@@ -1487,11 +1548,20 @@ class AmazonLoginAdvancer:
             and raw_path == _PAYMENT_DETAILS_EXACT_PATH
             and not parsed.params
         )
+        # 前缀必须整段匹配：``/account-switcherX`` 不算，``/account-switcher/…`` 才算。
+        switcher_allowed = any(
+            path == prefix or path.startswith(f"{prefix}/")
+            for prefix in _BUSINESS_PATH_PREFIXES
+        )
         return (
             parsed.scheme.lower() == "https"
             and normalized_expected in _SELLER_CENTRAL_HOSTS
             and host == normalized_expected
-            and (path in _BUSINESS_EXACT_PATHS or payment_details_allowed)
+            and (
+                path in _BUSINESS_EXACT_PATHS
+                or payment_details_allowed
+                or switcher_allowed
+            )
         )
 
     async def _wait_for_business_page(
@@ -1673,6 +1743,10 @@ class AmazonLoginAdvancer:
                     "紫鸟尚未填好 Amazon 登录密码",
                     kind="sign_in",
                 )
+            # 这里**刻意不再**探一次托管 Passkey。分类与点击之间还隔着 2–3 秒的
+            # pacing，逐个等待点补判断是打地鼠；真正的保证在点击前的复查里：
+            # 那里看到对话框会抛 ``_ManagedPasskeyAppeared``，本轮不点、回来重新
+            # 分类，一条转移覆盖全部等待窗口。
             _logger.info(
                 "Amazon assisted login password fallback ready: action=password_signin"
             )
@@ -1746,18 +1820,6 @@ class AmazonLoginAdvancer:
                 const email = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(value);
                 const phone = /^\\+?[0-9][0-9 ()-]{5,24}$/.test(value);
                 return !element.disabled && !element.readOnly && (email || phone);
-            }""",
-        )
-
-    async def _otp_is_ready(self, field: Any) -> bool:
-        if not await self._is_visible(field):
-            return False
-        return await self._boolean_evaluate(
-            field,
-            """element => {
-                const value = String(element.value || '').trim();
-                return !element.disabled && !element.readOnly
-                    && /^[0-9]{6}$/.test(value);
             }""",
         )
 
@@ -1966,24 +2028,20 @@ class AmazonLoginAdvancer:
         field: Any,
         *,
         selector: str,
-        kind: Literal["identifier", "password", "otp"],
+        kind: Literal["identifier", "password"],
     ) -> bool:
         """Wait briefly for Ziniao to populate the page-owned input.
 
         The browser evaluates only a readiness boolean.  The identifier or
-        OTP itself never crosses the page boundary into Python.
+        password itself never crosses the page boundary into Python.
+        OTP has its own stability wait (``_wait_for_stable_otp``).
         """
 
         readiness = {
             "identifier": self._identifier_is_ready,
             "password": self._password_is_ready,
-            "otp": self._otp_is_ready,
         }[kind]
-        timeout_ms = (
-            self._otp_prefill_wait_timeout_ms
-            if kind == "otp"
-            else self._prefill_wait_timeout_ms
-        )
+        timeout_ms = self._prefill_wait_timeout_ms
         if await readiness(field):
             return True
         wait_for_function = getattr(page, "wait_for_function", None)
@@ -2006,17 +2064,23 @@ class AmazonLoginAdvancer:
                     const field = fields[0];
                     if (field.disabled || field.readOnly) return false;
                     const value = String(field.value || '').trim();
-                    if (argument.kind === 'otp') return /^[0-9]{6}$/.test(value);
                     if (argument.kind === 'password') return value.length > 0;
                     const email = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(value);
                     const phone = /^\\+?[0-9][0-9 ()-]{5,24}$/.test(value);
                     return email || phone;
                 }""",
-                {"selector": selector, "kind": kind},
+                # ⚠️ ``arg`` 是关键字参数。写成位置参数会当场 TypeError，而不是
+                # 等待——整个窗口静默失效，调用方却读到「还没填好」。
+                arg={"selector": selector, "kind": kind},
                 polling=250,
                 timeout=timeout_ms,
             )
-        except Exception:
+        except PlaywrightError:
+            # 页面这一侧的结局——等满超时、导航打断、标签被关——都等于「这次没等到
+            # 填好」，交给调用方转人工。
+            # ⚠️ 只接 Playwright 自己的异常。``TypeError`` 这类**编程错误**必须抛出去：
+            # 当年 ``arg`` 写成位置参数，每次都 TypeError 被一个宽 ``except`` 吞掉，
+            # 两个等待窗口从未生效，测试全绿。
             return False
         return await readiness(field)
 
@@ -2738,7 +2802,37 @@ class AmazonLoginAdvancer:
         else:
             _logger.info("Managed Passkey CDP detach completed")
 
+    # Amazon's ``a-button`` renders its label in a sibling span and points the
+    # real control at it with ``aria-labelledby``.  That span carries
+    # ``aria-hidden="true"``, so the *only* name the control has is this
+    # reference — the input itself has no ``value``, no ``aria-label`` and (as
+    # an ``<input>``) no inner text at all.  ``textContent`` is deliberate:
+    # the referenced node may be hidden, and the accessible-name computation
+    # reads it regardless.  Only a button label crosses into Python here.
+    _ARIA_LABELLEDBY_TEXT = """
+        (el) => {
+          const ref = el.getAttribute('aria-labelledby');
+          if (!ref) return '';
+          const doc = el.ownerDocument;
+          return ref
+            .split(/\\s+/)
+            .filter(Boolean)
+            .map((id) => {
+              const target = doc.getElementById(id);
+              return target ? target.textContent || '' : '';
+            })
+            .join(' ');
+        }
+    """
+
     async def _control_label(self, element: Any) -> str:
+        """Return the control's accessible name, or ``""`` when it is ambiguous.
+
+        Every populated source must agree.  A control whose names disagree is
+        refused rather than guessed at — the caller turns that into a human
+        hand-off, which is the safe direction for a click-only automation.
+        """
+
         values: list[str] = []
         for attribute in ("label", "value", "aria-label"):
             try:
@@ -2747,6 +2841,12 @@ class AmazonLoginAdvancer:
                 value = None
             if value:
                 values.append(str(value))
+        try:
+            referenced = await element.evaluate(self._ARIA_LABELLEDBY_TEXT)
+        except Exception:
+            referenced = ""
+        if referenced:
+            values.append(str(referenced))
         try:
             text = await element.inner_text()
         except Exception:

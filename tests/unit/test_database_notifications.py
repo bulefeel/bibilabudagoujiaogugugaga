@@ -182,10 +182,16 @@ def seed(
 
 
 
-def test_payment_confirmation_requires_confirmed_guard(database) -> None:
+def test_payout_card_requires_a_dispatched_guard(database) -> None:
+    """绿色「提现已提交」卡必须有一条**发出去了**的资金记录。
+
+    2026-09-23 删掉回读之后,「发出去了」= 系统看到点击返回(SUBMITTED)或人工结案
+    (CONFIRMED)。原来这张卡只认 CONFIRMED,于是每一笔成功提现发的都是
+    「这不代表提现成功」。
+    """
     run_id, _ = seed(database, status="SUCCEEDED")
     builder = DatabaseNoticeBuilder(database)
-    assert builder.build(run_id, NotificationKind.PAYMENT_CONFIRMED) is None
+    assert builder.build(run_id, NotificationKind.PAYMENT_SUBMITTED) is None
 
     with database() as session:
         run = session.get(Run, run_id)
@@ -209,7 +215,7 @@ def test_payment_confirmation_requires_confirmed_guard(database) -> None:
         )
         session.commit()
 
-    confirmed = builder.build(run_id, NotificationKind.PAYMENT_CONFIRMED)
+    confirmed = builder.build(run_id, NotificationKind.PAYMENT_SUBMITTED)
     assert confirmed is not None
     assert confirmed.sites[0].outcome == "CONFIRMED"
     assert confirmed.sites[0].reference_suffix == ""
@@ -230,17 +236,17 @@ async def test_delivery_marks_sent_and_same_key_is_a_permanent_noop(database) ->
     sender = Sender()
     service = NotificationDeliveryService(database, sender)
     key = notification_dedupe_key(
-        run_id, NotificationKind.PAYMENT_CONFIRMED, site_run_id=site_id
+        run_id, NotificationKind.PAYMENT_SUBMITTED, site_run_id=site_id
     )
     assert await service.deliver(
         run_id,
-        NotificationKind.PAYMENT_CONFIRMED,
+        NotificationKind.PAYMENT_SUBMITTED,
         dedupe_key=key,
         site_run_id=site_id,
     )
     assert not await service.deliver(
         run_id,
-        NotificationKind.PAYMENT_CONFIRMED,
+        NotificationKind.PAYMENT_SUBMITTED,
         dedupe_key=key,
         site_run_id=site_id,
     )
@@ -309,7 +315,7 @@ async def test_mismatched_database_fact_is_not_sent(database) -> None:
 
     sender = Sender()
     service = NotificationDeliveryService(database, sender)
-    assert not await service.deliver(run_id, NotificationKind.PAYMENT_CONFIRMED)
+    assert not await service.deliver(run_id, NotificationKind.PAYMENT_SUBMITTED)
     assert sender.called is False
     with database() as session:
         assert session.scalar(select(NotificationDelivery)) is None
@@ -422,7 +428,9 @@ async def test_engine_adapter_silent_statuses_and_routes_success_by_database_gua
     )
     assert len(sender.notices) == 1
     assert sender.notices[0].kind is NotificationKind.RUN_COMPLETED
-    assert "不代表提现成功" in sender.notices[0].summary
+    # 没有任何资金记录的成功运行:一笔都没发出去,卡上就这么说。
+    # (原来钉的是「不代表提现成功」—— 删回读之后那句会被贴到每一笔成功提现上。)
+    assert "本次没有发出提现请求" in sender.notices[0].summary
 
     with database() as session:
         zero = session.get(Run, zero_run_id)
@@ -473,7 +481,7 @@ async def test_engine_adapter_silent_statuses_and_routes_success_by_database_gua
         WorkflowReport(confirmed_run_id, RunStatus.SUCCEEDED, "ignored", "ignored")
     )
     assert len(sender.notices) == 2
-    assert sender.notices[1].kind is NotificationKind.PAYMENT_CONFIRMED
+    assert sender.notices[1].kind is NotificationKind.PAYMENT_SUBMITTED
 
 
 @pytest.mark.asyncio
@@ -812,3 +820,41 @@ def test_site_error_beats_the_skip_event_and_loses_its_class_name(database) -> N
     assert notice.sites[0].reason.startswith("确认页收款账户与建档基线不一致")
     assert "PreflightRejected" not in notice.sites[0].reason
     assert "PreflightRejected" not in notice.summary
+
+
+@pytest.mark.asyncio
+async def test_a_successful_payout_card_says_submitted_and_where_to_check(database) -> None:
+    """渲染**真的那张卡**，读它说了什么。
+
+    ⚠️ 2026-09-23 实测：删回读之后，一笔成功提现发出去的卡标题是
+    「任务检查已完成（非提现确认）」、正文「这不代表提现成功」—— 与运营拍板的口径
+    「已提交，到账请自行核对」正好相反。只断言 kind 查不出这种错，必须看文字。
+    """
+
+    import json
+
+    from ziniao_automation.notifications.feishu import _card_content
+
+    run_id, _ = seed(database, status="SUCCEEDED", guard_state="SUBMITTED")
+
+    class Sender:
+        def __init__(self) -> None:
+            self.notices: list[SafeRunNotice] = []
+
+        async def send(self, notice: SafeRunNotice) -> None:
+            self.notices.append(notice)
+
+    sender = Sender()
+    adapter = DatabaseNotificationAdapter(NotificationDeliveryService(database, sender))
+    await adapter.send(WorkflowReport(run_id, RunStatus.SUCCEEDED, "ignored", "ignored"))
+
+    payout = [n for n in sender.notices if n.kind is NotificationKind.PAYMENT_SUBMITTED]
+    assert len(payout) == 1
+    card = json.loads(_card_content(payout[0]))
+    text = json.dumps(card, ensure_ascii=False)
+
+    assert card["header"]["template"] == "green"
+    assert "提现已提交" in text
+    assert "卖家后台核对" in text
+    for lie in ("不代表提现成功", "非提现确认", "回读"):
+        assert lie not in text, lie

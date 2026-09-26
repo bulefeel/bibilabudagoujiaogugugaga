@@ -32,12 +32,14 @@ from .models import (
     OperationGuard,
     Run,
     RunQueueEntry,
+    SiteRun,
     Store,
     SystemSetting,
     ZiniaoAccount,
 )
 from .presentation_time import format_display_datetime, to_display_datetime
 from .repositories import (
+    ACTIVE_RUN_STATUSES,
     ConflictError,
     DashboardRepository,
     NotFoundError,
@@ -56,6 +58,7 @@ from .schemas import (
     LoginInput,
     MarketplaceSetupInput,
     RunCreate,
+    WebdriverStart,
     RunView,
     ScheduleCreate,
     ScheduleDeleteView,
@@ -86,6 +89,8 @@ from .workflows.amazon_feedback.review_store import (
     TERMINAL_STATES as FEEDBACK_TERMINAL_STATES,
 )
 from .workflows.errors import WorkflowNotRegistered
+from .workflows.engine import run_status_from_facts
+from .workflows.types import UNSETTLED_GUARD_STATES
 from .ziniao.credentials import (
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
@@ -141,7 +146,6 @@ class AutomationService(Protocol):
     async def approve_run(self, run_id: str, approval_id: str | None = None, *, actor: str = "admin") -> None: ...
     async def continue_auth(self, run_id: str) -> None: ...
     async def cancel_run(self, run_id: str) -> None: ...
-    async def reconcile_run(self, run_id: str) -> None: ...
 
 
 def _interval_label(minutes: Any) -> str:
@@ -237,9 +241,6 @@ class UnconfiguredAutomationService:
     async def cancel_run(self, run_id: str) -> None:
         raise RuntimeError("自动化运行服务尚未配置")
 
-    async def reconcile_run(self, run_id: str) -> None:
-        raise RuntimeError("自动化运行服务尚未配置")
-
 
 def _resolved_classifier_endpoint() -> dict[str, Any] | None:
     """Non-secret description of where reason judgement is sent, or None."""
@@ -253,19 +254,19 @@ def _resolved_classifier_endpoint() -> dict[str, Any] | None:
 
 STATUS_LABELS = {
     "QUEUED": "排队中", "RUNNING": "执行中", "WAITING_APPROVAL": "待审核",
-    "WAITING_AUTH": "等待人工验证", "RECONCILING": "回读核对",
+    "WAITING_AUTH": "等待人工验证", "RECONCILING": "资金收口中",
     "SUCCEEDED": "已完成", "PARTIAL": "部分完成", "FAILED": "失败", "CANCELLED": "已取消",
     "SKIPPED": "已跳过", "NEEDS_HUMAN_AUTH": "需要人工验证",
     # Site-level states that had no label and rendered as raw English.
     "PREFLIGHT": "读取中", "PLANNED": "已列入计划", "DRY_RUN_COMPLETE": "只读检查完成",
-    "UNCERTAIN_FINANCIAL": "已发出，平台尚未显示", "PENDING": "待处理",
+    "UNCERTAIN_FINANCIAL": "资金结果待人工核对", "PENDING": "待处理",
     "APPROVED": "已批准", "CONFIRMED": "已确认", "ARMED": "已锁定",
-    "SUBMITTED": "已提交", "UNCERTAIN": "已发出，平台尚未显示", "INVALIDATED": "已失效",
+    "SUBMITTED": "已提交", "UNCERTAIN": "待人工核对", "INVALIDATED": "已失效",
     "EXPIRED": "已过期",
 }
 
 # Feedback entries need their own words.  Sharing STATUS_LABELS would render
-# UNCERTAIN as "已发出，平台尚未显示", which is about money leaving the account.
+# UNCERTAIN as "待人工核对", which is about a payout nobody can vouch for.
 FEEDBACK_STATE_LABELS = {
     "PENDING": "待提交",
     "NEEDS_HUMAN": "待人工",
@@ -290,7 +291,7 @@ QUEUE_ACTION_LABELS = {
     "START": "开始任务",
     "APPROVE": "批准后继续",
     "CONTINUE_AUTH": "验证后继续",
-    "RECONCILE": "资金回读",
+    "RECONCILE": "资金收口",
 }
 
 
@@ -394,15 +395,25 @@ def create_app(
             init_database(engine, backup_dir=settings.backup_dir)
         runtime = None
         try:
-            if runtime_factory is not None:
-                runtime = runtime_factory(settings, sessions)
-                app.state.runtime = runtime
-                app.state.automation_service = runtime.automation_service
-                app.state.schedule_manager = runtime.schedule_manager
-                runtime_registry = getattr(runtime, "workflow_registry", None)
-                if runtime_registry is not None:
-                    app.state.workflow_registry = runtime_registry
-                await runtime.start()
+            try:
+                if runtime_factory is not None:
+                    runtime = runtime_factory(settings, sessions)
+                    app.state.runtime = runtime
+                    app.state.automation_service = runtime.automation_service
+                    app.state.schedule_manager = runtime.schedule_manager
+                    runtime_registry = getattr(runtime, "workflow_registry", None)
+                    if runtime_registry is not None:
+                        app.state.workflow_registry = runtime_registry
+                    await runtime.start()
+            except BaseException:
+                # ⚠️ 启动失败时 uvicorn 只会打一句「Application startup failed.
+                # Exiting.」,而 runner.last_error 取的是最后一条 ERROR ——
+                # 于是启动器和 Start.bat 对**每一种**启动失败都显示那一句,真正的
+                # 原因(端口被占、库锁、凭据引用失效……)一个字都看不到
+                # (2026-09-26 自审)。这里先把它记下来,logger.exception 会经
+                # RedactionFilter 产出 exception_type/message,脱敏照旧。
+                logger.exception("service_startup_failed")
+                raise
             yield
         finally:
             if runtime is not None:
@@ -612,8 +623,7 @@ def create_app(
     def dashboard(request: Request, db: Session = Depends(get_session)) -> Response:
         data = DashboardRepository(db).summary()
         runs = WorkflowRepository(db).list_runs(limit=8)
-        guards = WorkflowRepository(db).list_guards(states=("UNCERTAIN", "ARMED", "SUBMITTED"))
-        return render(request, "dashboard.html", {"summary": data, "runs": runs, "guards": guards}, db=db, page_title="今日总览")
+        return render(request, "dashboard.html", {"summary": data, "runs": runs}, db=db, page_title="今日总览")
 
     @app.get("/stores", response_class=HTMLResponse)
     def stores_page(request: Request, db: Session = Depends(get_session)) -> Response:
@@ -763,6 +773,7 @@ def create_app(
             "run_detail.html",
             {
                 "run": run,
+                "run_is_active": run.status in ACTIVE_RUN_STATUSES,
                 "guards": guards,
                 "workflow_meta": definitions.get(run.workflow),
                 "feedback_reviews": feedback_reviews,
@@ -1143,15 +1154,20 @@ def create_app(
 
     @api.post("/ziniao/webdriver/start", status_code=200)
     async def start_webdriver_mode(
+        payload: WebdriverStart,
         request: Request,
         _: AuthenticatedAdmin = Depends(verified_admin),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         """Put Ziniao into WebDriver mode, which force-closes its open windows.
 
-        Refused outright while a run holds the browser or an ARMED/SUBMITTED
-        guard is outstanding — see ``webdriver_mode.describe_blockers``.  The
-        service answers 409 in that case and kills nothing.
+        Refused while a run holds the browser or an ARMED guard (click not yet
+        returned) is outstanding — see ``webdriver_mode.describe_blockers``.  The service
+        answers 409 in that case and kills nothing.
+
+        ``force`` 越过那些理由。它是**显式的第二次点击**，界面只在收到 409 之后
+        才把那颗按钮露出来 —— 前两类阻止是本进程内的锁，关掉浏览器清不掉，
+        卡住时除了重启服务没有别的出路。越过的内容会写进 WARNING 日志。
         """
 
         starter = getattr(
@@ -1161,7 +1177,7 @@ def create_app(
             raise HTTPException(503, "紫鸟运行服务尚未配置")
         _release_before_automation(db)
         try:
-            result = await starter()
+            result = await starter(force=payload.force)
         except RuntimeError as exc:
             raise HTTPException(503, str(exc)) from exc
         if not isinstance(result, dict):
@@ -1866,8 +1882,27 @@ def create_app(
             raise HTTPException(503, "自动化运行服务尚未配置")
         store = StoreRepository(db).get(payload.store_id)
         requested_input = payload.marketplace_codes
-        if requested_input is None and not payload.workflow_config:
-            requested_input = [m.code for m in store.marketplaces if m.enabled]
+        registry = active_workflow_registry(request)
+        # 未注册的流程留给 normalise_workflow_input 按 422 拒绝。
+        if (
+            requested_input is None
+            and not payload.workflow_config
+            and payload.workflow in registry.names()
+        ):
+            # 没指定站点时取「已启用且这个流程能跑」的那些。只取「已启用」的话，
+            # 迁移 0010 给每家店补的 DE 会让提现/反馈的「发起检查」一律 422。
+            supported = registry.definition(payload.workflow).supported_marketplace_codes()
+            requested_input = [
+                m.code for m in store.marketplaces if m.enabled and m.code in supported
+            ]
+            if supported and not requested_input:
+                # 发起检查的对话框里没有站点选择框,「请至少选择一个站点」让人无从下手。
+                raise HTTPException(
+                    422,
+                    "该店铺没有启用这个流程支持的站点（支持："
+                    + "、".join(sorted(supported))
+                    + "），请先在店铺设置里启用",
+                )
         config, version, codes = normalise_workflow_input(
             request,
             workflow=payload.workflow,
@@ -1951,19 +1986,6 @@ def create_app(
             raise HTTPException(409, str(exc)) from exc
         return {"status": "queued"}
 
-    @api.post("/runs/{run_id}/reconcile", status_code=202)
-    async def api_reconcile_run(run_id: str, request: Request, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
-        repository = WorkflowRepository(db)
-        repository.get_run(run_id)
-        if not repository.has_financial_guard(run_id):
-            raise HTTPException(409, "该任务没有需要回读的资金操作")
-        _release_before_automation(db)
-        try:
-            await request.app.state.automation_service.reconcile_run(run_id)
-        except RuntimeError as exc:
-            raise HTTPException(409, str(exc)) from exc
-        return {"status": "queued"}
-
     @api.post("/runs/{run_id}/guards/{guard_key}/release", status_code=200)
     async def api_release_guard(run_id: str, guard_key: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
         """Clear a money guard for which no dispatch was ever recorded.
@@ -1992,6 +2014,15 @@ def create_app(
             raise HTTPException(409, "该资金记录已派发过提现点击，不可释放")
         if guard.state not in ("ARMED", "UNCERTAIN"):
             raise HTTPException(409, f"资金记录当前为 {guard.state}，不可释放")
+        # ⚠️ 任务还在跑时,ARMED 可能正处在「已锁定、点击还没返回」的那十几秒里。
+        # 这时删掉记录,点击照样会发出去,而它唯一的记录已经没了 —— 之后连
+        # 「已提交」都写不进去(09-23 自审复核)。等任务结束再裁定。
+        run_status = db.scalar(select(Run.status).where(Run.id == run_id))
+        if run_status in ACTIVE_RUN_STATUSES:
+            raise HTTPException(
+                409,
+                f"任务还在进行中（{run_status}），这一笔可能正在提交；等任务结束后再裁定",
+            )
         marketplace_code, amount, currency = (
             guard.marketplace_code,
             guard.amount,
@@ -2006,6 +2037,9 @@ def create_app(
         if not deleted:
             db.rollback()
             raise HTTPException(409, "资金记录状态已变化，未执行释放")
+        # 释放 = 操作员断定这一下没点下去。站点行留在「已锁定 / 待人工核对」的话,
+        # 之后每一张卡都还把它算成待办(2026-09-26 自审)。
+        _sync_site_after_verdict(db, run_id, marketplace_code, "CANCELLED")
         repository.append_event(
             run_id,
             "operation_released",
@@ -2026,15 +2060,13 @@ def create_app(
 
     @api.post("/runs/{run_id}/guards/{guard_key}/acknowledge", status_code=200)
     async def api_acknowledge_guard(run_id: str, guard_key: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
-        """Settle a dispatched operation that the read-back can never resolve.
+        """Close out a dispatched operation after a person checked Seller Central.
 
         The mirror image of ``release``.  That one covers "the click never
-        happened"; this one covers "the click happened and Amazon never
-        published it".  Amazon frequently does not show a disbursement in the
-        statements page until the next day, so an automatic read-back bounded
-        to about a minute structurally cannot close such a row — it stayed
-        UNCERTAIN for ever, kept its run pinned, and no operator action existed
-        to end it.
+        happened"; this one covers "the click happened".  The automatic
+        read-back that used to try this was removed on 2026-09-23 (Amazon often
+        shows a disbursement only the next day, so a one-minute read-back
+        structurally could not close such a row).
 
         The verdict here is the human's, not the system's: only a person who
         has looked at Seller Central knows.  ``receipt_id`` is therefore left
@@ -2055,36 +2087,56 @@ def create_app(
         )
         if guard is None:
             raise HTTPException(404, "找不到该资金记录")
-        if guard.state != "UNCERTAIN":
+        # SUBMITTED 也要放行:2026-09-23 删掉联网回读之后,已派发的记录停在
+        # SUBMITTED 而不再转成 UNCERTAIN。只认 UNCERTAIN 的话,新记录永远没有
+        # 人工出口,而那 43 笔存量(UNCERTAIN)仍然走得通。
+        #
+        # ⚠️ **不看 ``submitted_at``**。它为空只说明「系统没记录到点击返回」——
+        # 点击之后、写 SUBMITTED 之前服务被停掉,就是这个样子,而钱可能已经发出去了。
+        # 原来这里要求它非空,于是操作员在卖家后台看到了这笔,页面却只给
+        # 「确认未发出，释放」—— 一个与事实相反的选项(09-23 自审复核)。
+        # 结案只是改状态、不删行;释放不接受 CONFIRMED,所以不会弱化「已派发不可删」。
+        # ARMED 分两种:任务还在跑 —— 那一下可能正在点,不许替它下结论;任务已经
+        # 结束(例如点击之后流程抛了异常,运行停在 UNCERTAIN_FINANCIAL)—— 它就是
+        # 一条「说不清」的记录,和 UNCERTAIN 一样由人凭卖家后台裁定。原来这里一律
+        # 拒绝、叫人「等收口」,而收口只在重启时才跑,操作员手上只剩「释放」
+        # (09-23 第二轮复核)。
+        if guard.state == "ARMED":
+            run_status = db.scalar(select(Run.status).where(Run.id == run_id))
+            if run_status in ACTIVE_RUN_STATUSES:
+                raise HTTPException(
+                    409,
+                    f"任务还在进行中（{run_status}），这一笔可能正在提交；等任务结束后再核对",
+                )
+        elif guard.state not in ("SUBMITTED", "UNCERTAIN"):
             raise HTTPException(409, f"资金记录当前为 {guard.state}，无需人工裁定")
-        if guard.submitted_at is None:
-            raise HTTPException(
-                409, "该资金记录没有派发过提现点击，请改用「确认从未发出」释放"
-            )
         marketplace_code, amount, currency = (
             guard.marketplace_code,
             guard.amount,
             guard.currency,
         )
-        # Merge, never replace: the existing metadata holds why the read-back
-        # gave up, which is the audit trail this decision was made against.
+        # Merge, never replace: the existing metadata is the audit trail this
+        # decision was made against.
         merged = dict(guard.metadata_json or {})
         merged["closed_by"] = "operator"
         changed = repository.transition_guard(
             guard.id,
-            expected_states=("UNCERTAIN",),
+            expected_states=("ARMED", "SUBMITTED", "UNCERTAIN"),
             to_state="CONFIRMED",
             metadata=merged,
         )
         if not changed:
             db.rollback()
             raise HTTPException(409, "资金记录状态已变化，未执行确认")
+        # 站点行也要跟着走。只改 guard 的话,运行结束后站点徽章仍写「资金结果待人工
+        # 核对」、卡片仍把它列成「待人工核对」,而人早就裁定完了(2026-09-26 自审)。
+        _sync_site_after_verdict(db, run_id, marketplace_code, "CONFIRMED")
         repository.append_event(
             run_id,
             "operation_acknowledged",
             message=(
-                f"操作员在亚马逊后台人工确认 {marketplace_code} 的转账确实发生，"
-                "本条资金记录结案；系统本身并未回读到该记录"
+                f"操作员在亚马逊卖家后台人工核对 {marketplace_code} 的转账确实发生，"
+                "本条资金记录结案"
             ),
             details={
                 "guard_key": guard_key,
@@ -2160,38 +2212,49 @@ def create_app(
         guards = list(
             db.scalars(select(OperationGuard).where(OperationGuard.run_id == run_id))
         )
+        # 只有「说不清点没点下去」的记录(ARMED/UNCERTAIN)还需要人裁定。
+        # SUBMITTED 在 2026-09-23 删掉回读之后是成功终态:那一下点击返回过。
         unsettled = sorted(
             {
                 guard.marketplace_code
                 for guard in guards
-                if guard.state in {"ARMED", "SUBMITTED", "UNCERTAIN"}
+                if guard.state in {state.value for state in UNSETTLED_GUARD_STATES}
             }
         )
         if unsettled:
             raise HTTPException(
                 409,
                 "还有资金记录没有裁定：" + "、".join(unsettled)
-                + "。请先对每一条使用「只回读，不重提」，或按核对结果选择"
+                + "。请先去亚马逊卖家后台核对，再按结果选择"
                 "「确认未发出，释放」/「我已在亚马逊核对，结案」。",
             )
-        # Guards are deleted on release and only ever reach CONFIRMED otherwise,
-        # so what survives here is exactly the set of transfers a human vouched
-        # for. Never report SUCCEEDED unless every site of this run is among
-        # them — a released site got no money, and green would say it did.
-        confirmed = [guard for guard in guards if guard.state == "CONFIRMED"]
+        # 释放会删掉记录,所以留下来的就是**确实发出去了**的那几笔:
+        # 系统看到点击返回的(SUBMITTED)和人工结案的(CONFIRMED)。
+        # 终态和引擎收口用**同一个**判据 —— 原来这里按「已派发条数 == 站点行数」算,
+        # 一个因余额为零被跳过的站点就让全额付清的运行变成 PARTIAL,而引擎对
+        # 同一组事实报 SUCCEEDED(09-23 自审复核)。
+        dispatched = [
+            guard for guard in guards if guard.state in {"SUBMITTED", "CONFIRMED"}
+        ]
         site_count = len(run.site_runs)
-        if not confirmed:
+        if not dispatched:
             status = "FAILED"
-        elif site_count and len(confirmed) == site_count:
-            status = "SUCCEEDED"
         else:
-            status = "PARTIAL"
+            status = run_status_from_facts(
+                [(guard.marketplace_code, guard.state) for guard in guards],
+                {site.marketplace_code: site.status for site in run.site_runs},
+            ).value
         changed = repository.set_run_status(
             run_id, status, allowed_from=("UNCERTAIN_FINANCIAL",)
         )
         if not changed:
             db.rollback()
             raise HTTPException(409, "任务状态已变化，未执行收尾")
+        # 和引擎收口一样:还在等 / 还没轮到的站点,就是本次没做的站点。
+        for site in run.site_runs:
+            if site.status in _PARKED_SITE_VALUES:
+                site.status = "CANCELLED"
+                site.error = "任务中断（服务重启或人工收尾），该站点本次未执行"
         repository.append_event(
             run_id,
             "run_settled_by_operator",
@@ -2201,7 +2264,7 @@ def create_app(
             ),
             details={
                 "closed_by": "operator",
-                "confirmed_guards": len(confirmed),
+                "dispatched_guards": len(dispatched),
                 "site_runs": site_count,
             },
         )
@@ -2211,6 +2274,36 @@ def create_app(
     app.include_router(api)
     return app
 
+
+def _sync_site_after_verdict(
+    db: Session, run_id: str, marketplace_code: str, verdict: str
+) -> None:
+    """人工裁定完一条资金记录之后,把它那一行站点状态也带到终态。
+
+    ``verdict`` 只有两种:``CONFIRMED``(结案:确实发出去了)、``CANCELLED``(释放:
+    确认没发出)。只动**还停在资金态**的站点行 —— 已经是别的终态(例如被跳过)的不碰。
+    """
+
+    site = db.scalar(
+        select(SiteRun).where(
+            SiteRun.run_id == run_id, SiteRun.marketplace_code == marketplace_code
+        )
+    )
+    if site is None or site.status not in _MONEY_PENDING_SITE_VALUES:
+        return
+    site.status = verdict
+    site.error = (
+        "操作员在亚马逊卖家后台核对后结案" if verdict == "CONFIRMED"
+        else "操作员确认未发出，已释放资金锁定；本次未提现"
+    )
+
+
+# 还挂着「钱没有结论」的站点态。人工裁定之后它们必须跟着走。
+_MONEY_PENDING_SITE_VALUES = frozenset({"ARMED", "SUBMITTED", "UNCERTAIN_FINANCIAL"})
+# 收尾时「还在等 / 还没轮到」的站点(与 engine._PARKED_SITE_STATUSES 同一组)。
+_PARKED_SITE_VALUES = frozenset(
+    {"PENDING", "PREFLIGHT", "PLANNED", "WAITING_APPROVAL", "WAITING_AUTH"}
+)
 
 def _safe_probe_error(exc: BaseException) -> str:
     """One short line for the operator, with anything secret-shaped removed.

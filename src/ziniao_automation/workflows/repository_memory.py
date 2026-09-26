@@ -87,6 +87,14 @@ class InMemoryWorkflowRepository:
         async with self._lock:
             return self.sites.get((run_id, marketplace_code))
 
+    async def list_site_statuses(self, run_id: str) -> dict[str, SiteStatus]:
+        async with self._lock:
+            return {
+                code: status
+                for (owner, code), status in self.sites.items()
+                if owner == run_id
+            }
+
     async def save_site_snapshot(
         self,
         run_id: str,
@@ -220,7 +228,7 @@ class InMemoryWorkflowRepository:
                 state=target,
                 created=False,
                 receipt_id=receipt_id or old.receipt_id,
-                last_reconciled_at=utc_now(),
+                # 与 SQLAlchemy 仓储一致:回读已删除,不再写 last_reconciled_at。
                 details={**dict(old.details), **dict(details or {})},
                 # Stamped once, on the transition that follows the irreversible
                 # click, mirroring the SQLAlchemy repository's column.

@@ -191,9 +191,30 @@ def last_error(settings: Settings | None = None, *, tail_bytes: int = 64_000) ->
         message = " ".join(str(record.get("message") or "").split())
         kind = str(record.get("exception_type") or "").strip()
         detail = str(record.get("exception_message") or "").strip()
+        if _is_generic_lifespan_trailer(message, kind):
+            # ⚠️ uvicorn 在任何启动失败之后都补一句「Application startup failed.
+            # Exiting.」,而这里取的是**最后**一条 ERROR —— 于是启动器和 Start.bat
+            # 对每一种失败都只显示这句,真正的原因(端口被占、库锁、凭据引用失效)
+            # 一个字都看不到(2026-09-26 自审)。跳过它,继续往前找带异常类型的那条。
+            continue
+        # 整段 traceback 会被 Starlette 当成一行 message 交给 uvicorn。日志里留着
+        # 它没有坏处,但**给人看的那一行**要短:只取最后一行(异常那句)。
+        if message.startswith("Traceback (most recent call last)"):
+            message = message.rsplit("  ", 1)[-1].strip() or message[-200:]
         parts = [part for part in (message, kind, detail) if part]
         return " | ".join(parts)[:400]
     return ""
+
+
+def _is_generic_lifespan_trailer(message: str, exception_type: str) -> bool:
+    """uvicorn 在启动/关闭失败后补的那句笼统话,本身不含任何原因。"""
+
+    if exception_type:
+        return False
+    return message in (
+        "Application startup failed. Exiting.",
+        "Application shutdown failed. Exiting.",
+    )
 
 
 def serve() -> int:

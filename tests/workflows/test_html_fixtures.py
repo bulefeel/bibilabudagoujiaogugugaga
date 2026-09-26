@@ -294,9 +294,10 @@ class _DelayedNoDataPage:
         raise AssertionError(selector)
 
     async def wait_for_function(
-        self, expression: str, selectors: dict[str, str], *, timeout: int
+        self, expression: str, *, arg: dict[str, str], timeout: int
     ) -> None:
-        del expression, selectors
+        # 与 Playwright 一致：``arg`` 是关键字参数，见 _Page.wait_for_function 的注释。
+        del expression, arg
         self.wait_calls.append(timeout)
         if len(self.wait_calls) == 1:
             # The first structural wait times out while Amazon is still

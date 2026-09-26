@@ -66,17 +66,20 @@ class Sessions:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("mode", "expected_site_status", "expected_plan_lines"),
+    ("mode", "expected_site_status", "expected_plan_lines", "expected_run_status"),
     (
-        (RunMode.DRY_RUN, SiteStatus.DRY_RUN_COMPLETE, 1),
-        (RunMode.APPROVAL, SiteStatus.SKIPPED, 0),
-        (RunMode.AUTO, SiteStatus.SKIPPED, 0),
+        (RunMode.DRY_RUN, SiteStatus.DRY_RUN_COMPLETE, 1, RunStatus.SUCCEEDED),
+        # 站点全部跳过 → 任务是 SKIPPED（蓝卡「本次没有站点发起提现」），
+        # 不是 SUCCEEDED。见 engine 里空计划那一段的注释。
+        (RunMode.APPROVAL, SiteStatus.SKIPPED, 0, RunStatus.SKIPPED),
+        (RunMode.AUTO, SiteStatus.SKIPPED, 0, RunStatus.SKIPPED),
     ),
 )
 async def test_all_modes_persist_read_financials_for_database_notice(
     mode: RunMode,
     expected_site_status: SiteStatus,
     expected_plan_lines: int,
+    expected_run_status: RunStatus,
 ) -> None:
     engine = create_engine(
         "sqlite+pysqlite:///:memory:",
@@ -155,7 +158,7 @@ async def test_all_modes_persist_read_financials_for_database_notice(
 
     result = await service.start(run)
 
-    assert result.status is RunStatus.SUCCEEDED
+    assert result.status is expected_run_status
     assert len(result.plan.lines) == expected_plan_lines
     with factory() as session:
         site = session.scalar(select(SiteRun).where(SiteRun.run_id == run_id))
@@ -171,9 +174,15 @@ async def test_all_modes_persist_read_financials_for_database_notice(
             select(OperationGuard).where(OperationGuard.run_id == run_id)
         ) is None
 
-    notice = DatabaseNoticeBuilder(factory).build(
-        run_id, NotificationKind.RUN_COMPLETED
+    # ⚠️ 卡片种类必须和任务的真实状态一致：``DatabaseNoticeBuilder`` 会拒绝为一个
+    # SKIPPED 的任务生成 RUN_COMPLETED 卡（那道护栏本来就是防止「把普通成功包装成
+    # 绿色付款卡」的）。站点全部跳过的那两个模式要问的是 RUN_SKIPPED。
+    notice_kind = (
+        NotificationKind.RUN_SKIPPED
+        if expected_run_status is RunStatus.SKIPPED
+        else NotificationKind.RUN_COMPLETED
     )
+    notice = DatabaseNoticeBuilder(factory).build(run_id, notice_kind)
     assert notice is not None
     assert len(notice.sites) == 1
     assert notice.sites[0].code == "CA"

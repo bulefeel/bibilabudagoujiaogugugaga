@@ -14,6 +14,14 @@ from ziniao_automation.ziniao.locks import ExecutionLocks
 from ziniao_automation.ziniao.models import CdpHealth, ProfileSelector, ZiniaoBrowserHandle
 
 
+class _ClosablePage:
+    def __init__(self, closed: bool = False) -> None:
+        self.closed = closed
+
+    def is_closed(self) -> bool:
+        return self.closed
+
+
 class FakeClient:
     def __init__(self, ports: list[int]):
         self.config = SimpleNamespace(host="127.0.0.1", port=16851)
@@ -69,7 +77,7 @@ class FakeSessions:
             debugging_port=port,
             browser=object(),
             context=object(),
-            page=object(),
+            page=_ClosablePage(),
             health=base_health,
             launch_proof=launch_proof,
             _close_callback=close,
@@ -505,3 +513,92 @@ async def test_bounded_cleanup_accepts_completion_at_timeout_boundary(
 
     assert finished is True
     assert value == "acquired"
+
+
+class _ReplacingContext:
+    """紫鸟的持久化上下文：标签页换了，代理/指纹/会话都还在它里面。"""
+
+    def __init__(self, pages: list[_ClosablePage] | None = None) -> None:
+        self.new_pages = 0
+        # 和 Playwright 的 ``BrowserContext.pages`` 一样：上下文里现有的全部标签页。
+        self.pages: list[_ClosablePage] = list(pages or [])
+
+    async def new_page(self) -> _ClosablePage:
+        self.new_pages += 1
+        page = _ClosablePage()
+        self.pages.append(page)
+        return page
+
+
+def _handle_with(page: _ClosablePage, context: _ReplacingContext) -> ZiniaoBrowserHandle:
+    return ZiniaoBrowserHandle(
+        selector=ProfileSelector("oauth", "probe"),
+        debugging_host="127.0.0.1",
+        debugging_port=9222,
+        browser=object(),
+        context=context,
+        page=page,
+        health=CdpHealth(reachable=True, instrumentation_live=True, issues=()),
+        launch_proof=SimpleNamespace(nonce="n"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_surviving_tab_is_reused_after_a_pause() -> None:
+    """没坏就别换：换掉等于白白丢弃当前页面状态。"""
+
+    page = _ClosablePage(closed=False)
+    context = _ReplacingContext()
+    handle = _handle_with(page, context)
+
+    assert await handle.ensure_live_page() is page
+    assert handle.page is page
+    assert context.new_pages == 0
+
+
+@pytest.mark.asyncio
+async def test_a_tab_closed_during_the_pause_is_replaced_in_the_same_context() -> None:
+    """人工验证可能持续几十分钟，紫鸟会自己把标签页换掉。
+
+    把原来那个 ``Page`` 还给流程，下一次导航就是
+    ``TargetClosedError: Page.goto``——人刚完成的验证被整个丢掉。
+    新标签页必须开在**同一个**持久化上下文里，否则代理与登录态一起没了。
+    """
+
+    context = _ReplacingContext()
+    handle = _handle_with(_ClosablePage(closed=True), context)
+
+    replaced = await handle.ensure_live_page()
+
+    assert replaced is handle.page
+    assert not replaced.is_closed()
+    assert context.new_pages == 1
+
+
+@pytest.mark.asyncio
+async def test_a_tab_still_alive_in_the_context_is_preferred_over_opening_one() -> None:
+    """紫鸟会把自动化新开的标签页当场关掉；上下文里还有活页就用它，别再开。
+
+    取最后一个活页：人工验证通常就是在最新的那一页上完成的。
+    """
+
+    dead = _ClosablePage(closed=True)
+    older = _ClosablePage(closed=False)
+    newest = _ClosablePage(closed=False)
+    context = _ReplacingContext([older, dead, newest])
+    handle = _handle_with(dead, context)
+
+    assert await handle.ensure_live_page() is newest
+    assert handle.page is newest
+    assert context.new_pages == 0
+
+
+@pytest.mark.asyncio
+async def test_a_closed_handle_refuses_to_produce_a_page() -> None:
+    """句柄已关闭时响亮失败，而不是悄悄开一个没人负责关的标签页。"""
+
+    handle = _handle_with(_ClosablePage(closed=True), _ReplacingContext())
+    handle._closed = True
+
+    with pytest.raises(RuntimeError, match="closed browser handle"):
+        await handle.ensure_live_page()

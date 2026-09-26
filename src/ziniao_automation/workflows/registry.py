@@ -12,7 +12,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 import re
-from typing import Any
+from typing import Any, get_args
 
 from pydantic import BaseModel, ConfigDict
 
@@ -201,6 +201,20 @@ class WorkflowDefinition:
         """Return a JSON-safe, canonical configuration snapshot."""
 
         return self.validate_config(value).model_dump(mode="json")
+
+    def supported_marketplace_codes(self) -> frozenset[str]:
+        """这个流程能跑的站点 —— 直接取配置模型 ``marketplace_codes`` 的 ``Literal``。
+
+        不另外维护一份清单：配置模型本身就是校验依据，两份一定会漂。
+        没有这个字段的流程返回空集。
+        """
+
+        field = self.config_model.model_fields.get("marketplace_codes")
+        if field is None:
+            return frozenset()
+        # tuple[Literal["CA", "UK", "AU"], ...] → Literal[...] → "CA", "UK", "AU"
+        (literal, *_rest) = get_args(field.annotation) or (None,)
+        return frozenset(str(code) for code in get_args(literal))
 
     def to_public_dict(self) -> dict[str, Any]:
         """Serialize only the fixed, non-sensitive frontend contract."""

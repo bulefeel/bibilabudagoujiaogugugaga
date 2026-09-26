@@ -108,7 +108,12 @@ class StoreMarketplace(TimestampMixin, Base):
 
     __table_args__ = (
         UniqueConstraint("store_id", "code", name="uq_store_marketplace_code"),
-        CheckConstraint("code IN ('CA', 'UK', 'AU')", name="ck_v1_marketplace_code"),
+        # 迁移 0010 把 DE 加了进来。这里**故意保留 CHECK 而不是删掉**：SQLite 改
+        # CHECK 只能整表重建，今天加和以后加成本一样，但「以后再说」的结果通常是
+        # 永远没有约束。白名单本身在 repositories.V1_MARKETPLACES，两处必须同步。
+        CheckConstraint(
+            "code IN ('CA', 'UK', 'AU', 'DE')", name="ck_v1_marketplace_code"
+        ),
         CheckConstraint("length(currency) = 3", name="ck_marketplace_currency"),
     )
 

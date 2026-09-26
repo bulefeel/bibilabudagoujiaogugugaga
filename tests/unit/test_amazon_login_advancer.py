@@ -26,6 +26,11 @@ class _Element:
     click_times: list[int] = field(default_factory=list)
     on_click: object | None = None
     closest_a_button_classes: set[str] | None = None
+    # Text of the node ``aria-labelledby`` points at.  Amazon's ``a-button``
+    # keeps its label there, on an ``aria-hidden`` sibling span, and leaves the
+    # real control with no label/value/aria-label and (being an ``<input>``) no
+    # inner text at all.
+    labelled_text: str = ""
     page: object | None = field(default=None, repr=False)
 
     async def get_attribute(self, name: str):
@@ -48,7 +53,9 @@ class _Element:
             and "visibility:hidden" not in style
         )
 
-    async def evaluate(self, expression: str) -> bool:
+    async def evaluate(self, expression: str):
+        if "aria-labelledby" in expression:
+            return self.labelled_text if self.attrs.get("aria-labelledby") else ""
         if "__ziniaoAutomationOtpStabilityV1" in expression:
             page = self.page
             assert page is not None
@@ -214,11 +221,15 @@ class _Page:
     async def wait_for_function(
         self,
         expression: str,
-        argument: dict[str, str],
         *,
+        arg: dict[str, str],
         polling: int,
         timeout: int,
     ) -> None:
+        # ⚠️ 签名必须与 playwright.async_api.Page.wait_for_function 一致：``arg``
+        # 是关键字参数。这个替身曾把它写成位置参数，于是生产代码里写错的调用在
+        # 测试里畅通无阻，真机上却每次 TypeError——两个等待窗口从未生效。
+        argument = arg
         del expression
         self.function_waits.append(
             {
@@ -2391,7 +2402,7 @@ async def test_managed_passkey_wait_timeout_uses_strict_password_fallback() -> N
     assert page.waits == [250, 250, 1500]
     assert ordinary_login.clicks == 1
     assert context.clicks == 0
-    # Initial probe + two late-popup polls + click-time no-popup revalidation.
+    # 初次分类探测 + 两次迟到弹窗轮询 + 点击前复查。
     assert len(context.sessions) == 4
 
 
@@ -3970,3 +3981,242 @@ def test_the_statements_page_counts_as_a_login_destination() -> None:
     assert not AmazonLoginAdvancer.is_supported_business_url(
         f"https://{host}/payments/allstatements/evil.html", expected_host=host
     )
+
+
+def _a_button_continue(label: str = "繼續") -> _Element:
+    """Amazon's real ``a-button`` continue control, as measured on a live page.
+
+    ``<span class="a-button" id="continue">``
+    ``  <span class="a-button-inner">``
+    ``    <input id="continue" class="a-button-input" type="submit"``
+    ``           aria-labelledby="continue-announce">``
+    ``    <span id="continue-announce" class="a-button-text"``
+    ``          aria-hidden="true">繼續</span>``
+
+    The control carries no ``label``, no ``value``, no ``aria-label``, and an
+    ``<input>`` has no inner text — so ``aria-labelledby`` is its only name.
+    """
+
+    return _Element(
+        "input",
+        {
+            "id": "continue",
+            "type": "submit",
+            "class": "a-button-input",
+            "aria-labelledby": "continue-announce",
+        },
+        labelled_text=label,
+    )
+
+
+@pytest.mark.asyncio
+async def test_continue_control_is_named_by_aria_labelledby() -> None:
+    """A login page whose button is named only by reference must still advance.
+
+    正香's German store parked on this exact markup: the button was visible and
+    enabled, yet every label source the advancer read came back empty, so it
+    reported "登录操作按钮缺失、禁用或不唯一" and handed a working page to a human.
+    """
+
+    button = _a_button_continue()
+    page = _Page("https://sellercentral.amazon.de/ap/signin", [button])
+    advancer = _advancer()
+
+    resolved = await advancer._unique_action_control(
+        page, "continue", expected_host="sellercentral.amazon.de"
+    )
+
+    assert resolved is button
+
+
+@pytest.mark.asyncio
+async def test_aria_labelledby_name_must_still_match_the_expected_action() -> None:
+    """Reading the reference must not degrade into "click whatever is there"."""
+
+    page = _Page(
+        "https://sellercentral.amazon.de/ap/signin",
+        [_a_button_continue("取消")],
+    )
+
+    with pytest.raises(HumanAuthRequired, match="按钮缺失、禁用或不唯一"):
+        await _advancer()._unique_action_control(
+            page, "continue", expected_host="sellercentral.amazon.de"
+        )
+
+
+@pytest.mark.asyncio
+async def test_disagreeing_label_sources_still_refuse_the_click() -> None:
+    """Ambiguity stays fail-closed: a new source must not become a tie-breaker."""
+
+    conflicted = _a_button_continue()
+    conflicted.attrs["aria-label"] = "取消"
+    page = _Page("https://sellercentral.amazon.de/ap/signin", [conflicted])
+
+    assert await _advancer()._control_label(conflicted) == ""
+    with pytest.raises(HumanAuthRequired, match="按钮缺失、禁用或不唯一"):
+        await _advancer()._unique_action_control(
+            page, "continue", expected_host="sellercentral.amazon.de"
+        )
+
+
+@pytest.mark.asyncio
+async def test_every_label_source_alone_names_the_control() -> None:
+    """The invariant: any single populated source is a usable name.
+
+    Asserting one source would have passed before this change too — the bug was
+    precisely that one source was missing from the set.
+    """
+
+    sources = {
+        "label": lambda el: el.attrs.__setitem__("label", "繼續"),
+        "value": lambda el: el.attrs.__setitem__("value", "繼續"),
+        "aria-label": lambda el: el.attrs.__setitem__("aria-label", "繼續"),
+        "aria-labelledby": lambda el: None,  # already set by the fixture
+        "inner_text": lambda el: setattr(el, "text", "繼續"),
+    }
+    for name, apply in sources.items():
+        element = _a_button_continue()
+        if name != "aria-labelledby":
+            element.attrs.pop("aria-labelledby")
+            element.labelled_text = ""
+        apply(element)
+        assert await _advancer()._control_label(element) == "繼續", name
+
+
+@pytest.mark.asyncio
+async def test_managed_passkey_appearing_before_the_click_reclassifies() -> None:
+    """分类之后、点击之前冒出托管 Passkey，要改走那条路，而不是转人工。
+
+    分类与点击之间至少隔着两段会改变页面的等待：2–3 秒的 pacing，以及最长 15 秒的
+    密码 prefill 轮询。紫鸟常在这期间才把对话框注入进来，于是分类交出的
+    ``password_signin`` 过期，点击前的复查看到对话框就拒绝——两边对同一个页面给出
+    相反结论，唯一出口变成转人工，可实际上该走的路就在旁边。
+
+    ⚠️ 判据钉的是**转移**，不是某一段等待：修法必须是「本轮不点、回去重新分类」，
+    而不是在每个等待点后面各补一次探测。第一版补丁只堵了 prefill 那段，pacing 那段
+    照样能把同一件事判死——那是打地鼠，不是修状态机。
+
+    2026-09-18 正香德国站实测到的就是这一幕；在那之前它一直被另一个 bug 盖着
+    （``_wait_for_prefill`` 传参写错，从不真正等待，于是在对话框出现前就先报了
+    「紫鸟尚未填好密码」）。
+    """
+
+    ordinary_login = _Element("button", {"id": "signInSubmit"}, text="登录")
+    page = _Page(
+        "https://sellercentral.amazon.co.uk/ap/signin",
+        [_Element("input", {"type": "password"}, value="prefilled"), ordinary_login],
+    )
+    # 第一次探测（分类）看不到对话框；等完 prefill 之后的重探才看到。
+    context = _CDPContext(page, [_empty_cdp_tree(), _managed_passkey_tree()])
+    page.context = context
+
+    result = await _advancer(managed_passkey_wait_timeout_ms=0).advance(
+        page, expected_host="sellercentral.amazon.co.uk"
+    )
+
+    assert result.actions == ("managed_passkey",)
+    assert context.clicks == 1
+    # 关键：绝不能同时去点 Amazon 自己的密码登录按钮。
+    assert ordinary_login.clicks == 0
+
+
+def test_the_account_switcher_counts_as_a_finished_login() -> None:
+    """落到账户/站点切换页 = 登录**成功了**，不是「需要人工」。
+
+    ⚠️ 同一个坑第四次（前三次：结算页、反馈管理页、监管合规性页）。漏掉它的代价
+    在德国站是**换了个面目**出现的：登录三步全过之后找不到业务页，助手报的是
+    「Amazon OTP 已变化、过期或更换输入框」——一句和真实原因毫无关系的话，
+    2026-09-18 正香-张刚CA 实测撞到。
+
+    识别它**不等于**去操作它：登录助手只负责认出「登录已经完成」。选站由调用方
+    做（提现 ``_raise_if_auth``、GPSR ``open_policies``，都用
+    ``amazon_account_switcher``），它们选不掉时转人工或跳过。
+    """
+
+    host = "sellercentral.amazon.de"
+    for path in (
+        "/account-switcher",
+        "/account-switcher/default/merchantMarketplace",
+    ):
+        assert AmazonLoginAdvancer.is_supported_business_url(
+            f"https://{host}{path}"
+            "?returnTo=%2Fperformance%2Faccount%2Fhealth%2Fproduct-policies",
+            expected_host=host,
+        ), path
+
+
+def test_the_switcher_prefix_must_match_a_whole_path_segment() -> None:
+    """前缀匹配不能退化成子串匹配。"""
+
+    host = "sellercentral.amazon.de"
+    for path in ("/account-switcherX", "/evil/account-switcher", "/account-switcherevil"):
+        assert not AmazonLoginAdvancer.is_supported_business_url(
+            f"https://{host}{path}", expected_host=host
+        ), path
+
+
+def _raise(exc: BaseException):
+    def hook(kind: str) -> None:
+        raise exc
+
+    return hook
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "page_side_error",
+    [
+        pytest.param("timeout", id="timeout"),
+        pytest.param("target_closed", id="target_closed"),
+    ],
+)
+async def test_a_page_side_failure_while_waiting_for_prefill_goes_to_a_human(
+    page_side_error,
+) -> None:
+    """等满没填好、标签被关、导航打断 —— 都是 Playwright 自己的异常,都等于
+    「这次没等到紫鸟填好」,交给人。
+
+    ⚠️ 只接 Playwright 的异常(09-23 起)。这里若误写成只接 ``asyncio.TimeoutError``,
+    Playwright 的 TimeoutError 并不是它的子类,最普通的「紫鸟还没填好」会从登录助手里
+    直接漏出去 —— 替身原来从不抛异常,这条路从没被测过(09-23 自审复核)。
+    """
+
+    from playwright.async_api import Error as PlaywrightError
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
+    error = (
+        PlaywrightTimeoutError("Timeout 15000ms exceeded.")
+        if page_side_error == "timeout"
+        else PlaywrightError("Target page, context or browser has been closed")
+    )
+    password = _Element("input", {"type": "password"}, value="")
+    button = _Element(
+        "input", {"id": "signInSubmit", "type": "submit", "value": "Sign in"}
+    )
+    page = _Page("https://sellercentral.amazon.co.uk/ap/signin", [password, button])
+    page.on_wait_for_function = _raise(error)
+
+    with pytest.raises(HumanAuthRequired, match="紫鸟尚未填好 Amazon 登录密码"):
+        await _password_test_advancer().advance(
+            page, expected_host="sellercentral.amazon.co.uk"
+        )
+    assert button.clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_a_programming_error_in_the_prefill_wait_is_not_swallowed() -> None:
+    """当年 ``arg`` 写成位置参数,每次 TypeError 被宽 ``except`` 吞掉、报成
+    「还没填好」,两个等待窗口从未生效、测试全绿。编程错误必须响亮地抛出来。"""
+
+    password = _Element("input", {"type": "password"}, value="")
+    button = _Element(
+        "input", {"id": "signInSubmit", "type": "submit", "value": "Sign in"}
+    )
+    page = _Page("https://sellercentral.amazon.co.uk/ap/signin", [password, button])
+    page.on_wait_for_function = _raise(TypeError("wait_for_function() takes 2 args"))
+
+    with pytest.raises(TypeError):
+        await _password_test_advancer().advance(
+            page, expected_host="sellercentral.amazon.co.uk"
+        )
+    assert button.clicks == 0

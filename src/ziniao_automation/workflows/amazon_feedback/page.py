@@ -20,6 +20,7 @@ import logging
 from typing import Any
 
 from ..errors import DomContractError
+from ..amazon_landing import AmazonLanding
 from .config import (
     FEEDBACK_MANAGER_PATH,
     MAX_RATING_ELIGIBLE_FOR_REMOVAL,
@@ -39,6 +40,10 @@ class ListOutcome:
     rows_loaded: bool = False
     reason: str = ""
     landed_url: str = ""
+    # 选站失败时的具体原因（``SwitchOutcome.reason``），进事件 details。
+    switch_reason: str = ""
+    # ⚠️ 登录助手可能把登录收在**另一个标签**里。后续抓取必须用这个 Page。
+    page: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,12 +413,15 @@ class AmazonFeedbackPage:
         list_timeout_seconds: float = 25.0,
         max_list_pages: int = 20,
         cancel_text: str = "取消",
+        landing: AmazonLanding | None = None,
     ) -> None:
         self.contract = contract or FeedbackDomContract()
         self.settle_seconds = settle_seconds
         self.list_timeout_seconds = list_timeout_seconds
         self.max_list_pages = max_list_pages
         self.cancel_text = cancel_text
+        # 登录、选站、落地判据:三条流程共用一份(见 amazon_landing 模块头部)。
+        self._landing = landing or AmazonLanding(settle_seconds=settle_seconds)
 
     # -- contract payload handed to the browser ---------------------------
     @property
@@ -438,32 +446,38 @@ class AmazonFeedbackPage:
         }
 
     async def open_list(self, page: Any, domain: str) -> ListOutcome:
-        """Navigate to the feedback manager and wait for its rows to arrive.
+        """打开反馈管理页并等它的行到齐。落地那几步交给共享的 ``AmazonLanding``。
 
-        Three outcomes, deliberately distinguished:
+        出口（每一条都只陈述**看见了什么**）：
 
-        * ``unavailable`` — Seller Central bounced us somewhere else, which it
-          does when the store is not selling on that marketplace: the URL comes
-          back as ``/account-switcher/...?returnTo=/feedback-manager/index.html``.
-          That is a fact about the store, not a fault, so it must not fail the
-          run the way a contract break does.
-        * ``ok`` with ``rows_loaded`` — the list rendered and has entries.
-        * ``ok`` without ``rows_loaded`` — the page is fine but no row ever
-          appeared.  Usually an empty store; the caller records it and does
-          nothing, because acting on a half-loaded list is the worse mistake.
+        * ``auth_required`` —— 停在登录页，连登录助手也没走通。交人工验证。
+        * ``marketplace_not_selected`` —— 停在账户/站点选择页且自己选不掉。
+          ⚠️ 这**不等于**「这家店没开这个站点」。这里原来写死的正是那句断言，
+          而且判据还是拿整个 URL 做子串匹配 —— 切换页的 ``returnTo`` 里就带着
+          ``/feedback-manager/index.html``，那句判断从来就没成立过
+          （用户 2026-09-24 拍板接自动选站，2026-09-26 实现）。
+        * ``marketplace_unavailable`` —— 落在别的地方。
+        * ``ok`` + ``rows_loaded`` —— 页面对，表格也有行。
+        * ``ok`` 但没有 ``rows_loaded`` —— 页面对但一行都没出现（通常是这个站点
+          还没有评价）。半张表上动手是更糟的选择，所以什么都不做。
 
-        Only "we are on the right page and its table never rendered" is a
-        contract error.
+        只有「页面对、但表格结构始终没出现」算契约错误。
         """
 
-        url = f"https://{domain}{FEEDBACK_MANAGER_PATH}"
-        await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
-        await page.wait_for_timeout(int(self.settle_seconds * 1000))
-
-        landed = str(getattr(page, "url", "") or "")
-        if FEEDBACK_MANAGER_PATH not in landed:
+        landing = await self._landing.land_on(
+            page,
+            url=f"https://{domain}{FEEDBACK_MANAGER_PATH}",
+            expected_path=FEEDBACK_MANAGER_PATH,
+            domain=domain,
+        )
+        page = landing.page or page
+        if not landing.ok:
             return ListOutcome(
-                ok=False, reason="marketplace_unavailable", landed_url=landed
+                ok=False,
+                reason=landing.reason,
+                landed_url=landing.landed_url,
+                switch_reason=landing.switch_reason,
+                page=page,
             )
 
         try:
@@ -477,15 +491,17 @@ class AmazonFeedbackPage:
 
         deadline = self.list_timeout_seconds
         waited = 0.0
-        step = self.settle_seconds
+        # ⚠️ 下限不能去掉：``settle_seconds=0`` 时 ``waited += step`` 永远加 0，
+        # 这个循环就再也出不来了 —— 没有超时、没有日志、没有任何征兆。
+        step = max(self.settle_seconds, 0.05)
         while waited < deadline:
             await page.wait_for_timeout(int(step * 1000))
             waited += step
             if await page.evaluate(_ROW_COUNT, self._contract_payload):
                 # One more settle so a partially rendered batch finishes.
                 await page.wait_for_timeout(int(step * 1000))
-                return ListOutcome(ok=True, rows_loaded=True)
-        return ListOutcome(ok=True, rows_loaded=False)
+                return ListOutcome(ok=True, rows_loaded=True, page=page)
+        return ListOutcome(ok=True, rows_loaded=False, page=page)
 
     async def read_all_rows(self, page: Any) -> tuple[list[FeedbackRow], bool]:
         """Read every page of the list, not just the first.

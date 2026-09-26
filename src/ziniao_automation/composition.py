@@ -40,6 +40,10 @@ from .workflows.amazon_feedback import (
     FeedbackReviewStore,
     build_amazon_feedback_definition,
 )
+from .workflows.amazon_gpsr import (
+    AmazonGpsrWorkflow,
+    build_amazon_gpsr_definition,
+)
 from .ziniao.factory import build_controller
 from .ziniao.credentials import read_generic_credential
 from .ziniao.errors import ZiniaoCredentialError
@@ -126,10 +130,12 @@ def build_runtime(
         # effect without restarting this service.
         classifier=FeedbackReasonClassifier(),
     )
+    gpsr_workflow = AmazonGpsrWorkflow(repository=workflow_repository)
     registry = WorkflowRegistry(
         (
             build_amazon_disbursement_definition(workflow),
             build_amazon_feedback_definition(feedback_workflow),
+            build_amazon_gpsr_definition(gpsr_workflow),
         )
     )
     if notifier is None:

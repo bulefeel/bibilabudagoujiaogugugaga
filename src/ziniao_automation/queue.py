@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 PRIORITY_RECOVERY = 0
 PRIORITY_HUMAN = 10
 PRIORITY_SCHEDULE = 100
+# ⚠️ ``RECONCILE`` 这个名字留着,但它**不再是「去亚马逊回读」**:2026-09-23
+# 删掉联网回读之后,它派发到的是按本地事实给资金记录收口(engine.settle),
+# 毫秒级、不开浏览器。名字没跟着改,是因为线上 SQLite 的 ck_run_queue_action
+# 只接受这四个值,而 SQLite 改 CHECK 要整表重建 —— 为一个内部标识符去重建
+# 一张资金队列表不值得。
 QUEUE_ACTIONS = frozenset({"START", "APPROVE", "CONTINUE_AUTH", "RECONCILE"})
 DEFAULT_WORKFLOW_BUSINESS_PRIORITIES = {"amazon_disbursement": 1}
 DEFAULT_TARGET_ORDER = 2_147_483_647
@@ -738,9 +743,27 @@ class PersistentQueueWorker:
     def wake(self) -> None:
         self._wake.set()
 
+    async def _sleep_a_beat(self) -> None:
+        self._wake.clear()
+        try:
+            await asyncio.wait_for(self._wake.wait(), timeout=self.poll_seconds)
+        except TimeoutError:
+            pass
+
     async def _loop(self) -> None:
         while not self._stopping:
-            entry = self.queue.claim_next()
+            try:
+                entry = self.queue.claim_next()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # ⚠️ 一次 SQLite「database is locked」就能把这个 worker 整个打死:
+                # 任务在 ``asyncio.create_task`` 里,异常没人看,**日志里一个字都没有**,
+                # 之后排队的运行全部停摆,直到有人再入队一次才发现(2026-09-26 自审)。
+                # 认领失败不是业务失败,退一拍再来。
+                logger.exception("durable_queue_claim_failed")
+                await self._sleep_a_beat()
+                continue
             if entry is None:
                 self._wake.clear()
                 try:
@@ -773,7 +796,14 @@ class PersistentQueueWorker:
                 # restores the exact row/FIFO position (and converts a funds
                 # entry to RECONCILE when required).
                 if not interrupted:
-                    self.queue.finish(entry.id)
+                    try:
+                        self.queue.finish(entry.id)
+                    except Exception:
+                        # 同上:收尾写不进去也不能让 worker 死掉。条目还是 CLAIMED,
+                        # 下次启动恢复会把它捡回来。
+                        logger.exception(
+                            "durable_queue_finish_failed run_id=%s", entry.run_id[:8]
+                        )
                 self.current_entry_id = None
 
     async def _notify_cross_day_started(self, run_id: str) -> bool:

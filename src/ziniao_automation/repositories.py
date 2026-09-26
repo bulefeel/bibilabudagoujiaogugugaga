@@ -33,7 +33,22 @@ V1_MARKETPLACES: dict[str, tuple[str, str]] = {
     "CA": ("sellercentral.amazon.ca", "CAD"),
     "UK": ("sellercentral.amazon.co.uk", "GBP"),
     "AU": ("sellercentral.amazon.com.au", "AUD"),
+    # DE 是为 GPSR 安全证明流程加的，提现流程不覆盖它。它**刻意不在**
+    # ``amazon_disbursement.config.ALLOWED_MARKETPLACES`` 里：统一建档要读付款页
+    # 才能核验，德国站没有那条链路。所以 DE 只能在店铺弹窗里勾选保存，不会被
+    # 统一建档探测——store_marketplaces 里它就是一行普通数据。
+    "DE": ("sellercentral.amazon.de", "EUR"),
 }
+
+
+def marketplace_codes_text(codes: Iterable[str] = ()) -> str:
+    """把站点白名单渲染成给人看的顿号列表。
+
+    这句话以前在四个地方各写死了一份「CA、UK、AU」，加 DE 时必须同时改四处，
+    漏一处就会出现「无效站点：DE」却又列不出 DE 的自相矛盾提示。
+    """
+
+    return "、".join(sorted(codes or V1_MARKETPLACES))
 
 
 class NotFoundError(LookupError):
@@ -288,7 +303,7 @@ class StoreRepository:
                 raise ValueError(f"站点 {code} 重复，每个站点只能提交一次")
             incoming[code] = item
         if not set(incoming).issubset(V1_MARKETPLACES):
-            raise ValueError("V1 仅允许 CA、UK、AU")
+            raise ValueError(f"仅允许 {marketplace_codes_text()}")
         by_code = {item.code: item for item in store.marketplaces}
         for code, (canonical_domain, currency) in V1_MARKETPLACES.items():
             definition = incoming.get(code)
@@ -679,7 +694,7 @@ class ScheduleRepository:
         unknown = set(normalized) - set(V1_MARKETPLACES)
         if unknown:
             raise ValueError(
-                "计划站点只能是 CA、UK、AU；无效站点："
+                f"计划站点只能是 {marketplace_codes_text()}；无效站点："
                 + "、".join(sorted(unknown))
             )
         if len(normalized) != len(set(normalized)):
@@ -840,8 +855,6 @@ class ScheduleRepository:
 class WorkflowRepository:
     """Atomic persistence contract used by all fixed-code workflows."""
 
-    FINANCIAL_STATES = frozenset({"ARMED", "SUBMITTED", "CONFIRMED", "UNCERTAIN"})
-
     def __init__(self, session: Session, workflow_registry: Any | None = None) -> None:
         self.session = session
         self.workflow_registry = workflow_registry
@@ -973,7 +986,12 @@ class WorkflowRepository:
             # concurrent cancellation request.
             return False
         values: dict[str, Any] = {"status": to_status, "error": error, "updated_at": utc_now()}
-        if to_status == "RUNNING":
+        # ⚠️ 只在**第一次**认领时盖。审批通过、人工验证恢复、收口认领都会再进一次
+        # RUNNING;每次都重盖的话,卡片上的「实际开始」和「排队等待」会把两小时的
+        # 审批时间算成排队(2026-09-26 自审)。
+        if to_status == "RUNNING" and self.session.scalar(
+            select(Run.started_at).where(Run.id == run_id)
+        ) is None:
             values["started_at"] = utc_now()
         if to_status in {"SUCCEEDED", "PARTIAL", "FAILED", "CANCELLED", "NEEDS_HUMAN_AUTH", "UNCERTAIN_FINANCIAL", "SKIPPED"}:
             values["finished_at"] = utc_now()
@@ -1072,11 +1090,45 @@ class WorkflowRepository:
 
     def list_pending_approvals(self) -> list[ApprovalRequest]:
         now = utc_now()
+        expired_run_ids = list(
+            self.session.scalars(
+                select(ApprovalRequest.run_id).where(
+                    ApprovalRequest.status == "PENDING",
+                    ApprovalRequest.expires_at <= now,
+                )
+            )
+        )
         self.session.execute(
             update(ApprovalRequest)
             .where(ApprovalRequest.status == "PENDING", ApprovalRequest.expires_at <= now)
             .values(status="EXPIRED", invalidated_at=now, invalid_reason="审批已超时")
         )
+        if expired_run_ids:
+            # ⚠️ 审批一过期,卡片(以及那颗唯一的「取消任务」按钮)就消失了,而运行
+            # 还停在 WAITING_APPROVAL —— 那是个活跃状态,于是这条僵尸永远否决这条
+            # 排期的「立即执行」「删除排期」和店铺建档重置,谁也动不了它,只能重启
+            # (2026-09-26 自审)。审批超时就是这次运行的结论:一并收掉。
+            self.session.execute(
+                update(Run)
+                .where(
+                    Run.id.in_(expired_run_ids),
+                    Run.status == "WAITING_APPROVAL",
+                )
+                .values(
+                    status="CANCELLED",
+                    error="审批已超时，本次运行未执行",
+                    finished_at=now,
+                    updated_at=now,
+                )
+            )
+            self.session.execute(
+                update(SiteRun)
+                .where(
+                    SiteRun.run_id.in_(expired_run_ids),
+                    SiteRun.status == "WAITING_APPROVAL",
+                )
+                .values(status="CANCELLED", error="审批已超时，该站点本次未执行")
+            )
         return list(
             self.session.scalars(
                 select(ApprovalRequest)
@@ -1186,9 +1238,12 @@ class WorkflowRepository:
         metadata: dict[str, Any] | None = None,
     ) -> bool:
         now = utc_now()
+        # 不写 ``last_reconciled_at``:它记录的是「系统去亚马逊回读」的时刻,而回读已于
+        # 2026-09-23 删除。这里只有人工结案会走到,把人工操作的时间写进去,运行详情页
+        # 会把它显示成一次从没发生过的回读。
         values: dict[str, Any] = {
             "state": to_state, "failure_reason": failure_reason,
-            "last_reconciled_at": now, "updated_at": now,
+            "updated_at": now,
         }
         if metadata is not None:
             values["metadata_json"] = metadata
@@ -1215,19 +1270,6 @@ class WorkflowRepository:
         if states is not None:
             stmt = stmt.where(OperationGuard.state.in_(tuple(states)))
         return list(self.session.scalars(stmt))
-
-    def recovery_guards(self) -> list[OperationGuard]:
-        return self.list_guards(states=("ARMED", "SUBMITTED", "UNCERTAIN"))
-
-    def has_financial_guard(self, run_id: str) -> bool:
-        return bool(
-            self.session.scalar(
-                select(func.count(OperationGuard.id)).where(
-                    OperationGuard.run_id == run_id,
-                    OperationGuard.state.in_(self.FINANCIAL_STATES),
-                )
-            )
-        )
 
     def add_evidence(
         self,
@@ -1260,8 +1302,26 @@ class DashboardRepository:
             "stores": int(scalar(select(func.count(Store.id))) or 0),
             "enabled_stores": int(scalar(select(func.count(Store.id)).where(Store.enabled.is_(True))) or 0),
             "pending_approvals": int(scalar(select(func.count(ApprovalRequest.id)).where(ApprovalRequest.status == "PENDING")) or 0),
-            "active_runs": int(scalar(select(func.count(Run.id)).where(Run.status.in_(("QUEUED", "RUNNING", "WAITING_AUTH", "RECONCILING")))) or 0),
-            "uncertain": int(scalar(select(func.count(OperationGuard.id)).where(OperationGuard.state == "UNCERTAIN")) or 0),
+            "active_runs": int(scalar(select(func.count(Run.id)).where(Run.status.in_(("QUEUED", "RUNNING", "WAITING_AUTH")))) or 0),
+            # 还需要人裁定的资金记录:UNCERTAIN(等人核对)与**所属运行已经不在跑**的
+            # ARMED(锁了、却再也不会有人去点完它)。正在提交中的 ARMED 只是 arm 与
+            # 点击之间那几秒,不是待办。已派发的停在 SUBMITTED,是正常终态。
+            # (2026-09-23 之前这一格数的是 UNCERTAIN,而回读几乎必然失败,于是每一笔
+            # 正常提现都会进来,堆到了 43 笔。)
+            "needs_human_settlement": int(
+                scalar(
+                    select(func.count(OperationGuard.id))
+                    .join(Run, Run.id == OperationGuard.run_id)
+                    .where(
+                        (OperationGuard.state == "UNCERTAIN")
+                        | (
+                            (OperationGuard.state == "ARMED")
+                            & Run.status.not_in(tuple(ACTIVE_RUN_STATUSES))
+                        )
+                    )
+                )
+                or 0
+            ),
         }
 
 

@@ -19,22 +19,26 @@ class NullNotifier:
 
 
 class LoggingNotifier:
-    """Log identifiers/status only; never serialise site data or secrets."""
+    """Log identifiers/status only; never serialise site data or secrets.
+
+    ⚠️ **标题也不许进日志**:卡片标题里有店铺名(= 卖家名),例如
+    「紫鸟提现 · <店铺名> · 提现已提交」。这里原来记了 title=,于是每一张卡的
+    店铺名都进了 data/logs/*.jsonl(2026-09-23 自审复核在线上日志里读到)。
+    """
 
     async def send(self, report: "SafeRunNotice | WorkflowReport") -> None:
         if isinstance(report, SafeRunNotice):
             logger.info(
-                "workflow_notification run_id=%s status=%s title=%s",
+                "workflow_notification run_id=%s status=%s workflow=%s",
                 report.run_short_id,
                 report.kind.value,
-                report.title,
+                report.workflow,
             )
             return
         logger.info(
-            "workflow_notification run_id=%s status=%s title=%s",
-            report.run_id,
+            "workflow_notification run_id=%s status=%s",
+            str(report.run_id)[:8],
             report.status.value,
-            report.title,
         )
 
 

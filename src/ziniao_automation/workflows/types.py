@@ -69,6 +69,19 @@ class GuardState(StrEnum):
     UNCERTAIN = "UNCERTAIN"
 
 
+# 「这笔到底点没点下去」**真的不知道**的资金记录 —— 只有人能裁定。
+#
+# ⚠️ 这不是「这条运行动过钱」。后者看的是**有没有任何 guard**(存在性),与防重提现
+# 读的是同一件事,不需要状态集合。
+#
+# 2026-09-23 删掉联网回读之后 ``SUBMITTED`` 变成了成功终态:那一下不可逆点击返回过,
+# 请求确实发出去了。它**动过钱**,但**有结论**。删回读时只改了终态映射一处,
+# 其余七处仍把 ARMED/SUBMITTED/UNCERTAIN 当一个集合用,于是每次重启都会把
+# 成功提现翻成 UNCERTAIN_FINANCIAL、一笔成功后的任何异常也会把运行钉在那里、
+# 第一笔提现成功后 WebDriver 切换被永久阻止…… 两个概念必须分开用。
+UNSETTLED_GUARD_STATES = frozenset({GuardState.ARMED, GuardState.UNCERTAIN})
+
+
 class ApprovalStatus(StrEnum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
@@ -143,6 +156,11 @@ class PreflightResult:
     contract_version: str
 
 
+_UNBOUND_SNAPSHOT_FIELDS = frozenset(
+    {"payable_amount", "delayed_amount", "identity_source"}
+)
+
+
 @dataclass(frozen=True, slots=True)
 class MarketplaceSnapshot:
     marketplace_code: str
@@ -183,6 +201,12 @@ class MarketplaceSnapshot:
             "identity_source": self.identity_source,
         }
 
+    # ⚠️ 往 ``canonical()`` 加字段时先问:它会不会因为**环境**(哪个 Page、缓存冷热、
+    # 走了哪条探测路径)而变?会变就得加进这里,否则绑定会把正常现象判成「变了」。
+    #
+    # * 两个金额:余额边跑边涨是常态,绑它等于拿正常入账打死站点(2026-08-19)。
+    # * ``identity_source``:观测**方式**,不是被操作的账号(2026-09-26)。
+
     @property
     def snapshot_hash(self) -> str:
         return stable_hash(self.canonical())
@@ -204,12 +228,19 @@ class MarketplaceSnapshot:
         contract version and the page's structural fingerprint — which is
         already amount-free because ``_fingerprint`` strips digits and text
         before hashing.
+
+        ⚠️ ``identity_source`` 同样被排除,理由是同一条:它记的是**身份是怎么读到的**
+        (``dom:content`` / ``account_switcher:current`` / 身份缓存命中时硬编码的
+        ``session:account_switcher``),不是**操作的是哪个账号** —— 后者由 ``seller_id``
+        绑着。它会随环境变:审批通过后换一个会话、或登录被甩到新标签页,每 Page 的身份
+        缓存就是冷的,来源字符串随之改变,于是 ``PlanChanged`` 判「身份、账户、站点或页面
+        结构发生变化」而页面上什么都没变 —— 审批模式因此永远付不出去(2026-09-26 自审实测)。
         """
 
         payload = {
             key: value
             for key, value in self.canonical().items()
-            if key not in ("payable_amount", "delayed_amount")
+            if key not in _UNBOUND_SNAPSHOT_FIELDS
         }
         return stable_hash(payload)
 

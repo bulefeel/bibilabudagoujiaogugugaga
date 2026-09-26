@@ -21,6 +21,7 @@ image path with ``QueryFullProcessImageNameW`` before signalling anything.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import logging
 import os
@@ -143,30 +144,48 @@ async def _terminate(pids: list[int]) -> int:
 def describe_blockers(
     lock_snapshot: dict[str, object] | None,
     pending_guard_sites: list[str] | None,
+    *,
+    store_names: Mapping[str, str],
 ) -> list[str]:
     """Reasons it is not safe to close Ziniao right now, in the operator's words.
 
     Killing the browser mid-run would abandon a session that may be holding a
     funds lock, and in the worst case would do it between ``arm_operation`` and
     the irreversible click.  An empty list means the switch may proceed.
+
+    ⚠️ 前两条是**本服务进程内的 asyncio 锁**，第三条才是 SQLite 里的记录。
+    这个区别必须写在文案里:2026-09-22 运营关掉了全部紫鸟窗口、报错照旧，于是以为
+    判据坏了 —— 实际上关浏览器根本不碰这两把锁，只有持锁的协程释放、或者重启服务
+    才会没。不说清楚，操作员只会一遍遍去关浏览器。
+
+    ``store_names`` 把锁上的键(店铺 id 的字符串)换成店铺名。之前直接打印键，
+    屏幕上是一个孤零零的「36」——现在有三十多家店，那个数字谁也认不出来。
     """
 
     blockers: list[str] = []
     snapshot = lock_snapshot or {}
     if snapshot.get("funds_locked"):
-        blockers.append("有提现任务正在执行（资金锁被占用）")
+        blockers.append("有提现任务正在执行（资金锁被占用）；关闭紫鸟窗口不会释放它")
     busy = [
         key
         for key, locked in (snapshot.get("stores") or {}).items()  # type: ignore[union-attr]
         if locked
     ]
     if busy:
-        blockers.append(f"以下店铺的浏览器会话仍在进行：{'、'.join(sorted(busy))}")
+        labelled = [
+            f"{store_names[key]}（#{key}）" if key in store_names else f"#{key}"
+            for key in sorted(busy)
+        ]
+        blockers.append(
+            "以下店铺的浏览器会话仍在进行："
+            + "、".join(labelled)
+            + "；关闭紫鸟窗口不会释放它"
+        )
     if pending_guard_sites:
         blockers.append(
-            "存在尚未收尾的资金记录："
+            "存在点击尚未返回的资金记录："
             + "、".join(sorted(pending_guard_sites))
-            + "（先在任务详情页回读或结案）"
+            + "（提现任务可能正在点击，等它结束；若任务已经卡住，重启服务后会自动收口）"
         )
     return blockers
 
@@ -177,8 +196,22 @@ async def start_webdriver_mode(
     host: str,
     port: int,
     blockers: list[str],
+    force: bool = False,
+    log_blockers: list[str] | tuple[str, ...] = (),
 ) -> ModeReport:
-    """Bring the local WebDriver API up, closing normal-mode windows if needed."""
+    """Bring the local WebDriver API up, closing normal-mode windows if needed.
+
+    ``force=True`` 越过 ``blockers``。这是运营明确要的:锁卡住时(比如持锁的协程
+    正等一个已经关掉的浏览器)，除了重启服务没有别的出路，而人就坐在机器前、
+    能自己确认还有没有残留进程。
+
+    ⚠️ 越过归越过，**不许静默**:被忽略的每一条都写进 WARNING 日志和返回的
+    ``details``。真出了「提现提交到一半被杀」的事，得能在日志里查到是谁在什么时候
+    越过了什么。
+
+    ``blockers`` 是给界面看的，里面有店铺名（= 卖家名）；卖家名不进日志文件，
+    所以日志只写 ``log_blockers`` —— 同样的理由，店铺只用 ``#id`` 标。
+    """
 
     if port_open(host, port):
         return ModeReport(
@@ -194,12 +227,22 @@ async def start_webdriver_mode(
             details={"executable": str(executable)},
         )
 
-    if blockers:
+    if blockers and not force:
         return ModeReport(
             False,
             "busy",
-            "现在切换会关掉正在使用的紫鸟窗口，因此已阻止：\n" + "\n".join(blockers),
-            details={"blockers": blockers},
+            "现在切换会关掉正在使用的紫鸟窗口，因此已阻止：\n"
+            + "\n".join(blockers)
+            + "\n\n前两类是本服务进程内的锁，关闭紫鸟窗口不会清除；"
+            "确认无人正在提现后，可用「强制切换」越过。",
+            details={"blockers": blockers, "forceable": True},
+        )
+    if blockers:
+        logger.warning(
+            "WebDriver switch forced past %d blocker(s): %s",
+            len(blockers),
+            " | ".join(log_blockers),
+            extra={"event": "webdriver_switch_forced"},
         )
 
     closed = 0
@@ -251,11 +294,17 @@ async def start_webdriver_mode(
     deadline = asyncio.get_running_loop().time() + READY_TIMEOUT_SECONDS
     while asyncio.get_running_loop().time() < deadline:
         if port_open(host, port):
+            message = f"紫鸟 WebDriver 模式已就绪（{host}:{port}）。现在可以同步店铺了。"
+            if blockers:
+                # 强制切换成功也要把越过了什么摆在操作员眼前，否则这一步在界面上
+                # 和一次干净的切换长得一模一样。
+                message += "\n⚠️ 本次为强制切换，已越过：" + "；".join(blockers)
             return ModeReport(
                 True,
                 "ready",
-                f"紫鸟 WebDriver 模式已就绪（{host}:{port}）。现在可以同步店铺了。",
+                message,
                 closed_processes=closed,
+                details={"overridden_blockers": blockers} if blockers else {},
             )
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
 

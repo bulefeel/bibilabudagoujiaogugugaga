@@ -59,10 +59,13 @@ class FakePage:
         self.closed = 0
         self.select_result_ok = True
         self.unavailable = False
+        self.auth_required = False
         self.truncated = False
         self.reloads = 0
 
     async def open_list(self, page: Any, domain: str) -> ListOutcome:
+        if self.auth_required:
+            return ListOutcome(ok=False, reason="auth_required")
         if self.unavailable:
             # Seller Central bounces to the account switcher for a marketplace
             # the store does not sell on.
@@ -853,3 +856,78 @@ async def test_confirming_a_submission_reloads_the_list(session_factory) -> None
 
     assert page.reloads >= 1, "确认阶段必须重新打开列表"
     assert states(session_factory)["702-110"] == SUBMITTED
+
+
+# --------------------------------------------------------------------------
+# 10. 卡片上的那几句话必须和事实对得上（2026-09-26 自审）
+# --------------------------------------------------------------------------
+async def test_a_site_with_work_to_do_is_planned_not_skipped(session_factory) -> None:
+    """有待办就是「待提交」。一律记 SKIPPED 的话，空跑卡对着有 2 条待办的站点写
+    「已读取，无需提交」——同一张卡的正文却列着那两条。"""
+
+    workflow, _, repo = build(session_factory, [row("702-95", 1), row("702-96", 2)])
+
+    await workflow.plan(make_run(mode=RunMode.DRY_RUN), object())
+
+    assert repo.site_status["CA"] == "PLANNED"
+
+
+async def test_a_site_with_nothing_to_do_is_still_skipped(session_factory) -> None:
+    """反向：真的没活儿才是「已读取，无需提交」。"""
+
+    workflow, _, repo = build(session_factory, [row("702-97", 5)])
+
+    await workflow.plan(make_run(), object())
+
+    assert repo.site_status["CA"] == "SKIPPED"
+
+
+async def test_a_site_that_submitted_nothing_is_not_reported_as_done(
+    session_factory,
+) -> None:
+    """有待办、却一条都没提交成：记 CONFIRMED 的话卡片写「已提交请求 / 反馈处理
+    已完成 / 无需操作」，而正文同时说「本次没有提交任何请求审核」。"""
+
+    run = make_run()
+    workflow, page, repo = build(session_factory, [row("702-98", 1)])
+    plan = await workflow.plan(run, object())
+    page.select_result_ok = False  # 原因码选不中 → 这一条发不出去
+
+    await workflow.execute(run, object(), plan)
+
+    assert page.submitted == []
+    assert repo.site_status["CA"] == "FAILED"
+    assert any(event[0] == "feedback_site_nothing_submitted" for event in repo.events)
+
+
+async def test_a_list_that_will_not_open_at_execute_is_a_failure(session_factory) -> None:
+    """执行阶段说明计划已经读到了待提交条目：这时打不开列表是**没做成**，
+    不是「这站没活儿」。原来静默 SKIPPED，卡片写「本次没有可处理的反馈」。"""
+
+    run = make_run()
+    workflow, page, repo = build(session_factory, [row("702-99", 1)])
+    plan = await workflow.plan(run, object())
+    page.unavailable = True
+
+    await workflow.execute(run, object(), plan)
+
+    assert repo.site_status["CA"] == "FAILED"
+    (event,) = [e for e in repo.events if e[0] == "feedback_site_unavailable"]
+    assert event[2]["during_execute"] is True
+
+
+async def test_an_expired_session_goes_to_a_human_not_to_nothing_to_do(
+    session_factory,
+) -> None:
+    """会话掉了要交给人工接管。当成「这个站点没活儿」的话，任务会报成功——
+    每家店可以永远这样绿下去（和 GPSR 那条同族）。"""
+
+    from ziniao_automation.workflows.errors import HumanAuthRequired
+
+    workflow, page, repo = build(session_factory, [row("702-94", 1)])
+    page.auth_required = True
+
+    with pytest.raises(HumanAuthRequired):
+        await workflow.plan(make_run(), object())
+
+    assert repo.site_status.get("CA") != "SKIPPED", "不能记成「读完了没活儿」"

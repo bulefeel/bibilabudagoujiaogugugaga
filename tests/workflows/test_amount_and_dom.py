@@ -117,6 +117,7 @@ class _NativeChallengeAdapter(AmazonPaymentsPage):
         marketplace=None,
         *,
         allow_payment_details_handoff=False,
+        select_marketplace_on_switcher=True,
     ):
         del marketplace
         assert allow_payment_details_handoff is True
@@ -213,7 +214,7 @@ class _LoginAnsweredAdapter(AmazonPaymentsPage):
     async def _goto_dashboard(self, page, marketplace):
         page.url = f"https://{marketplace.domain}/payments/dashboard/index.html"
 
-    async def _raise_if_auth(self, page, marketplace=None, *, allow_payment_details_handoff=False):
+    async def _raise_if_auth(self, page, marketplace=None, *, allow_payment_details_handoff=False, select_marketplace_on_switcher=True):
         del marketplace, allow_payment_details_handoff
         return page
 
@@ -465,7 +466,8 @@ class _StepUpAfterPressAdapter(_LoginAnsweredAdapter):
         page.commit_click()
 
     async def _raise_if_auth(
-        self, page, marketplace=None, *, allow_payment_details_handoff=False
+        self, page, marketplace=None, *, allow_payment_details_handoff=False,
+        select_marketplace_on_switcher=True,
     ):
         del allow_payment_details_handoff
         self.auth_calls.append(str(page.url))
@@ -542,3 +544,38 @@ async def test_a_press_that_lands_somewhere_unknown_still_reaches_a_human() -> N
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_binding_hash_ignores_how_the_identity_was_proven() -> None:
+    """``identity_source`` 记的是**身份怎么读到的**,不是操作的哪个账号。
+
+    ⚠️ 它随环境变:审批通过后换会话、或登录被甩到新标签页,每 Page 的身份缓存就是
+    冷的,来源字符串跟着变。绑它 → 审批模式**永远付不出去**,卡片还说「身份、账户、
+    站点或页面结构发生变化」,而页面上什么都没变(2026-09-26 自审实测)。
+    """
+
+    from decimal import Decimal
+
+    from ziniao_automation.workflows.types import MarketplaceSnapshot
+
+    def snap(**over):
+        base = dict(
+            marketplace_code="CA", domain="sellercentral.amazon.ca", seller_id="SELLER",
+            payment_account="001", currency="CAD", payable_amount=Decimal("10"),
+            delayed_amount=Decimal("0"), settlement_key="cycle", can_submit=True,
+            contract_version="v1", page_fingerprint="fp",
+        )
+        base.update(over)
+        return MarketplaceSnapshot(**base)
+
+    planned = snap(identity_source="session:account_switcher")   # 计划期:缓存命中
+    executed = snap(identity_source="dom:content")               # 执行期:新 Page,缓存冷
+    assert planned.binding_hash == executed.binding_hash
+    # 反向:真正决定「操作哪个账号」的东西照样绑着。
+    assert planned.binding_hash != snap(seller_id="OTHER").binding_hash
+    # ⚠️ 收款尾号**故意**不在绑定里:钱去哪由亚马逊定,本地存一个「期望尾号」只能
+    # 挡住正常提现、挡不住任何改向(见 memory 里 payout-account-tail-source)。
+    assert planned.binding_hash == snap(payment_account="999").binding_hash
+    assert planned.binding_hash != snap(can_submit=False).binding_hash
+    # snapshot_hash 仍然什么都算(它本来就是全字段)。
+    assert planned.snapshot_hash != executed.snapshot_hash

@@ -14,9 +14,13 @@
 </div>
 <section class="diagnostic-actions">
   <header><p class="eyebrow">ONE CLICK</p><h3>紫鸟 WebDriver 模式</h3></header>
-  <p class="fieldset-help">自动化需要紫鸟运行在 WebDriver 模式下，本地控制端口 {{ diagnostics.control_port }} 才会响应。<strong>切换会关掉当前所有已打开的紫鸟店铺窗口</strong>；正在跑提现任务、或还有未收尾的资金记录时，程序会拒绝切换。</p>
+  <p class="fieldset-help">自动化需要紫鸟运行在 WebDriver 模式下，本地控制端口 {{ diagnostics.control_port }} 才会响应。<strong>切换会关掉当前所有已打开的紫鸟店铺窗口</strong>；正在跑提现任务、或有点击尚未返回的资金记录（ARMED）时，程序会拒绝切换。<strong>「有任务在跑」「店铺会话进行中」是本服务进程内的锁，手动关掉紫鸟窗口并不会清除它们</strong>；确认无人正在提现后，可用拒绝后出现的「强制切换」越过。</p>
   <div class="diagnostic-actions-row">
     <button class="button dark" type="button" data-action="start-webdriver" {{ 'disabled' if diagnostics.control_reachable else '' }}>{{ '端口已响应，无需切换' if diagnostics.control_reachable else '启动 WebDriver 模式' }}</button>
+    {# 只在服务真的拒绝过一次之后才露出来。前两类阻止是服务进程内的锁，关掉紫鸟
+       窗口清不掉，卡住时除了重启服务没有别的出路；但强制切换会杀掉正在用的窗口，
+       所以它必须是操作员看过原因之后的第二次点击，不能一上来就摆在那里。 #}
+    <button class="button danger" type="button" data-action="force-webdriver" hidden>强制切换（忽略上述阻止）</button>
     <span class="diagnostic-actions-state" data-webdriver-state aria-live="polite"></span>
   </div>
 </section>

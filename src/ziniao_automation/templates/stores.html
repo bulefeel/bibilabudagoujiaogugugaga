@@ -47,17 +47,26 @@
         </div>
         <button class="button dark" type="button" data-action="detect-store-setup">自动获取卖家ID并核验站点</button>
       </aside>
-      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选 CA、UK、AU 中需要的站点，再点击统一建档。卖家身份与各站点核验结果会直接保存到账册；只有卖家身份与原建档冲突才需要人工复核。</p>
-      {% for code, label, domain in [
-        ('CA', '加拿大', 'sellercentral.amazon.ca'),
-        ('UK', '英国', 'sellercentral.amazon.co.uk'),
-        ('AU', '澳大利亚', 'sellercentral.amazon.com.au')
+      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选 CA、UK、AU 中需要的站点，再点击统一建档。卖家身份与各站点核验结果会直接保存到账册；只有卖家身份与原建档冲突才需要人工复核。<b>德国站不参与统一建档</b>——核验要读付款控制面板，德国站没有那条链路，所以勾选后直接保存即可。</p>
+      {% for code, label, domain, probeable in [
+        ('CA', '加拿大', 'sellercentral.amazon.ca', true),
+        ('UK', '英国', 'sellercentral.amazon.co.uk', true),
+        ('AU', '澳大利亚', 'sellercentral.amazon.com.au', true),
+        ('DE', '德国', 'sellercentral.amazon.de', false)
       ] %}
-      <div class="store-marketplace-row" data-store-marketplace="{{ code }}">
+      {# DE 只供 GPSR 安全证明流程使用。它带着 data-no-probe，因为这批行有两个
+         消费者：店铺保存（取全部行）和统一建档（只取勾选的行）。不隔开的话，
+         勾了 DE 再点统一建档会收到「无效站点：DE」——在唯一能勾 DE 的界面上。 #}
+      <div class="store-marketplace-row" data-store-marketplace="{{ code }}"{% if not probeable %} data-no-probe{% endif %}>
         <label class="mini-check marketplace-enable"><input type="checkbox" data-marketplace-enabled> <span><b>{{ code }} {{ label }}</b><small>{{ domain }}</small></span></label>
         <div class="marketplace-detection-state">
+          {% if probeable %}
           <span class="marketplace-status pending" data-marketplace-status>待检测</span>
           <small data-marketplace-account-display>勾选后核验域名与卖家身份</small>
+          {% else %}
+          <span class="marketplace-status skipped" data-marketplace-status>不参与核验</span>
+          <small data-marketplace-account-display>勾选即保存，统一建档不会检测该站点</small>
+          {% endif %}
         </div>
       </div>
       {% endfor %}

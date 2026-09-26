@@ -18,8 +18,8 @@ class DatabaseNotificationAdapter:
     summary and free-form fields are ignored; the detailed notification is
     rebuilt from explicit database columns by NotificationDeliveryService.
     A successful run produces exactly one database-backed notice: a green
-    payment confirmation when a CONFIRMED guard exists, otherwise a neutral
-    task-completed/read-only card.  A run in which every site was skipped gets
+    「提现已提交」 card when a payout request went out (a SUBMITTED or
+    CONFIRMED guard), otherwise a neutral task-completed/read-only card.  A run in which every site was skipped gets
     its own neutral card naming each site's reason — staying silent there made
     Amazon's 24-hour disbursement cap indistinguishable from a crash.  Only
     cancellation remains silent, because the operator caused it.
@@ -46,7 +46,7 @@ class DatabaseNotificationAdapter:
             # sent.  This also keeps a failed green-card delivery from being
             # downgraded to a misleading neutral completion card.
             await self.deliveries.deliver(
-                report.run_id, NotificationKind.PAYMENT_CONFIRMED
+                report.run_id, NotificationKind.PAYMENT_SUBMITTED
             )
             await self.deliveries.deliver(
                 report.run_id, NotificationKind.RUN_COMPLETED

@@ -173,6 +173,7 @@ class _SubmitRouteGuardAdapter(AmazonPaymentsPage):
         super().__init__(pacing_range_ms=(0, 0))
         self.final_button = _CountingButton()
         self.auth_handoff_flags: list[bool] = []
+        self.switcher_flags: list[bool] = []
 
     async def _raise_if_auth(
         self,
@@ -180,9 +181,11 @@ class _SubmitRouteGuardAdapter(AmazonPaymentsPage):
         marketplace=None,
         *,
         allow_payment_details_handoff=False,
+        select_marketplace_on_switcher=True,
     ):
         del marketplace
         self.auth_handoff_flags.append(bool(allow_payment_details_handoff))
+        self.switcher_flags.append(bool(select_marketplace_on_switcher))
         return page
 
     async def _matching_buttons(self, page):
@@ -397,6 +400,8 @@ async def test_submit_once_rejects_nonexact_details_route_without_click(
         await adapter.submit_once(page, run, marketplace, snapshot)
 
     assert adapter.auth_handoff_flags == [True]
+    # ARMED 之后、唯一不可逆点击之前：不在这个窗口里多做一次选站导航。
+    assert adapter.switcher_flags == [False]
     assert adapter.final_button.clicks == 0
 
 
@@ -566,7 +571,8 @@ class _TwoSiteSubmitAdapter(AmazonPaymentsPage):
             raise self.click_error
 
     async def _raise_if_auth(
-        self, page, marketplace=None, *, allow_payment_details_handoff=False
+        self, page, marketplace=None, *, allow_payment_details_handoff=False,
+        select_marketplace_on_switcher=True,
     ):
         del marketplace, allow_payment_details_handoff
         return page
@@ -729,3 +735,163 @@ async def test_failure_after_the_click_is_never_reported_as_not_dispatched() -> 
     assert not isinstance(raised.value, SubmissionNotDispatched)
     assert adapter.final_button.clicks == 1
     assert "UK" in adapter._page_consumed_marketplaces(page)
+
+
+class _StepUpAdapter(AmazonPaymentsPage):
+    """在最终点击**之前**被要求重新认证的真适配器(只有登录判据被替掉)。"""
+
+    def __init__(self, *, after_click: bool = False) -> None:
+        super().__init__(pacing_range_ms=(0, 0))
+        self.after_click = after_click
+        self.final_button = _CountingButton(self._maybe_raise_after_click)
+
+    def _maybe_raise_after_click(self) -> None:
+        if self.after_click:
+            raise HumanAuthRequired("点完之后才被要求认证", kind="challenge")
+
+    async def _raise_if_auth(
+        self, page, marketplace=None, *, allow_payment_details_handoff=False,
+        select_marketplace_on_switcher=True,
+    ):
+        del marketplace, allow_payment_details_handoff, select_marketplace_on_switcher
+        if not self.after_click:
+            raise HumanAuthRequired("付款区要求重新认证", kind="challenge")
+        return page
+
+    async def _verify_identity(self, page, expected, marketplace):
+        del page, marketplace
+        return expected, "fixture:merchant-id"
+
+    async def _verify_details(self, page, marketplace, expected):
+        del page, marketplace
+        return expected
+
+    async def _matching_buttons(self, page):
+        del page
+        return [self.final_button]
+
+    async def _body_text(self, page) -> str:
+        del page
+        return "no banner"
+
+    async def _settle(self, page) -> None:
+        del page
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("after_click", "expected"),
+    [(False, False), (True, True)],
+)
+async def test_submit_once_reports_whether_the_click_had_already_happened(
+    after_click, expected
+) -> None:
+    """``HumanAuthRequired.dispatch_recorded`` 是「点没点」唯一有凭据的答案。
+
+    判据来自写在 ``click()`` 上一行的 consumed 标记。⚠️ 不能拿「``submitted_at``
+    还空着」代替 —— 那一列是点击**之后**才写的,点完抛异常时它同样是空的。
+    """
+
+    run, marketplace, snapshot = _run_and_marketplace()
+    adapter = _StepUpAdapter(after_click=after_click)
+    page = _RouteOnlyPage("https://sellercentral.amazon.ca/payments/disburse/details")
+
+    with pytest.raises(HumanAuthRequired) as caught:
+        await adapter.submit_once(page, run, marketplace, snapshot)
+
+    assert caught.value.dispatch_recorded is expected
+    assert adapter.final_button.clicks == (1 if after_click else 0)
+
+
+@pytest.mark.asyncio
+async def test_a_step_up_before_the_click_releases_the_lock_and_keeps_going() -> None:
+    """点击前被要求认证 = 这一下没发生。撤销锁定,自动模式跳过该站点继续跑。
+
+    不撤销的话:引擎按「有说不清的记录」只收口不续跑,人验证完点继续,整条运行落
+    UNCERTAIN_FINANCIAL、后面的站点一个没试,而那笔钱一分没动(2026-09-26 自审)。
+    """
+
+    from ziniao_automation.workflows.amazon_disbursement import (
+        AmazonDisbursementWorkflow,
+    )
+    from dataclasses import replace
+
+    from ziniao_automation.workflows.repository_memory import InMemoryWorkflowRepository
+    from ziniao_automation.workflows.types import SiteStatus, SubmissionReceipt, utc_now
+
+    from .test_auth_cursor import CursorAdapter, make_multi_site_run
+
+    repo = InMemoryWorkflowRepository()
+    run = make_multi_site_run()
+    await repo.add_run(run)
+    adapter = CursorAdapter()
+
+    async def open_without_auth(page, run_, marketplace, expected):
+        adapter.open_calls.append(marketplace.code)
+        return replace(expected, payment_account="493")
+
+    async def uk_step_up(page, run_, marketplace, expected):
+        adapter.submit_calls.append(marketplace.code)
+        if marketplace.code == "UK":
+            raise HumanAuthRequired(
+                "付款区要求重新认证", kind="challenge", dispatch_recorded=False
+            )
+        return SubmissionReceipt(utc_now(), receipt_id=f"click-{marketplace.code}")
+
+    adapter.open_confirmation = open_without_auth
+    adapter.submit_once = uk_step_up
+    workflow = AmazonDisbursementWorkflow(repository=repo, page_adapter=adapter)
+    plan = await workflow.plan(run, object())
+
+    await workflow.execute(run, object(), plan)
+
+    assert adapter.submit_calls == ["CA", "UK", "AU"], "UK 之后的站点照样要做"
+    codes = {op.intent.marketplace_code for op in await repo.list_operations(run.id)}
+    assert codes == {"CA", "AU"}, "UK 的锁定必须被撤销"
+    assert await repo.get_site_status(run.id, "UK") is SiteStatus.NEEDS_HUMAN_AUTH
+    released = [e for e in repo.events if e["event_type"] == "operation_released"]
+    assert len(released) == 1 and released[0]["details"]["kind"] == "challenge"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dispatch_recorded", [True, None])
+async def test_a_step_up_that_may_have_clicked_never_releases(dispatch_recorded) -> None:
+    """⚠️ 点过了、或**不知道点没点**,都不许撤销锁定 —— 撤了就等于删掉当天的防重屏障,
+    下一次运行会再付一笔。不知道就当点过了(fail closed)。"""
+
+    from ziniao_automation.workflows.amazon_disbursement import (
+        AmazonDisbursementWorkflow,
+    )
+    from dataclasses import replace
+
+    from ziniao_automation.workflows.repository_memory import InMemoryWorkflowRepository
+    from ziniao_automation.workflows.types import GuardState
+
+    from .test_auth_cursor import CursorAdapter, make_multi_site_run
+
+    repo = InMemoryWorkflowRepository()
+    run = make_multi_site_run()
+    await repo.add_run(run)
+    adapter = CursorAdapter()
+
+    async def open_without_auth(page, run_, marketplace, expected):
+        adapter.open_calls.append(marketplace.code)
+        return replace(expected, payment_account="493")
+
+    async def ca_step_up(page, run_, marketplace, expected):
+        adapter.submit_calls.append(marketplace.code)
+        raise HumanAuthRequired(
+            "认证", kind="challenge", dispatch_recorded=dispatch_recorded
+        )
+
+    adapter.open_confirmation = open_without_auth
+    adapter.submit_once = ca_step_up
+    workflow = AmazonDisbursementWorkflow(repository=repo, page_adapter=adapter)
+    plan = await workflow.plan(run, object())
+
+    with pytest.raises(HumanAuthRequired):
+        await workflow.execute(run, object(), plan)
+
+    guards = await repo.list_operations(run.id)
+    assert [g.state for g in guards] == [GuardState.ARMED], "锁定必须原样留着"
+    assert [e for e in repo.events if e["event_type"] == "operation_released"] == []

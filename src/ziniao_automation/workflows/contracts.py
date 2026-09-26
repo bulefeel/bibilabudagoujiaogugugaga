@@ -113,14 +113,6 @@ class MarketplacePageAdapter(Protocol):
         expected: MarketplaceSnapshot,
     ) -> ReconcileResult: ...
 
-    async def reconcile(
-        self,
-        page: Any,
-        run: WorkflowRun,
-        marketplace: MarketplaceRef,
-        operation: OperationRecord,
-    ) -> ReconcileResult: ...
-
 
 @runtime_checkable
 class WorkflowRepository(Protocol):
@@ -156,6 +148,10 @@ class WorkflowRepository(Protocol):
     async def get_site_status(
         self, run_id: str, marketplace_code: str
     ) -> SiteStatus | None: ...
+
+    async def list_site_statuses(self, run_id: str) -> Mapping[str, SiteStatus]:
+        """这条运行**全部**站点行的状态,按站点码。"""
+        ...
 
     async def append_event(
         self,

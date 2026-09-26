@@ -6,7 +6,7 @@ from .definition import (
     AmazonDisbursementConfig,
     build_amazon_disbursement_definition,
 )
-from .workflow import AmazonDisbursementWorkflow, DisbursementPolicy
+from .workflow import AmazonDisbursementWorkflow
 
 __all__ = [
     "ALLOWED_MARKETPLACES",
@@ -15,6 +15,5 @@ __all__ = [
     "build_amazon_disbursement_definition",
     "AmazonDomContract",
     "AmazonPaymentsPage",
-    "DisbursementPolicy",
     "parse_amount",
 ]

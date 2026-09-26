@@ -27,6 +27,7 @@ from ziniao_automation.queue import (
     PRIORITY_HUMAN,
     PRIORITY_RECOVERY,
 )
+from ziniao_automation.repositories import marketplace_codes_text
 from ziniao_automation.ziniao.models import ProfileSelector
 from ziniao_automation.ziniao.errors import AuthWaitCancelled, AuthWaitExpired
 
@@ -39,6 +40,7 @@ from .types import (
     RunMode,
     RunStatus,
     StoreRef,
+    UNSETTLED_GUARD_STATES,
     WorkflowRun,
 )
 
@@ -107,6 +109,10 @@ class _MarketplaceSetupProbe:
     message: str = "正在通过对应紫鸟店铺按顺序检测付款账户"
     unified: bool = False
     identity: dict[str, Any] | None = None
+
+
+# 说不清点没点下去的资金记录(存库的字符串值)。见 types.UNSETTLED_GUARD_STATES。
+_UNSETTLED_GUARD_VALUES = tuple(sorted(state.value for state in UNSETTLED_GUARD_STATES))
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,7 +216,9 @@ class DatabaseRunLoader:
                 and (not requested_codes or market.code in requested_codes)
             )
             if requires_marketplaces and not enabled:
-                raise ValueError("任务店铺没有启用的 CA/UK/AU 站点")
+                raise ValueError(
+                    f"任务店铺没有启用的站点（可选：{marketplace_codes_text()}）"
+                )
             return WorkflowRun(
                 id=row.id,
                 workflow=row.workflow,
@@ -337,14 +345,18 @@ class DatabaseRunLoader:
         )
 
     def _financial_guard_snapshot(self) -> dict[str, tuple[str, ...]]:
-        """Return active guard site codes without trusting mutable run config."""
+        """说不清点没点下去的资金记录所在的站点,按运行分组。
+
+        ⚠️ 只收 ARMED/UNCERTAIN。SUBMITTED 在 2026-09-23 删掉回读之后是成功终态;
+        把它也收进来,每次重启都会把**所有成功提现**的运行当成「状态不一致」,
+        直接改写成 UNCERTAIN_FINANCIAL(自审抓到的头号回归)。已提交但运行没落终态的
+        (崩在点击之后)由 ``startup_recovery_plan`` 的 historical 分支收口。
+        """
 
         with self.session_factory() as session:
             rows = session.execute(
                 select(OperationGuard.run_id, OperationGuard.marketplace_code)
-                .where(
-                    OperationGuard.state.in_(("ARMED", "SUBMITTED", "UNCERTAIN"))
-                )
+                .where(OperationGuard.state.in_(_UNSETTLED_GUARD_VALUES))
                 .order_by(OperationGuard.run_id, OperationGuard.marketplace_code)
             ).all()
         grouped: dict[str, list[str]] = {}
@@ -379,10 +391,19 @@ class DatabaseRunLoader:
             if row is None:
                 raise LookupError(f"任务 {run_id} 不存在")
 
-            # An active guard is more authoritative than a contradictory run
-            # terminal state.  Without this repair, engine.reconcile() treats
-            # SUCCEEDED/PARTIAL/FAILED as already settled and returns without
-            # reading the platform, leaving ARMED/SUBMITTED stranded forever.
+            # 一条**说不清**的资金记录(ARMED/UNCERTAIN)比一个矛盾的运行终态更可信:
+            # 运行说「成功」、记录说「不知道点没点下去」,就按不知道处理。
+            # ⚠️ 只看说不清的那种。SUBMITTED + SUCCEEDED 是**一致**的 —— 删回读之后
+            # 这就是正常的成功提现;按旧口径把它也「修」成 UNCERTAIN_FINANCIAL,
+            # 每次重启、每次点一下过期的「继续」都会把成功翻成红色。
+            has_unsettled = session.scalar(
+                select(OperationGuard.id)
+                .where(
+                    OperationGuard.run_id == run_id,
+                    OperationGuard.state.in_(_UNSETTLED_GUARD_VALUES),
+                )
+                .limit(1)
+            )
             reconcilable_statuses = {
                 "RUNNING",
                 "WAITING_APPROVAL",
@@ -391,11 +412,11 @@ class DatabaseRunLoader:
                 "UNCERTAIN_FINANCIAL",
                 "RECONCILING",
             }
-            if row.status not in reconcilable_statuses:
+            if has_unsettled is not None and row.status not in reconcilable_statuses:
                 previous_status = row.status
                 row.status = "UNCERTAIN_FINANCIAL"
                 row.error = (
-                    "检测到资金保护记录与任务状态不一致，已强制进入资金回读"
+                    "任务已结束，但仍有无法确认是否已发出的资金记录，已转入待人工核对"
                 )
                 from ziniao_automation.models import RunEvent
 
@@ -470,7 +491,7 @@ class DatabaseRunLoader:
         """Quarantine one malformed guarded run without blocking its peers."""
 
         message = (
-            "启动资金回读准备失败，已保持资金结果不明确；"
+            "资金收口准备失败，已保持资金结果不明确；"
             f"请人工核查（{type(exc).__name__}）"
         )
         with self.session_factory() as session:
@@ -496,7 +517,8 @@ class DatabaseRunLoader:
                 select(SiteRun).where(
                     SiteRun.run_id == run_id,
                     SiteRun.status.in_(
-                        ("ARMED", "SUBMITTED", "RECONCILING", "WAITING_AUTH")
+                        # 不含 SUBMITTED:那一站点击返回过,有结论,不能改成「不明」。
+                        ("ARMED", "RECONCILING", "WAITING_AUTH")
                     ),
                 )
             ):
@@ -530,10 +552,18 @@ class DatabaseRunLoader:
                     message="程序重启后需人工重新确认",
                 )
             )
+            # 和 engine.expire_auth 一致:这条运行停下了,还在等 / 还没轮到的站点
+            # 都是「需要人工」,不能留在「读取中」「等待审核」(09-23 第三轮复核)。
             for site in session.scalars(
                 select(SiteRun).where(SiteRun.run_id == run_id)
             ):
-                if site.status == "WAITING_AUTH":
+                if site.status in (
+                    "WAITING_AUTH",
+                    "PENDING",
+                    "PREFLIGHT",
+                    "PLANNED",
+                    "WAITING_APPROVAL",
+                ):
                     site.status = "NEEDS_HUMAN_AUTH"
             session.commit()
             return True
@@ -606,13 +636,16 @@ class AutomationService:
         if self._worker is not None:
             self._worker.notifications = deliveries
 
-    async def start_webdriver_mode(self) -> dict[str, Any]:
+    async def start_webdriver_mode(self, *, force: bool = False) -> dict[str, Any]:
         """Switch Ziniao into WebDriver mode, refusing while work is in flight.
 
         Exposed here because this is the only object that can see both halves of
         the safety question: the controller's live lock state, and the durable
         guards in SQLite.  Killing the browser between ``arm_operation`` and the
         irreversible click would strand a payout nobody can account for.
+
+        ``force=True`` 越过那些理由 —— 运营明确要的出口，见
+        ``webdriver_mode.start_webdriver_mode``。越过的内容会写进 WARNING 日志。
         """
 
         from ziniao_automation.ziniao.webdriver_mode import (
@@ -627,19 +660,39 @@ class AutomationService:
             snapshot = locks.snapshot()
 
         pending: list[str] = []
+        # 锁上的键是店铺 id 的字符串。屏幕上只印一个「36」，在三十多家店的情况下
+        # 谁也认不出那是谁，所以这里一并把名字查出来。
+        store_names: dict[str, str] = {}
         if self.session_factory is not None:
-            from ziniao_automation.models import OperationGuard
+            from ziniao_automation.models import OperationGuard, Store
             from sqlalchemy import select as _select
 
             with self.session_factory() as session:
+                # 只有 ARMED(已锁定、点击还没返回)是真危险的窗口 —— 此刻关浏览器
+                # 会让那一下停在说不清。SUBMITTED 已经点完;UNCERTAIN 是等人裁定的
+                # 纸面记录,关不关浏览器都不影响它。把它们算进来,第一笔提现成功之后
+                # 普通切换就被永远挡住(自审抓到的回归)。
+                # 只数**任务还在进行中**的 ARMED。任务早已结束还停在 ARMED 的
+                # (例如点击后抛了异常)是等人裁定的纸面记录,不是正在点击 ——
+                # 算进来会叫人去「等一个永远不会结束的任务」(09-23 第二轮复核)。
+                from ziniao_automation.models import Run as _Run
+                from ziniao_automation.repositories import ACTIVE_RUN_STATUSES
+
                 pending = [
                     f"{row.marketplace_code}（{row.state}）"
                     for row in session.scalars(
-                        _select(OperationGuard).where(
-                            OperationGuard.state.in_(("ARMED", "SUBMITTED"))
+                        _select(OperationGuard)
+                        .join(_Run, _Run.id == OperationGuard.run_id)
+                        .where(
+                            OperationGuard.state == "ARMED",
+                            _Run.status.in_(tuple(ACTIVE_RUN_STATUSES)),
                         )
                     )
                 ]
+                store_names = {
+                    str(row.id): row.name
+                    for row in session.execute(_select(Store.id, Store.name))
+                }
 
         config = getattr(controller, "config", None)
         client_config = getattr(getattr(controller, "client", None), "config", None)
@@ -647,7 +700,10 @@ class AutomationService:
             Path(getattr(config, "client_path", "")),
             host=str(getattr(client_config, "host", "127.0.0.1")),
             port=int(getattr(client_config, "port", 16851)),
-            blockers=describe_blockers(snapshot, pending),
+            blockers=describe_blockers(snapshot, pending, store_names=store_names),
+            force=force,
+            # 卖家名不进日志文件：日志里的店铺只用 #id。
+            log_blockers=describe_blockers(snapshot, pending, store_names={}),
         )
         return {
             "ok": report.ok,
@@ -1088,8 +1144,10 @@ class AutomationService:
         unknown = set(normalized) - set(ALLOWED_MARKETPLACES)
         if unknown:
             raise ValueError(
-                "统一建档站点只能是 CA、UK、AU；无效站点："
-                + "、".join(sorted(unknown))
+                # 统一建档要读付款页才能核验，所以它的白名单是提现流程的
+                # ALLOWED_MARKETPLACES，**不含 DE**。这和店铺弹窗能勾 DE 并不矛盾。
+                f"统一建档站点只能是 {marketplace_codes_text(ALLOWED_MARKETPLACES)}"
+                "；无效站点：" + "、".join(sorted(unknown))
             )
 
         with self.session_factory() as session:
@@ -1413,7 +1471,11 @@ class AutomationService:
         handle: Any,
         adapter: AmazonPaymentsPage,
     ) -> dict[str, Any]:
-        """Confirm each selected site opens as the same seller.  Never clicks.
+        """Confirm each selected site opens as the same seller.
+
+        Never clicks a money control.  The only clicks are the assisted login
+        buttons and, on a multi-site account, the account/site switcher (a view
+        switch; a refusal there fails that site instead of waiting for a login).
 
         This used to press the dashboard's non-final Request-disbursement
         control on every site just to read the payout tail off the details
@@ -1457,7 +1519,14 @@ class AutomationService:
                     await adapter.preflight(handle.page, run, marketplace)
                     handle.page = adapter.resolved_page_for(handle.page)
                     break
-                except HumanAuthRequired:
+                except HumanAuthRequired as exc:
+                    if exc.kind == "marketplace_switch":
+                        # 选不定站点不是登录问题:等「完成登录」等满 30 分钟、还占着
+                        # 资金锁,毫无意义。如实记下原因,接着核下一个站点。
+                        await self._set_marketplace_setup_site(
+                            probe_id, code, status="FAILED", message=str(exc)
+                        )
+                        break
                     resolved_page = adapter.resolved_page_for(handle.page)
                     if resolved_page is not handle.page:
                         handle.page = resolved_page
@@ -1539,8 +1608,8 @@ class AutomationService:
         unknown = set(normalized) - set(ALLOWED_MARKETPLACES)
         if unknown:
             raise ValueError(
-                "自动建档站点只能是 CA、UK、AU；无效站点："
-                + "、".join(sorted(unknown))
+                f"自动建档站点只能是 {marketplace_codes_text(ALLOWED_MARKETPLACES)}"
+                "；无效站点：" + "、".join(sorted(unknown))
             )
         with self.session_factory() as session:
             store = session.get(Store, int(store_id))
@@ -1681,7 +1750,12 @@ class AutomationService:
                         await adapter.preflight(handle.page, run, marketplace)
                         handle.page = adapter.resolved_page_for(handle.page)
                         break
-                    except HumanAuthRequired:
+                    except HumanAuthRequired as exc:
+                        if exc.kind == "marketplace_switch":
+                            await self._set_marketplace_setup_site(
+                                probe_id, code, status="FAILED", message=str(exc)
+                            )
+                            break
                         resolved_page = adapter.resolved_page_for(handle.page)
                         if resolved_page is not handle.page:
                             handle.page = resolved_page
@@ -2197,15 +2271,21 @@ class AutomationService:
             # attempts the full guarded check again.
             status = await self.engine.repository.get_run_status(run_id)
             if status in (RunStatus.WAITING_AUTH, RunStatus.NEEDS_HUMAN_AUTH):
-                if await self.engine.repository.list_operations(run_id):
-                    changed = await self.engine.repository.set_run_status(
-                        run_id,
-                        RunStatus.UNCERTAIN_FINANCIAL,
-                        allowed_from=(status,),
+                operations = await self.engine.repository.list_operations(run_id)
+                if operations:
+                    # 动过钱的运行只能收口。只有真说不清的记录才先标成
+                    # UNCERTAIN_FINANCIAL;全是已提交的,交给收口按事实定终态。
+                    if any(op.state in UNSETTLED_GUARD_STATES for op in operations):
+                        changed = await self.engine.repository.set_run_status(
+                            run_id,
+                            RunStatus.UNCERTAIN_FINANCIAL,
+                            allowed_from=(status,),
+                        )
+                        if not changed:
+                            raise RuntimeError("任务状态已变化，请刷新后重试")
+                    await self._enqueue(
+                        run_id, action="RECONCILE", priority=PRIORITY_RECOVERY
                     )
-                    if not changed:
-                        raise RuntimeError("任务状态已变化，请刷新后重试")
-                    await self._enqueue(run_id, action="RECONCILE", priority=PRIORITY_RECOVERY)
                     return
                 changed = await self.engine.repository.set_run_status(
                     run_id,
@@ -2233,13 +2313,9 @@ class AutomationService:
                     )
                         .limit(1)
                     )
-                # A durable RECONCILE item is itself a financial safety marker.
-                # It may survive a restart after all guard rows have reached a
-                # terminal state, so checking only active guard states above is
-                # insufficient. Keep both reads in this managed session before
-                # any cancellation signal or ``cancel_ready`` call; otherwise
-                # cancellation could erase the only recovery action and strand
-                # the run in a reconcile state.
+                # 收口条目也是一个资金安全标记:所有 guard 都已收口之后它仍可能
+                # 活到下次重启,所以只看活跃 guard 状态是不够的。两次读都要在这个
+                # 会话里做完,再去发取消信号,否则取消会抹掉唯一的恢复动作。
                 recovery_entry = session.scalar(
                     select(RunQueueEntry.action)
                     .where(
@@ -2251,25 +2327,41 @@ class AutomationService:
                 )
             if active_guard is not None:
                 raise RuntimeError(
-                    "任务已进入资金保护阶段，只能执行付款结果回读，不能取消"
+                    "任务已进入资金保护阶段，不能取消"
                 )
             if recovery_entry is not None:
                 raise RuntimeError(
-                    "任务已进入资金回读队列，只能先完成资金结果回读，不能取消"
+                    "任务已进入资金收口队列，需先完成收口，不能取消"
                 )
         signal = getattr(self.ziniao_controller, "cancel_auth", None)
         if callable(signal) and await signal(run_id):
             return
+        run = await self._load_for_cancel(run_id)
         if self._queue is not None and self._queue.cancel_ready(run_id):
-            run = await self.run_loader(run_id)
             cancelled = await self.engine.cancel(run)
             await self._raise_if_cancel_was_unsafe(run_id, cancelled)
             if self._worker is not None:
                 self._worker.wake()
             return
-        run = await self.run_loader(run_id)
         cancelled = await self.engine.cancel(run)
         await self._raise_if_cancel_was_unsafe(run_id, cancelled)
+
+    async def _load_for_cancel(self, run_id: str) -> Any:
+        """取消只需要认出这条运行是谁,不需要它还能跑。
+
+        ⚠️ 原来走的是完整严格加载:运营在审批卡上看到 CA、决定不付、先去店铺设置里
+        把 CA 关掉、再回来点「取消任务」—— 加载器于是抛「任务店铺没有启用的站点」,
+        422,永远取消不掉,直到审批超时变成一条谁也动不了的僵尸(2026-09-26 自审)。
+        资金侧的恢复加载器早就是这么做的(只按资金记录重建站点列表)。
+        """
+
+        loader = getattr(self.run_loader, "load_financial_recovery", None)
+        try:
+            return await self.run_loader(run_id)
+        except Exception:
+            if not callable(loader):
+                raise
+            return await loader(run_id)
 
     async def _raise_if_cancel_was_unsafe(
         self, run_id: str, cancelled: Any
@@ -2300,28 +2392,13 @@ class AutomationService:
             return
         if await self.engine.repository.list_operations(run_id):
             raise RuntimeError(
-                "任务已进入资金保护阶段，只能执行付款结果回读，不能取消"
+                "任务已进入资金保护阶段，不能取消；请在运行详情页按资金记录逐条裁定后收尾"
             )
         if status in {RunStatus.RUNNING, RunStatus.RECONCILING}:
             raise RuntimeError(
                 "任务正在执行，当前尚未到可安全取消的等待点；本次未写入取消状态"
             )
         raise RuntimeError("任务状态已变化，当前不能取消，请刷新后重试")
-
-    async def reconcile_run(self, run_id: str) -> None:
-        if self._queue is not None:
-            changed = self._queue.replace_ready_action(
-                run_id, action="RECONCILE", priority=PRIORITY_RECOVERY
-            )
-            if not changed:
-                await self._enqueue(
-                    run_id, action="RECONCILE", priority=PRIORITY_RECOVERY
-                )
-            elif self._worker is not None:
-                await self._worker.start()
-                self._worker.wake()
-        else:
-            await self._spawn(run_id, lambda run: self.engine.reconcile(run))
 
     async def _enqueue(
         self,
@@ -2335,7 +2412,9 @@ class AutomationService:
                 "START": lambda run: self.engine.start(run),
                 "APPROVE": lambda run: self.engine.approve(run),
                 "CONTINUE_AUTH": lambda run: self.engine.continue_auth(run),
-                "RECONCILE": lambda run: self.engine.reconcile(run),
+                # ⚠️ 名字还叫 RECONCILE(见 queue.QUEUE_ACTIONS 的说明),
+                # 但它派发到的是离线收口,不再去亚马逊回读。
+                "RECONCILE": lambda run: self.engine.settle(run),
             }
             await self._spawn(run_id, actions[action])
             return
@@ -2345,7 +2424,6 @@ class AutomationService:
 
     async def _execute_queue_entry(self, entry: Any) -> None:
         durable_status: str | None = None
-        has_active_guard = False
         has_any_guard = False
         if self.session_factory is not None:
             with self.session_factory() as session:
@@ -2360,19 +2438,16 @@ class AutomationService:
                     )
                 )
                 has_any_guard = bool(guard_states)
-                has_active_guard = any(
-                    state in {"ARMED", "SUBMITTED", "UNCERTAIN"}
-                    for state in guard_states
-                )
-        # The guard, not a stale queue action, decides what is safe. An
-        # ARMED/SUBMITTED/UNCERTAIN run can only enter the read-back path.
-        effective_action = "RECONCILE" if has_active_guard else entry.action
+        # 由资金记录而不是过期的队列动作决定什么是安全的:带 ARMED/SUBMITTED/
+        # UNCERTAIN 记录的运行**只能**去收口,绝不能按旧动作重跑一遍提现。
+        # ⚠️ 这条覆盖和「回读」是两回事,2026-09-23 删回读时不能顺手删掉它。
+        effective_action = "RECONCILE" if has_any_guard else entry.action
         try:
             recovery_loader = getattr(
                 self.run_loader, "load_financial_recovery", None
             )
             if (
-                (has_active_guard or (entry.action == "RECONCILE" and has_any_guard))
+                has_any_guard
                 and callable(recovery_loader)
             ):
                 run = await recovery_loader(entry.run_id)
@@ -2411,7 +2486,7 @@ class AutomationService:
         elif effective_action == "CONTINUE_AUTH":
             await self.engine.continue_auth(run)
         elif effective_action == "RECONCILE":
-            await self.engine.reconcile(run)
+            await self.engine.settle(run)
         else:  # database check constraint is defence in depth
             raise RuntimeError(f"unknown queue action: {entry.action}")
 
@@ -2497,9 +2572,9 @@ class AutomationService:
             # Isolated non-database consumers retain the legacy serial path.
             for run in plan.financial:
                 try:
-                    await self.engine.reconcile(run)
+                    await self.engine.settle(run)
                 except Exception:
-                    logger.exception("Startup reconciliation failed for run %s", run.id)
+                    logger.exception("Startup settlement failed for run %s", run.id)
 
         # A plain RUNNING record means the process died during a read-only,
         # pre-submit step.  CAS it back to QUEUED before spawning so the engine
@@ -2546,6 +2621,11 @@ class AutomationService:
             marker = getattr(self.run_loader, "mark_waiting_auth_after_restart", None)
             if callable(marker):
                 changed = await marker(run_id)
+                if changed:
+                    # 操作员手上最后一张卡是「等待登录验证，完成后回后台继续」。
+                    # 重启让那次验证作废了,不告诉他,他会去完成一个已经接不上的验证
+                    # (09-23 自审复核)。expire_auth 那条分支自己会发这张卡。
+                    await self._notify_auth_lease_lost(run_id)
             else:
                 run = await self.run_loader(run_id)
                 changed = await self.engine.expire_auth(run)
@@ -2555,6 +2635,16 @@ class AutomationService:
         if self._worker is not None:
             await self._worker.start()
             self._worker.wake()
+
+    async def _notify_auth_lease_lost(self, run_id: str) -> None:
+        deliveries = getattr(self._worker, "notifications", None)
+        notify = getattr(deliveries, "notify_auth_timeout", None)
+        if not callable(notify):
+            return
+        try:
+            await notify(run_id)
+        except Exception:
+            logger.exception("auth_lease_lost_notice_failed run_id=%s", run_id[:8])
 
     async def wait_idle(self) -> None:
         if self._worker is not None:

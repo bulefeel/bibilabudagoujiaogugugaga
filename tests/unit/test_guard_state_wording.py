@@ -40,8 +40,11 @@ def test_no_surface_says_the_platform_is_reviewing_it(name: str) -> None:
 def test_every_surface_uses_the_same_wording() -> None:
     """网页、飞书卡片、通知文案说同一句话，否则跨渠道对不上号。"""
 
+    # 「已发出，平台尚未显示」在删回读之后是错话:UNCERTAIN 现在只来自「没看到点击
+    # 返回」与人工待裁定的历史记录,系统也不会再去平台查。三处统一说「待人工核对」。
     for name in ("web", "feishu", "database"):
-        assert "已发出，平台尚未显示" in _sources()[name], name
+        assert "待人工核对" in _sources()[name], name
+        assert "已发出，平台尚未显示" not in _sources()[name], name
 
 
 def test_the_run_page_explains_the_state_not_just_the_buttons() -> None:
@@ -53,44 +56,14 @@ def test_the_run_page_explains_the_state_not_just_the_buttons() -> None:
     note = _sources()["run_detail"]
     assert "不是在等你审核" in note
     assert "真的被点下去" in note
-    assert "不会自己变好" in note, "必须写明它不会自动收尾，否则操作员会一直等"
-    assert "永不重新提交" in note
+    # 「不会自己变好」「永不重新提交」原来讲的是那颗「只回读，不重提」按钮。
+    # 2026-09-23 删掉回读之后没有这颗按钮了,改钉真正该说清的那件事:
+    # 这个状态意味着钱已经请求出去了,而系统不会再回头去查。
+    # ⚠️ 连「不会」一起钉:只钉「回头去亚马逊查」的话,意思相反的旧句子也满足。
+    assert "系统<b>不会</b>回头去亚马逊查这笔到没到" in note
+    assert "只回读，不重提" not in note
     # 最重要的一句：不处理也不会挡住下一次。否则操作员会为了对账天天来点一次。
     assert "不处理也可以" in note
     assert "不会挡住" in note
     assert "同店同站同一天只允许一条资金记录" in note
 
-
-def test_the_guard_row_shows_that_a_read_back_actually_ran() -> None:
-    """跑过但没查到，和压根没跑，在页面上必须区分得开。
-
-    回读会写 last_reconciled_at、把原因写进 metadata、还追加 reconcile_attempt 事件——
-    数据一直都在，只是守卫行一个字都不显示。于是操作员点完看到的东西和点之前一模一样，
-    只能反复点。
-    """
-
-    note = _sources()["run_detail"]
-
-    assert "guard.last_reconciled_at" in note
-    assert "上次回读" in note
-    assert "仍未查到" in note
-    assert "guard.metadata_json" in note, "回读给出的原因要显示出来"
-
-
-def test_reconcile_waits_for_the_job_instead_of_reloading_immediately() -> None:
-    """回读是排队执行的，固定 800ms 后刷新只会看到原样。
-
-    它要开一个紫鸟窗口，几十秒起步。原来那个立即刷新让整个动作看起来毫无效果。
-    """
-
-    script = (
-        PROJECT_ROOT / "src/ziniao_automation/static/app.js"
-    ).read_text(encoding="utf-8")
-
-    assert "async function waitForRunToSettle" in script
-    assert 'if (runAction === "reconcile")' in script
-    assert "await waitForRunToSettle(runId)" in script
-    assert '"正在回读…"' in script
-    # 观察不到 RECONCILING 时也要到点收手，不能把人永远晾着。
-    assert "attempts = 80" in script
-    assert "sawReconciling" in script

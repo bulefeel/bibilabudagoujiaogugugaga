@@ -16,6 +16,27 @@ def _template() -> str:
     )
 
 
+def _base() -> str:
+    return (PROJECT_ROOT / "src/ziniao_automation/templates/base.html").read_text(
+        encoding="utf-8"
+    )
+
+
+def _cache_key() -> str:
+    """当前的静态资源缓存键，从 base.html 读出来而不是写死。
+
+    写死的话每次 bump 都会多出几条互不相干的红，训练出「看到红就改断言」的
+    习惯。这些断言想说的是「页面发的是当前这一版静态资源」，不是「键等于某个
+    字面量」。
+    """
+
+    import re
+
+    keys = set(re.findall(r"app\.(?:js|css)'\) }}\?v=([\w.-]+)", _base()))
+    assert len(keys) == 1, f"app.js 和 app.css 的缓存键必须一致，读到：{keys}"
+    return keys.pop()
+
+
 def test_store_editor_uses_one_unified_setup_action_without_a_save_prerequisite() -> None:
     template = _template()
     script = _script()
@@ -166,7 +187,9 @@ def test_global_credential_error_pauses_single_and_bulk_setup_without_store_fail
     assert "bulkStoreSetup.failed += 1" not in bulk
     assert "凭据保存后重试当前店铺" in script
     assert "不会继续打开下一家" in script
-    assert "app.js') }}?v=20260831-schedule-bulk" in base
+    # 升级后浏览器必须重新取 app.js，否则新模板会配上旧处理器。这里钉的是
+    # 「键存在且 js/css 一致」，具体值由 _cache_key 从 base.html 读。
+    assert f"app.js') }}}}?v={_cache_key()}" in base
 
 
 def test_bulk_refresh_revalidates_probe_before_showing_auth_actions() -> None:
@@ -343,4 +366,80 @@ def test_legacy_setup_routes_are_not_left_in_the_frontend_and_cache_is_bumped() 
         "detect-all-marketplace-setups",
     ):
         assert legacy not in combined
-    assert "20260831-schedule-bulk" in base
+    assert _cache_key() in base
+    # 上一版的键要留在注释里，升级出问题时才查得出用户卡在哪一版。
+    assert "previous cache key retained in source" in base
+
+
+def test_de_is_saveable_but_never_sent_to_the_unified_setup_probe() -> None:
+    """同一批 ``[data-store-marketplace]`` 行有两个消费者，DE 只能进其中一个。
+
+    - 保存店铺读**全部**行，DE 必须在里面，否则德国站永远存不进账册；
+    - 统一建档只读**勾选**的行，DE 绝不能在里面——核验要打开付款控制面板，
+      德国站没有那条链路，服务端会回「统一建档站点只能是…；无效站点：DE」。
+
+    不隔开的话，操作员会在**唯一能勾 DE 的那个界面**上收到一条自相矛盾的报错。
+    这个测试钉的是这道分界，不是某一句文案。
+    """
+
+    template = _template()
+    script = _script()
+
+    # 模板：DE 行存在，并且带着把它挡在探针之外的标记。
+    assert 'data-store-marketplace="{{ code }}"' in template
+    assert "'DE', '德国', 'sellercentral.amazon.de', false" in template
+    assert "data-no-probe" in template
+
+    # 脚本：每一条喂给探针的选择器都必须排除 data-no-probe。
+    probe_selectors = [
+        line
+        for line in script.splitlines()
+        if "[data-store-marketplace]" in line and "data-marketplace-enabled]:checked" in line
+    ]
+    assert probe_selectors, "找不到探针的行选择器，断言已经失去目标"
+    for line in probe_selectors:
+        assert ":not([data-no-probe])" in line, line.strip()
+
+    # 反向：保存店铺那条**不能**排除，否则 DE 永远存不进去。
+    start = script.index("marketplaces: $$(")
+    saving = script[start : start + 240]
+    assert "[data-store-marketplace]" in saving
+    assert "data-no-probe" not in saving
+
+
+def test_no_probe_rows_never_receive_a_detection_status() -> None:
+    """没被检测过的站点不该有检测结论。
+
+    两种假结论都真实出现过：
+    - 统一建档收尾时，条件是「returnedCodes 命中」**或**「已勾选且仍为 PENDING」，
+      勾上的 DE 满足后半句，于是一次与它无关的建档结束后它被判成「核验失败」；
+    - 打开编辑框回填时，循环会无差别调用 ``setMarketplaceRowStatus``，
+      把 DE 的「不参与核验」覆盖成「待检测」。
+
+    所以不变量不是「循环要不要排除 DE」——回填勾选时**必须**包含它——而是
+    **任何一次 setMarketplaceRowStatus 都不能落到 data-no-probe 行上**。
+    """
+
+    script = _script()
+    marker = "$$('[data-store-marketplace]"
+    # 按真实边界切块（下一个同类循环的起点），不用固定长度窗口——窗口会越过
+    # 分支边界，测试看着绿其实什么都没盖住。
+    starts = [
+        index
+        for index in range(len(script))
+        if script.startswith(marker, index)
+    ]
+    assert starts, "找不到逐行处理站点的循环，断言已经失去目标"
+    blocks = [
+        script[start : (starts[i + 1] if i + 1 < len(starts) else len(script))]
+        for i, start in enumerate(starts)
+    ]
+    touching_status = [b for b in blocks if "setMarketplaceRowStatus(" in b]
+    assert touching_status, "没有任何循环设置检测态，断言已经失去目标"
+    for block in touching_status:
+        header = block[: block.index("\n")]
+        guarded = ":not([data-no-probe])" in header or (
+            'hasAttribute("data-no-probe")'
+            in block[: block.index("setMarketplaceRowStatus(")]
+        )
+        assert guarded, header.strip()

@@ -233,7 +233,7 @@
       setMarketplaceRowStatus(row, status, detail);
     }
     if (["CHECKING", "WAITING_AUTH"].includes(String(data.status || "").toUpperCase())) {
-      $$('[data-store-marketplace] [data-marketplace-enabled]:checked', form).forEach(input => {
+      $$('[data-store-marketplace]:not([data-no-probe]) [data-marketplace-enabled]:checked', form).forEach(input => {
         const row = input.closest("[data-store-marketplace]");
         if (!returnedCodes.has(row.dataset.storeMarketplace)) {
           setMarketplaceRowStatus(row, "CHECKING", "排队等待检查");
@@ -258,7 +258,10 @@
         : overall === "NEEDS_REVIEW"
           ? ["FAILED", data.message || "卖家身份需要人工复核，站点核验未完成"]
           : ["FAILED", data.message || "检测已结束，但该站点没有返回完整结果；请稍后重试"];
-    $$('[data-store-marketplace]', form).forEach(row => {
+    // :not([data-no-probe]) —— 不参与统一建档的站点（DE）永远不会出现在
+    // returnedCodes 里，但它勾上以后 enabled && PENDING 会成立，于是会被这段
+    // 收尾逻辑判成「核验失败」。它压根没被检测过，不该有检测结论。
+    $$('[data-store-marketplace]:not([data-no-probe])', form).forEach(row => {
       const code = String(row.dataset.storeMarketplace || "").toUpperCase();
       const current = String(row.dataset.marketplaceProbeStatus || "PENDING").toUpperCase();
       const enabled = $("[data-marketplace-enabled]", row)?.checked;
@@ -278,7 +281,7 @@
   }
   function pauseStoreSetupForCredential(form, error) {
     const ui = storeSetupUi(form), message = ziniaoCredentialGuidance(error);
-    $$('[data-store-marketplace]', form).forEach(row => {
+    $$('[data-store-marketplace]:not([data-no-probe])', form).forEach(row => {
       if (String(row.dataset.marketplaceProbeStatus || "").toUpperCase() === "CHECKING") {
         setMarketplaceRowStatus(row, "PENDING", "尚未启动：请先重新保存紫鸟凭据");
       }
@@ -853,7 +856,10 @@
     $$('[data-store-marketplace]', form).forEach(row => {
       const site = savedMarketplaces.get(String(row.dataset.storeMarketplace || "").toUpperCase());
       if (!site) return;
+      // 勾选状态每个站点都要回填；检测态只对参与统一建档的站点有意义，否则
+      // 打开编辑框就会把德国站的「不参与核验」覆盖成「待检测」。
       $('[data-marketplace-enabled]', row).checked = !!site.enabled;
+      if (row.hasAttribute("data-no-probe")) return;
       setMarketplaceRowStatus(row, "PENDING", "勾选后核验域名与卖家身份");
     });
     form.dataset.persistedSellerId = String(saved.expected_seller_id || "");
@@ -938,7 +944,7 @@
         const legend=document.createElement("legend");legend.textContent=fieldLabel(key,schema)+(Number(schema.minItems||0)>0?"（至少选择 "+schema.minItems+" 个）":"");holder.append(legend);
         const itemSchema=resolveWorkflowFieldSchema(meta,schema.items||{}),enumValues=Array.isArray(itemSchema.enum)?itemSchema.enum:[],supportedEnum=!schema.__uiUnsupported&&!schema.__uiNullable&&!itemSchema.__uiUnsupported&&!itemSchema.__uiNullable&&enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value)),current=new Set(Array.isArray(initial)?initial.map(value=>JSON.stringify(value)):[]);
         if(!supportedEnum)holder.dataset.configUnsupported="true";
-        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
+        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚",DE:"DE 德国"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
       }else{
         const title=document.createElement("span");title.textContent=fieldLabel(key,schema)+(required.has(rawKey)?" *":"");holder.append(title);const scalarType=["string","number","integer","boolean"].includes(type),enumValues=Array.isArray(schema.enum)?schema.enum:null,enumSupported=!enumValues||(enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value))),nullableSupported=!schema.__uiNullable||Boolean(enumValues)||type==="boolean";
         if(schema.__uiUnsupported||!scalarType||!enumSupported||!nullableSupported){holder.dataset.configUnsupported="true";}
@@ -1123,21 +1129,6 @@
     catch (exc) { if (error) error.textContent = exc.message; else toast(exc.message, true); }
     finally { if (button) button.disabled = false; }
   }));
-  // 轮询到这次回读真的结束为止。判据是「进过 RECONCILING 再离开」；万一始终没观察到
-  // （队列很忙、或者跑得比一次轮询还快），到点也照样刷新，绝不把操作员永远晾在这里。
-  async function waitForRunToSettle(runId, {attempts = 80, intervalMs = 3000} = {}) {
-    let sawReconciling = false;
-    for (let index = 0; index < attempts; index += 1) {
-      await sleep(intervalMs);
-      let status = "";
-      try {
-        status = String((await api(`/api/runs/${encodeURIComponent(runId)}`)).status || "");
-      } catch (_) { continue; }   // 轮询失败不该把整个动作judged为失败
-      if (status === "RECONCILING") { sawReconciling = true; continue; }
-      if (sawReconciling) return status;
-    }
-    return "";
-  }
   document.addEventListener("click", async event => {
     const target = event.target.closest("[data-action],[data-run-action]"); if (!target) return;
     const action = target.dataset.action;
@@ -1171,6 +1162,7 @@
       $$('[data-store-marketplace]', form).forEach(row => {
         const site = marketplaces.get(row.dataset.storeMarketplace) || {};
         $('[data-marketplace-enabled]', row).checked = !!site.enabled;
+        if (row.hasAttribute("data-no-probe")) return;
         setMarketplaceRowStatus(row, "PENDING", "勾选后核验域名与卖家身份");
       });
       dialog.dataset.storeId = String(data.id ?? ""); const ui = storeSetupUi(form); ui.error.textContent = "";
@@ -1182,7 +1174,7 @@
     }
     if (action === "detect-store-setup") {
       const form = target.closest("form"), id = Number($("[name=id]", form)?.value), ui = storeSetupUi(form);
-      const marketplaceCodes = $$('[data-store-marketplace] [data-marketplace-enabled]:checked', form).map(input => input.closest("[data-store-marketplace]").dataset.storeMarketplace);
+      const marketplaceCodes = $$('[data-store-marketplace]:not([data-no-probe]) [data-marketplace-enabled]:checked', form).map(input => input.closest("[data-store-marketplace]").dataset.storeMarketplace);
       if (!validPositiveId(id)) { ui.error.textContent = "未识别到当前店铺，请关闭窗口后重新点击“编辑建档”。"; return; }
       if (!marketplaceCodes.length) { ui.error.textContent = "请先勾选至少一个需要统一建档的站点。"; return; }
       target.disabled = true; target.textContent = "正在打开对应紫鸟店铺…"; ui.error.textContent = ""; ui.reset.disabled = true;
@@ -1259,19 +1251,26 @@
       const allCards = $$('[data-store-card]');
       const cards = allCards.filter(card => card.dataset.storeSetupNeeded === "true");
       const eligible = cards.map(card => {
-        let marketplaceCodes = [];
-        try { marketplaceCodes = JSON.parse(card.dataset.storeSetupMarketplaces || "[]"); } catch (_) {}
-        marketplaceCodes = [...new Set(marketplaceCodes.map(code => String(code).toUpperCase()).filter(code => ["CA", "UK", "AU"].includes(code)))];
-        const defaulted = marketplaceCodes.length === 0;
+        let enabled = [];
+        try { enabled = JSON.parse(card.dataset.storeSetupMarketplaces || "[]"); } catch (_) {}
+        enabled = [...new Set(enabled.map(code => String(code).toUpperCase()))];
+        // 建档只核验提现支持的这三个站点。
+        let marketplaceCodes = enabled.filter(code => ["CA", "UK", "AU"].includes(code));
+        // ⚠️ 只在店铺**一个站点都没启用**时才退到 CA/UK/AU。原来是过滤之后再判空:
+        // 只开了 DE 的 GPSR 店过滤完是空表 → 被当成「没选站点」→ 确认框说要默认按
+        // CA/UK/AU 建档 → 建档成功后把这三个站点一起开了,运营从没要过
+        // (2026-09-26 自审)。这种店应该整个跳过。
+        const defaulted = enabled.length === 0;
         if (defaulted) marketplaceCodes = ["CA", "UK", "AU"];
         return {
           id:Number(card.dataset.storeId),
           name:card.dataset.storeName || `店铺 #${card.dataset.storeId}`,
           marketplaceCodes,
           defaulted,
+          unsupportedOnly: !defaulted && marketplaceCodes.length === 0,
           identityState:String(card.dataset.identityState || "MISSING").toUpperCase(),
         };
-      }).filter(store => validPositiveId(store.id));
+      }).filter(store => validPositiveId(store.id) && !store.unsupportedOnly);
       const alreadyComplete = allCards.length - cards.length;
       if (!eligible.length) {
         toast(allCards.length ? "全部店铺的卖家身份和已启用站点都已完成建档。" : "暂无可建档店铺。", true);
@@ -1530,7 +1529,7 @@
       // Make it unmistakable that this is their finding from Seller Central and
       // not something the system read back, because nothing will re-check it.
       const site = target.dataset.marketplace || "该站点";
-      const agreed = await confirmAction(`你已经在亚马逊后台看到 ${site} 的 ${target.dataset.amount || "这笔提现"} 确实转出了吗？确认后这条记录结案为「已确认」，系统不会再回读。如果你其实没有核对过，请先去亚马逊付款记录里查证。`);
+      const agreed = await confirmAction(`你已经在亚马逊后台看到 ${site} 的 ${target.dataset.amount || "这笔提现"} 确实转出了吗？确认后这条记录按你的人工核对结案为「已确认」，系统不会再去核实。如果你其实没有核对过，请先去亚马逊付款记录里查证。`);
       if (!agreed) return;
       target.disabled = true;
       try {
@@ -1541,24 +1540,15 @@
       return;
     }
     if (runAction) {
-      const map = {approve:"approve", cancel:"cancel", reconcile:"reconcile", "continue-auth":"continue-auth", settle:"settle"};
-      const message = target.dataset.confirm || (runAction === "cancel" ? "确认取消这个任务？资金锁定后的任务仍只会进入回读。" : "确认执行此操作？");
+      const map = {approve:"approve", cancel:"cancel", "continue-auth":"continue-auth", settle:"settle"};
+      const message = target.dataset.confirm || (runAction === "cancel" ? "确认取消这个任务？已进入资金保护阶段的任务不能取消。" : "确认执行此操作？");
       if (!(await confirmAction(message))) return;
       target.disabled = true;
       try {
         const runId = target.dataset.runId;
         await api(`/api/runs/${runId}/${map[runAction]}`, {method:"POST", body:"{}"});
-        // 回读是排队执行的：它要开一个紫鸟窗口，几十秒起步。原来固定 800ms 后刷新，
-        // 那时活儿还没开始，页面原样回来，看起来就像「点了什么都没发生」，操作员只能
-        // 反复点。改成等它真的跑完再刷新。
-        if (runAction === "reconcile") {
-          toast("已排队；正在打开紫鸟窗口回读，请稍候");
-          target.textContent = "正在回读…";
-          await waitForRunToSettle(runId);
-        } else {
-          toast("请求已进入队列");
-        }
-        setTimeout(() => location.reload(), runAction === "reconcile" ? 200 : 800);
+        toast("请求已进入队列");
+        setTimeout(() => location.reload(), 800);
       } catch (exc) { toast(exc.message, true); target.disabled = false; }
     }
   });
@@ -1677,41 +1667,73 @@
   // ---- 系统诊断页：WebDriver 切换与凭据配置 ----------------------------------
   (function diagnosticsPage() {
     const webdriverButton = $('[data-action="start-webdriver"]');
+    const webdriverForce = $('[data-action="force-webdriver"]');
     const webdriverState = $("[data-webdriver-state]");
 
+    // ⚠️ 这行字原来写进去就再也不会消失。2026-09-22 运营关掉了全部紫鸟窗口，
+    // 屏幕上那句拒绝还在，于是以为判据坏了 —— 其实那是上一次点击留下的旧结果，
+    // 页面根本没有重新检查过。带上时刻，过期的结果至少看得出来是过期的。
     function say(text, bad) {
       if (!webdriverState) return;
-      webdriverState.textContent = text;
+      const at = new Date().toTimeString().slice(0, 5);
+      webdriverState.textContent = text ? "[" + at + "] " + text : "";
       webdriverState.className = "diagnostic-actions-state" + (bad ? " bad" : "");
     }
 
-    webdriverButton?.addEventListener("click", async () => {
+    async function switchWebdriverMode(force) {
       // Naming the consequence beats a generic "确定执行此操作？": the operator
       // may well have store windows open right now with work in them.
       const agreed = await confirmAction(
-        "切换到 WebDriver 模式会强制关闭当前所有已打开的紫鸟店铺窗口。\n\n" +
-        "如果有店铺窗口里正在人工处理验证，请先处理完。确定继续吗？"
+        force
+          ? "强制切换会忽略上面列出的阻止理由，直接关掉当前所有紫鸟店铺窗口。\n\n" +
+            "如果其中有正在提交的提现，这一步会把它停在说不清的状态。确定继续吗？"
+          : "切换到 WebDriver 模式会强制关闭当前所有已打开的紫鸟店铺窗口。\n\n" +
+            "如果有店铺窗口里正在人工处理验证，请先处理完。确定继续吗？"
       );
       if (!agreed) return;
+      const pressed = force && webdriverForce ? webdriverForce : webdriverButton;
       webdriverButton.disabled = true;
-      const original = webdriverButton.textContent;
-      webdriverButton.textContent = "正在切换…";
+      if (webdriverForce) webdriverForce.disabled = true;
+      const original = pressed.textContent;
+      pressed.textContent = "正在切换…";
       say("正在关闭旧窗口并启动 WebDriver 模式，最长等待 60 秒…");
       try {
-        const data = await api("/api/ziniao/webdriver/start", {method:"POST", body:"{}"});
+        const data = await api("/api/ziniao/webdriver/start", {
+          method: "POST",
+          body: JSON.stringify({force: Boolean(force)}),
+        });
         say(data.message || "已就绪");
         toast("紫鸟 WebDriver 模式已就绪");
-        setTimeout(() => location.reload(), 1200);
+        // 强制切换时 message 里带着「已越过：…」。自动刷新会在 1.2 秒内把它抹掉，
+        // 这一步在界面上就和一次干净的切换长得一模一样 —— 留在页面上让人读完。
+        const overridden = (data.details && data.details.overridden_blockers) || [];
+        if (overridden.length) {
+          webdriverButton.disabled = false;
+          if (webdriverForce) {
+            webdriverForce.hidden = true;
+            webdriverForce.disabled = false;
+          }
+          pressed.textContent = original;
+        } else {
+          setTimeout(() => location.reload(), 1200);
+        }
       } catch (exc) {
         // The server's refusal text names which store or guard is in the way;
         // replacing it with something generic would remove the only actionable
         // part of the message.
         say(exc.message, true);
         toast(exc.message, true);
+        // 409 = 被那几条理由挡下的。只有这种情况才把强制按钮露出来：其它失败
+        // （客户端没装、端口起不来）强制也没用，摆出来只会误导。
+        if (webdriverForce && exc.statusCode === 409) webdriverForce.hidden = false;
         webdriverButton.disabled = false;
-        webdriverButton.textContent = original;
+        if (webdriverForce) webdriverForce.disabled = false;
+        pressed.textContent = original;
       }
-    });
+    }
+
+    webdriverButton?.addEventListener("click", () => switchWebdriverMode(false));
+    webdriverForce?.addEventListener("click", () => switchWebdriverMode(true));
 
     function bindSettings(kind, endpoint, successText) {
       const form = $(`[data-settings-form="${kind}"]`);

@@ -10,7 +10,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-MarketplaceCode = Literal["CA", "UK", "AU"]
+MarketplaceCode = Literal["CA", "UK", "AU", "DE"]
 RunMode = Literal["dry_run", "approval", "auto"]
 Weekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -180,6 +180,16 @@ class ScheduleDeleteView(ApiModel):
     scheduler_refreshed: bool
     scheduler_failed_schedule_ids: list[int] | None = None
     warning: str | None = None
+
+
+class WebdriverStart(StrictApiModel):
+    """切换到紫鸟 WebDriver 模式。
+
+    ``force`` 越过「有任务在跑 / 有未收尾资金记录」那几条阻止。默认 False：
+    界面只在收到 409 之后才把强制按钮露出来，所以这必须是操作员的第二次点击。
+    """
+
+    force: bool = False
 
 
 class RunCreate(StrictApiModel):

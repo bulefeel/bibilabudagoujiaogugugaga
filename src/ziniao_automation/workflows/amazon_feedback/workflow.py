@@ -22,6 +22,7 @@ from decimal import Decimal
 from typing import Any, Sequence
 
 from ..contracts import WorkflowRepository
+from ..errors import HumanAuthRequired
 from ..types import (
     MarketplaceRef,
     MarketplaceSnapshot,
@@ -140,17 +141,42 @@ class AmazonFeedbackWorkflow:
         )
 
         outcome = await self.page_adapter.open_list(page, marketplace.domain)
+        page = getattr(outcome, "page", None) or page
         if not outcome.ok:
-            # Seller Central bounced us to the account switcher, which is what
-            # it does when the store does not sell on this marketplace.  That
-            # is a fact about the store, not a fault: the other sites must
-            # still run, and the whole run must not be reported as failed.
+            if outcome.reason == "auth_required":
+                # 会话掉了。交给引擎的人工接管路径,**不能**当成「这个站点没活儿」。
+                _log_item(marketplace.code, "NEEDS_HUMAN_AUTH", "auth_required")
+                raise HumanAuthRequired(
+                    f"{marketplace.code} 站点需要重新登录后才能读取反馈管理页",
+                    kind="signin",
+                )
+            # ⚠️ 只说**看见了什么**。原来这里写死「该店铺未开通此站点」——
+            # 那是没读过就下的断言,而自动选站已经替我们读过那一页了
+            # (用户 2026-09-24 拍板,2026-09-26 实现)。
+            details: dict[str, Any] = {
+                "reason_code": outcome.reason or "marketplace_unavailable"
+            }
+            if outcome.reason == "marketplace_not_selected":
+                if outcome.switch_reason == "not_offered":
+                    seen = "选择页上没有与此站点完全一致的国家（带「待註冊」等后缀的不算）"
+                elif outcome.switch_reason == "list_not_loaded":
+                    seen = "选择页上的站点列表一直没有加载出来"
+                else:
+                    seen = f"自动选站没有完成（{outcome.switch_reason or '原因未知'}）"
+                message = (
+                    f"页面停在账户/站点选择页，{seen}，本站点跳过；"
+                    "请在紫鸟窗口确认该账号是否开通了此站点："
+                    "若已开通，在该页选定一次即可；若没有，请在店铺设置里关闭此站点"
+                )
+                details["switch_reason"] = outcome.switch_reason
+            else:
+                message = "页面未落在反馈管理页，也不是账户/站点选择页，本站点跳过"
             await self.repository.append_event(
                 run.id,
                 "feedback_site_unavailable",
-                "该店铺未开通此站点（页面跳转到账户/站点选择），本站点跳过",
+                message,
                 marketplace_code=marketplace.code,
-                details={"reason_code": outcome.reason or "marketplace_unavailable"},
+                details=details,
             )
             await self.repository.set_site_status(
                 run.id, marketplace.code, SiteStatus.SKIPPED
@@ -254,11 +280,14 @@ class AmazonFeedbackWorkflow:
                 details={"count": len(unreadable), "reason_code": "menu_unreadable"},
             )
             _log_item(marketplace.code, "DEFERRED", "menu_unreadable", count=len(unreadable))
-        # Read successfully.  SKIPPED here means "nothing left to send", which
-        # the event message spells out; execute() upgrades it to CONFIRMED for
-        # any site that actually submits.
+        # 读成功了。有待办 → PLANNED(卡片写「待提交」);一条都没有才是 SKIPPED
+        # (「已读取，无需提交」)。空跑不会走到 execute,站点就停在这一格 ——
+        # 原来一律 SKIPPED,于是每张空跑卡都对着有 2 条待办的站点写
+        # 「已读取，无需提交」(2026-09-26 自审)。execute 成功提交后升成 CONFIRMED。
         await self.repository.set_site_status(
-            run.id, marketplace.code, SiteStatus.SKIPPED
+            run.id,
+            marketplace.code,
+            SiteStatus.PLANNED if actionable else SiteStatus.SKIPPED,
         )
         return actionable
 
@@ -434,9 +463,32 @@ class AmazonFeedbackWorkflow:
         )
 
         outcome = await self.page_adapter.open_list(page, marketplace.domain)
+        page = getattr(outcome, "page", None) or page
+        if outcome.reason == "auth_required":
+            raise HumanAuthRequired(
+                f"{marketplace.code} 站点需要重新登录后才能提交请求审核",
+                kind="signin",
+            )
         if not outcome.ok:
+            # 走到执行阶段说明计划已经读到了待提交的条目:这时打不开列表是
+            # **没做成**,不是「这站没活儿」。原来一条事件都不写就记 SKIPPED,
+            # 于是卡片写「本次没有可处理的反馈」,而正文同时列着 2 条待提交
+            # (2026-09-26 自审;GPSR 同一处已经这么修过)。
+            await self.repository.append_event(
+                run.id,
+                "feedback_site_unavailable",
+                "执行阶段重新打开反馈管理页失败，计划阶段读到的待提交条目本次没有提交",
+                marketplace_code=marketplace.code,
+                details={
+                    "reason_code": outcome.reason or "marketplace_unavailable",
+                    "during_execute": True,
+                },
+            )
             await self.repository.set_site_status(
-                run.id, marketplace.code, SiteStatus.SKIPPED
+                run.id, marketplace.code, SiteStatus.FAILED
+            )
+            _log_item(
+                marketplace.code, "FAILED", outcome.reason or "unavailable"
             )
             return 0
         page_rows, _ = await self.page_adapter.read_all_rows(page)
@@ -453,6 +505,26 @@ class AmazonFeedbackWorkflow:
             if outcome == SUBMITTED:
                 submitted += 1
 
+        if pending and not submitted:
+            # 有待办、却一条都没提交成(原因码不在候选里、面板打不开、行不见了……)。
+            # 记 CONFIRMED 的话卡片写「已提交请求 / 反馈处理已完成 / 无需操作」,
+            # 而正文同时说「本次没有提交任何请求审核」—— 自相矛盾且站点那行是假的
+            # (2026-09-26 自审)。
+            await self.repository.append_event(
+                run.id,
+                "feedback_site_nothing_submitted",
+                f"{len(pending)} 条待提交全部没能发出，请到反馈处理台逐条核对",
+                marketplace_code=marketplace.code,
+                details={
+                    "reason_code": "nothing_submitted",
+                    "pending": len(pending),
+                },
+            )
+            await self.repository.set_site_status(
+                run.id, marketplace.code, SiteStatus.FAILED
+            )
+            _log_item(marketplace.code, "FAILED", "nothing_submitted", pending=len(pending))
+            return 0
         # CONFIRMED is this enum's terminal success; SiteStatus has no SUCCEEDED
         # member, and referring to one raised AttributeError at the very end of
         # a site that had already submitted its requests.

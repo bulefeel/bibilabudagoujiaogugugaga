@@ -19,7 +19,6 @@ from ziniao_automation.models import (
 )
 from ziniao_automation.workflows.amazon_disbursement import (
     AmazonDisbursementWorkflow,
-    DisbursementPolicy,
 )
 from ziniao_automation.workflows.engine import WorkflowEngine
 from ziniao_automation.workflows.errors import InvalidTransition
@@ -224,10 +223,6 @@ def _environment(tmp_path):
     workflow = AmazonDisbursementWorkflow(
         repository=repository,
         page_adapter=adapter,
-        policy=DisbursementPolicy(
-            reconcile_attempts=1,
-            reconcile_interval_seconds=0,
-        ),
     )
     collector = _Collector()
     engine = WorkflowEngine(
@@ -308,7 +303,10 @@ async def test_late_legacy_cancel_is_not_rewritten_as_success(tmp_path) -> None:
     assert result.status is RunStatus.CANCELLED
     assert await repository.get_run_status(run.id) is RunStatus.CANCELLED
     records = await repository.list_operations(run.id)
-    assert [record.state for record in records] == [GuardState.CONFIRMED]
+    # 2026-09-23 删掉回读之后,已派发的记录停在 SUBMITTED(不再自动升 CONFIRMED —— 
+    # 「已确认」意味着在亚马逊那边看到了这笔,而我们不再去看)。这条用例的主题
+    # 「迟到的取消不能被改写成成功」由上面两条 CANCELLED 断言保证,与此无关。
+    assert [record.state for record in records] == [GuardState.SUBMITTED]
     assert collector.reports == []
     assert await repository.set_run_status(
         run.id,

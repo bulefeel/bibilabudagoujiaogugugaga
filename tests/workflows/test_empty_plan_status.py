@@ -5,8 +5,8 @@
 流水里显示成「成功（没钱可提）」——操作员看不出任何异常。
 
 修正后的路由：任一站点 NEEDS_HUMAN_AUTH → 整个任务 NEEDS_HUMAN_AUTH；
-任一站点 FAILED → PARTIAL；其余（全部跳过 / 空跑完成 / 流程不维护站点行）
-仍是正常的成功空跑。
+任一站点 FAILED → PARTIAL；站点**全部跳过** → SKIPPED（蓝卡）；
+其余（空跑完成 / 流程不维护站点行）仍是正常的成功空跑。
 
 ⚠️ 这段判定必须排在 DRY_RUN 短路**之前**——目前多数店铺刻意保持 dry_run
 （memory「反馈流程当前状态」），排在后面等于把登录失败全部盖住。第一条
@@ -157,10 +157,21 @@ async def test_needs_human_auth_wins_over_failed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_all_sites_skipped_is_still_an_ordinary_no_op() -> None:
-    """真的没钱可提（站点全部跳过）不能因为这次改动变成告警。"""
+async def test_all_sites_skipped_is_reported_as_skipped_not_completed() -> None:
+    """站点全部跳过 → 任务 SKIPPED，**不是** SUCCEEDED。
 
-    assert await run_engine(RunMode.AUTO, SiteStatus.SKIPPED) is RunStatus.SUCCEEDED
+    ⚠️ 这条测试原来钉的是 SUCCEEDED，理由写的是「不能变成告警」——而那个前提是错的：
+    ``RUN_SKIPPED`` 是**刻意的蓝卡**（feishu ``_card_colour`` 的注释：红卡会把亚马逊
+    正常的 24 小时限流训练成事故）。真正的后果是另一回事：2026-09-18 正香-张刚CA
+    的德国站停在账户/站点选择页被跳过，**一个站点都没读成**，飞书卡标题却是绿色的
+    「GPSR 安全证明已完成」。
+
+    引擎的另一条路径 ``_finish_operations`` 一直对同一情形给 SKIPPED，两条路径本来
+    就该一致；提现流程没暴露这个 bug，只是因为它读到余额后计划非空、走的是那一条。
+    memory「跳过也要发通知」已经确立：全跳过的 run 必须发蓝卡。
+    """
+
+    assert await run_engine(RunMode.AUTO, SiteStatus.SKIPPED) is RunStatus.SKIPPED
 
 
 @pytest.mark.asyncio

@@ -295,3 +295,56 @@ async def test_reattaching_active_probe_does_not_enable_different_sites(
     assert cancelled["status"] == "CANCELLED"
 
 
+@pytest.mark.asyncio
+async def test_a_site_the_switcher_cannot_select_fails_instead_of_waiting_for_a_login(
+    tmp_path, monkeypatch
+) -> None:
+    """建档核验落到账户/站点选择页、自动选站又选不掉:这不是登录问题。
+
+    ⚠️ 原来它被当成「等待登录」:探针占着资金锁在一个不存在的登录上等满 30 分钟,
+    之后的站点一个都轮不到(09-23 第三轮复核)。现在如实记下原因、接着核下一个。
+    """
+
+    class NoLoginWait(_Controller):
+        async def wait_for_auth(self, handle, key, **kwargs):
+            # ⚠️ 必须响亮失败,不能像基类那样立刻返回:否则修复被改回去时,核验循环
+            # 会在「等登录 → 再核验 → 又要选站」之间无限转圈,测试挂死而不是变红
+            # (09-23 反证时真的挂死过,把内存吃满)。
+            self.wait_for_auth_calls += 1
+            raise AssertionError("选不定站点不该进登录等待")
+
+    controller = NoLoginWait()
+    service, sessions, store_id = _service(tmp_path, controller)
+
+    async def identity(self, page, marketplace):
+        del self, page, marketplace
+        return "A1SELLERFIXTURE", "payments-dashboard"
+
+    async def preflight(self, page, run, marketplace):
+        del self, page, run
+        if marketplace.code == "CA":
+            raise HumanAuthRequired(
+                "页面停在亚马逊账户/站点选择页，未能自动选定 CA（not_offered）",
+                kind="marketplace_switch",
+            )
+
+    monkeypatch.setattr(
+        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.detect_identity", identity
+    )
+    monkeypatch.setattr(
+        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.preflight", preflight
+    )
+    monkeypatch.setattr(
+        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.resolved_page_for",
+        lambda self, page: page,
+    )
+
+    started = await service.detect_store_setup(store_id, ["CA", "UK"])
+    result = await _terminal(service, store_id, started["probe_id"])
+
+    assert controller.wait_for_auth_calls == 0, "选不定站点不该进登录等待"
+    sites = {site["code"]: site for site in result["marketplaces"]}
+    assert sites["CA"]["status"] == "FAILED"
+    assert "not_offered" in sites["CA"]["message"]
+    assert sites["UK"]["status"] == "SUCCEEDED"
+    assert result["status"] == "PARTIAL"

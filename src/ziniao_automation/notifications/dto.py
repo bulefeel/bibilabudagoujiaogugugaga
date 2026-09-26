@@ -24,7 +24,10 @@ class NotificationKind(StrEnum):
     WAITING_APPROVAL = "WAITING_APPROVAL"
     WAITING_AUTH = "WAITING_AUTH"
     AUTH_TIMEOUT = "AUTH_TIMEOUT"
-    PAYMENT_CONFIRMED = "PAYMENT_CONFIRMED"
+    # 提现请求已经发出(那一下不可逆点击返回过)。2026-09-23 删掉联网回读之后,
+    # 这就是提现成功的全部含义:系统不再去亚马逊查到没到账,所以不存在
+    # 「平台已确认」这一步 —— 原来的 PAYMENT_CONFIRMED 随之删除。
+    PAYMENT_SUBMITTED = "PAYMENT_SUBMITTED"
     RUN_COMPLETED = "RUN_COMPLETED"
     RUN_FAILED = "RUN_FAILED"
     RUN_PARTIAL = "RUN_PARTIAL"
@@ -162,8 +165,9 @@ class SafeRunNotice:
         fields = report.fields
         raw_operations = fields.get("operations", ())
         operations = raw_operations if isinstance(raw_operations, (list, tuple)) else ()
-        confirmed = any(
-            isinstance(item, Mapping) and str(item.get("state", "")).upper() == "CONFIRMED"
+        dispatched = any(
+            isinstance(item, Mapping)
+            and str(item.get("state", "")).upper() in {"SUBMITTED", "CONFIRMED"}
             for item in operations
         )
 
@@ -178,8 +182,8 @@ class SafeRunNotice:
         }
         if report.status is RunStatus.SUCCEEDED:
             kind = (
-                NotificationKind.PAYMENT_CONFIRMED
-                if confirmed
+                NotificationKind.PAYMENT_SUBMITTED
+                if dispatched
                 else NotificationKind.RUN_COMPLETED
             )
         else:
@@ -220,12 +224,12 @@ class SafeRunNotice:
         return cls(
             kind=kind,
             title=(
-                "任务检查已完成（非提现确认）"
+                "任务已完成（本次未发出提现）"
                 if is_neutral_completion
                 else report.title
             ),
             summary=(
-                "流程已完成，但未发现已确认的资金提交记录；这不代表提现成功。"
+                "流程已完成，本次没有发出任何提现请求。"
                 if is_neutral_completion
                 else report.summary
             ),
