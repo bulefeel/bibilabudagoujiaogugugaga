@@ -42,5 +42,8 @@ def test_invalid_file_error_does_not_echo_contents_or_path(tmp_path):
 
 
 def test_installer_includes_policy():
-    source = (PROJECT_ROOT / 'installer/build.ps1').read_text(encoding='utf-8')
+    # Build tools stay in the checkout; the policy must exist in the runtime tree.
+    source_root = Path(__file__).resolve().parents[2]
+    source = (source_root / 'installer/build.ps1').read_text(encoding='utf-8-sig')
+    assert POLICY.is_file()
     assert "'onboarding-policy.toml'" in source
