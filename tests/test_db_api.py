@@ -11,6 +11,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import select
 
+from ziniao_automation import __version__
 from ziniao_automation.config import Settings
 from ziniao_automation.models import (
     ApprovalRequest,
@@ -1424,7 +1425,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
 
     assert page.status_code == 200
     assert "应用版本 / 构建" in page.text
-    assert "0.7.0" in page.text
+    assert __version__ in page.text
     assert "数据库迁移版本" in page.text
     # 从迁移脚本读 head，而不是写死版本号。写死的话每加一条迁移都会多出一条
     # 无关的红，久而久之就训练成「看到红就改断言」——这条断言的意思是

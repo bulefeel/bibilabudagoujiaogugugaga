@@ -4,7 +4,7 @@
 `http://127.0.0.1:8765`。SQLite、日志、截图、虚拟环境和缓存都放在安装目录下，
 提现、建档和 GPSR 使用固定流程；Feedback 判定可能调用配置的模型服务。
 
-当前版本 **0.7.0**，更新内容见 [发布说明](https://github.com/bulefeel/bibilabudagoujiaogugugaga/releases/tag/v0.7.0)。
+当前版本 **0.7.1**，更新内容见 [发布说明](https://github.com/bulefeel/bibilabudagoujiaogugugaga/releases/tag/v0.7.1)。
 
 ## 1. 安装（给非技术同事看的版本）
 

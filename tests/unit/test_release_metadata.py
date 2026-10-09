@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import re
 import tomllib
 
 from ziniao_automation import __version__
@@ -15,7 +16,7 @@ def test_release_number_has_one_hand_edited_source() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     installer = (ROOT / "installer/ziniao-automation.iss").read_text(encoding="utf-8")
 
-    assert __version__ == "0.7.0"
+    assert re.fullmatch(r"\d+\.\d+\.\d+", __version__)
     locked = tomllib.loads((ROOT / "uv.lock").read_text(encoding="utf-8"))
     package = next(item for item in locked["package"] if item["name"] == "ziniao-automation")
     assert package["version"] == __version__
@@ -136,4 +137,3 @@ def test_inno_aborts_when_environment_install_fails() -> None:
     assert "ResultCode <> 0" in code_section
     assert "RaiseException" in code_section
     assert "Install.bat" in code_section
-

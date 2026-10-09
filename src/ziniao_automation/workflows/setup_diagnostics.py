@@ -49,11 +49,11 @@ REASON_MESSAGES = {
 
 STAGES = frozenset({
     "unknown", "classify", "session_snapshot", "business_handoff",
-    "continue", "password_signin", "otp_signin", "managed_passkey",
+    "continue", "password_signin", "otp_signin", "managed_passkey", "saved_account_choice",
     "otp_method_choice", "marketplace_switch", "identity_read", "site_access",
 })
 ACTIONS = frozenset({
-    "continue", "password_signin", "otp_signin", "managed_passkey",
+    "continue", "password_signin", "otp_signin", "managed_passkey", "saved_account_choice",
     "otp_method_choice", "select_marketplace",
 })
 PAGE_CATEGORIES = frozenset({

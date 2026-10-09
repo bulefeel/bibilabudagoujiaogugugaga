@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="de"><head><meta charset="utf-8"><title>Login fixture</title></head><body>
+<h1>Konten wechseln</h1>
+<div class="cvf-account-switcher">
+  <div class="cvf-widget-form cvf-widget-form-account-switcher"
+       method="post" action="/ap/switchaccount">
+    <a class="cvf-account-switcher-sign-out-link" href="/ap/signin"
+       data-name="sign_out_request" data-value="fixture-signout">Abmelden</a>
+  </div>
+  <div data-test-id="switchableAccounts" class="cvf-account-switcher-spacing-base">
+    <div class="cvf-widget-form cvf-widget-form-account-switcher"
+         method="post" action="/ap/switchaccount" data-use-only-form-action="true">
+      <a role="button" class="cvf-widget-btn-val cvf-widget-btn-verify-account-switcher"
+         data-name="switch_account_request" data-value="fixture-account-1"
+         href="/ap/signin"><div class="a-fixed-left-grid">ACCOUNT_1</div></a>
+    </div>
+  </div>
+  <div role="button"><a id="cvf-account-switcher-add-accounts-link"
+                       href="/ap/signin">Konten hinzufügen</a></div>
+</div>
+<div class="a-row a-size-base cvf-account-switcher-spacing-top-micro"><div class="a-column a-text-center"><a href="/gp/help/customer/display.html/">Erfahre mehr über den Kontowechsel.</a></div></div>
+<button id="business-submit">GPSR Submit fixture</button>
+<script>
+window.fixtureClicks = [];
+document.addEventListener("click", e => {
+  const target = e.target.closest("a,button");
+  if (!target) return;
+  e.preventDefault();
+  window.fixtureClicks.push(target.dataset.value || target.id);
+});
+</script></body></html>

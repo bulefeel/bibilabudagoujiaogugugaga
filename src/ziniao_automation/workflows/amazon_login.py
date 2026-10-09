@@ -1,7 +1,8 @@
 """Narrow, reusable Amazon Seller Central sign-in progression.
 
-This component deliberately knows only four Ziniao-assisted screens:
+This component models the following Ziniao-assisted screens:
 
+* the first saved account on Amazon's exact login-account chooser;
 * an already-filled e-mail/phone field followed by one Continue button;
 * one already-filled password field followed by the exact ``#signInSubmit``
   button when Ziniao's managed dialog has handed control back to Amazon;
@@ -11,7 +12,7 @@ This component deliberately knows only four Ziniao-assisted screens:
 
 It never reads field values into Python and never types credentials/codes.  A
 password form that is empty or ambiguous, CAPTCHA, native Passkey prompt,
-account selection or error page is still returned to the existing human-auth
+unknown account selection or error page is still returned to the existing human-auth
 lease as :class:`HumanAuthRequired`.
 """
 
@@ -22,13 +23,14 @@ from dataclasses import dataclass, field
 import logging
 import random
 import re
-from typing import Any, Callable, Literal
+from typing import Any, Callable, Literal, NoReturn
 from urllib.parse import urlparse
 from weakref import WeakKeyDictionary
 
 from playwright.async_api import Error as PlaywrightError
 
 from .errors import HumanAuthRequired
+from .amazon_saved_account import SAVED_ACCOUNT_ACTION, SAVED_ACCOUNT_ROOT
 
 
 _SELLER_CENTRAL_HOSTS = frozenset(
@@ -101,8 +103,8 @@ _PAYMENT_DETAILS_EXACT_PATH = "/payments/disburse/details"
 # ``AmazonPaymentsPage._raise_if_auth`` 与 GPSR ``AmazonGpsrPage.open_policies``,
 # 都用 ``amazon_account_switcher``。**新增调用方必须同样处理这一页**,否则登录成功
 # 之后会拿着一个停在切换页的 page 往下走。
-# 这和 ``_account_choice_selector`` 转人工的那一页不是一回事:那是**登录页上**
-# 选用哪个账号登录,属于凭据决定;这一页发生在登录之后,只是换个站点视图。
+# 登录页上的已保存账号选择由 saved_account_choice 按用户规则选第一个；
+# 这一页发生在登录之后，只是换站点视图，不共享选择逻辑。
 _BUSINESS_PATH_PREFIXES = ("/account-switcher",)
 _OTP_METHOD_OPTIONS = """
 () => Array.from(document.querySelectorAll('input[type="radio"]')).map((el, index) => {
@@ -133,6 +135,7 @@ _SELECT_OTP_METHOD = """
 
 
 _LoginAction = Literal[
+    "saved_account_choice",
     "continue",
     "password_signin",
     "otp_signin",
@@ -470,7 +473,9 @@ class AmazonLoginAdvancer:
         # One round can legitimately traverse managed Passkey → password
         # fallback → managed Passkey → OTP.  Keep a separate hard transition
         # ceiling so three complete rounds are possible but loops stay finite.
-        transition_limit = 1 + (self.max_steps + 1) * self._max_validation_rounds
+        # Saved-account selection and identifier Continue may both precede
+        # the first credential round; neither spends a validation round.
+        transition_limit = 2 + (self.max_steps + 1) * self._max_validation_rounds
         for _ in range(transition_limit):
             business_page = self.resolve_business_page(
                 page,
@@ -525,6 +530,15 @@ class AmazonLoginAdvancer:
                 # click, so this is not a stale-element shortcut.
                 action = pending_action
                 pending_action = None
+            if action is None and self.is_supported_login_url(
+                self._safe_page_url(page), expected_host=expected_host
+            ):
+                # Initial redirects can still be painting, just like post-click
+                # transitions. Reuse the bounded read-only settle loop instead
+                # of asking for a human before the account chooser appears.
+                action, _ = await self._settled_classification(
+                    page, None, expected_host=expected_host
+                )
             if action is None:
                 # A successful click can already have navigated away from the
                 # login route.  That is a normal handoff to the page adapter.
@@ -694,7 +708,7 @@ class AmazonLoginAdvancer:
         A retry never consumes another ``max_steps`` slot.  After each click we
         first reclassify the live page: leaving the login route or seeing the
         next supported action is success, while an explicit Amazon error,
-        CAPTCHA, account choice, changed/expired OTP, or ambiguous control is
+        CAPTCHA, unknown account choice, changed/expired OTP, or ambiguous control is
         handed to the existing human-auth lease.  Only the unchanged exact
         action is eligible for another click, up to the configured limit.
         """
@@ -1054,6 +1068,8 @@ class AmazonLoginAdvancer:
                 "password_signin": "密码登录",
                 "otp_signin": "OTP 登录",
                 "continue": "邮箱 Continue",
+                "saved_account_choice": "已保存账号选择",
+                "otp_method_choice": "认证器方式选择",
             }[action]
             _logger.warning(
                 "Amazon assisted login retry exhausted: action=%s attempts=%d",
@@ -1078,11 +1094,11 @@ class AmazonLoginAdvancer:
     async def _settled_classification(
         self,
         page: Any,
-        action: _LoginAction,
+        action: _LoginAction | None,
         *,
         expected_host: str | None,
     ) -> tuple[_LoginAction | None, bool]:
-        """Poll until the post-click page settles, or the budget runs out.
+        """Poll an initial or post-click page until settled, or its budget runs out.
 
         Returns ``(classification, left_login_flow)``.
 
@@ -1154,6 +1170,9 @@ class AmazonLoginAdvancer:
         allow_payment_details_handoff: bool = False,
     ) -> tuple[_DispatchOutcome, BaseException | None]:
         """Perform one fully revalidated click attempt without settling it."""
+
+        if action == "saved_account_choice":
+            return await self._choose_saved_account(page, expected_host=expected_host)
 
         if action == "otp_method_choice":
             try:
@@ -1761,6 +1780,81 @@ class AmazonLoginAdvancer:
             and parsed.path.rstrip("/").lower() in _LOGIN_PATHS
         )
 
+    async def _saved_account_state(
+        self, page: Any, *, click: bool, expected_host: str | None
+    ) -> dict[str, Any]:
+        """Probe/select without transferring the account's identity or secrets."""
+        host = self._business_host(page, expected_host)
+        result = await asyncio.wait_for(
+            page.evaluate(
+                SAVED_ACCOUNT_ACTION,
+                {
+                    "origin": f"https://{host}",
+                    "root": SAVED_ACCOUNT_ROOT,
+                    "accountChoices": self._account_choice_selector,
+                    "blockers": ", ".join((
+                        self._captcha_selector, self._passkey_selector,
+                        self._error_selector, self._identifier_selector,
+                        self._password_selector, self._otp_selector,
+                    )),
+                    "click": click,
+                },
+            ),
+            timeout=self._transition_settle_timeout_ms / 1000,
+        )
+        if not isinstance(result, dict) or result.get("status") not in {
+            "ready", "clicked", "not_present", "untrusted_route", "ambiguous",
+            "blocked", "no_accounts", "disabled",
+        }:
+            raise HumanAuthRequired(
+                "Amazon 已保存账号选择页结构未通过检查",
+                kind="sign_in", reason_code="AUTH_ACTION_AMBIGUOUS",
+                stage="saved_account_choice", page_category="LOGIN",
+            )
+        return result
+
+    @staticmethod
+    def _raise_saved_account_status(status: str) -> NoReturn:
+        messages = {
+            "no_accounts": "Amazon 账号选择页没有可选择的已有账号",
+            "disabled": "Amazon 账号选择页的第一个已有账号暂不可点击",
+            "blocked": "Amazon 账号选择页同时存在其他验证或错误",
+            "untrusted_route": "Amazon 账号选择页域名或路径已变化",
+        }
+        raise HumanAuthRequired(
+            messages.get(status, "Amazon 已保存账号选择页结构存在歧义"),
+            kind="sign_in",
+            reason_code="AUTH_CHALLENGE" if status == "blocked" else "AUTH_ACTION_AMBIGUOUS",
+            stage="saved_account_choice", page_category="LOGIN",
+        )
+
+    async def _choose_saved_account(
+        self, page: Any, *, expected_host: str | None
+    ) -> tuple[_DispatchOutcome, BaseException | None]:
+        # Reuse the document/stage budget, not an account ID: a re-rendered list
+        # must not reset the limit or leak identities into logs or guard keys.
+        reservation = await self._reserve_dispatch(page, "saved_account_choice")
+        try:
+            result = await self._saved_account_state(
+                page, click=True, expected_host=expected_host
+            )
+        except (PlaywrightError, TimeoutError):
+            _logger.warning("Amazon saved account selection outcome uncertain")
+            return "uncertain", RuntimeError("Saved account selection outcome uncertain")
+        status = result["status"]
+        if status == "clicked":
+            _logger.info(
+                "Amazon assisted login selected saved account: index=1 count=%d",
+                result["count"],
+            )
+            return "dispatched", None
+        # The renderer proved no click. Let the shared state machine classify
+        # a completed navigation/new login form, rather than clicking old DOM.
+        self._release_dispatch(page, reservation)
+        if status in {"not_present", "untrusted_route"}:
+            return "not_dispatched", None
+        self._raise_saved_account_status(status)
+
     async def _classify(
         self,
         page: Any,
@@ -1774,7 +1868,25 @@ class AmazonLoginAdvancer:
         path = urlparse(current_url).path.rstrip("/").lower()
         auth_kind = "challenge" if path == "/ap/mfa" else "sign_in"
 
-        # CAPTCHA, ordinary Passkey challenges, account choices and errors
+        # Recognize the exact saved-account chooser before the generic blocker.
+        # CAPTCHA, errors and mixed credential forms still block selection.
+        if await self._visible_elements(page.locator(SAVED_ACCOUNT_ROOT)):
+            try:
+                state = await self._saved_account_state(
+                    page, click=False, expected_host=expected_host
+                )
+            except (PlaywrightError, TimeoutError):
+                raise HumanAuthRequired(
+                    "Amazon 账号选择页读取超时或已关闭",
+                    kind="sign_in", reason_code="AUTH_PAGE_CHANGED",
+                    stage="saved_account_choice", page_category="LOGIN",
+                ) from None
+            if state["status"] == "ready":
+                return "saved_account_choice"
+            if state["status"] != "not_present":
+                self._raise_saved_account_status(state["status"])
+
+        # CAPTCHA, ordinary Passkey challenges, unknown account choices and errors
         # always win over the managed helper.  The managed helper itself is in
         # a closed shadow root, so none of these page locators can match it.
         if await self._visible_unsupported_auth_content(page):

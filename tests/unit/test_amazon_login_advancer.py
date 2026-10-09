@@ -4245,3 +4245,197 @@ async def test_otp_wait_never_treats_untrusted_redirect_as_success(url):
     with pytest.raises(HumanAuthRequired):
         await _advancer().advance(page, expected_host="sellercentral.amazon.co.uk")
     assert button.clicks == 0
+
+
+class _SavedAccountPage(_DocumentPage):
+    """State-machine double; browser fixtures test the actual DOM contract."""
+
+    def __init__(self, *, status="ready", count=1):
+        super().__init__("https://sellercentral.amazon.de/ap/signin", [])
+        self.saved_status = status
+        self.account_count = count
+        self.account_clicks = 0
+        self.on_select = None
+
+    def locator(self, selector):
+        if selector == amazon_login_module.SAVED_ACCOUNT_ROOT:
+            return _Locator([_Element("div")] if self.saved_status else [])
+        return super().locator(selector)
+
+    async def evaluate(self, expression, arg=None):
+        if expression != amazon_login_module.SAVED_ACCOUNT_ACTION:
+            return await super().evaluate(expression)
+        if not self.url.startswith(arg["origin"] + "/ap/signin"):
+            return {"status": "untrusted_route"}
+        state = self.saved_status or "not_present"
+        if state == "ready" and arg["click"]:
+            self.account_clicks += 1
+            if self.on_select:
+                self.on_select()
+            return {"status": "clicked", "count": self.account_count}
+        return {"status": state, "count": self.account_count}
+
+
+def _saved_to_home(page):
+    page.url = "https://sellercentral.amazon.de/home"
+    page.saved_status = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 3])
+async def test_saved_account_stage_selects_once_then_hands_off(count):
+    page = _SavedAccountPage(count=count)
+    page.on_select = lambda: _saved_to_home(page)
+    result = await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+    assert result.status == "advanced"
+    assert result.actions == ("saved_account_choice",)
+    assert page.account_clicks == 1
+
+
+@pytest.mark.asyncio
+async def test_saved_account_enters_existing_password_and_otp_chain():
+    page = _SavedAccountPage()
+    password = _Element("input", {"type": "password"}, value="fixture-password")
+    submit = _Element("input", {"id": "signInSubmit", "type": "submit", "value": "Sign in"})
+    otp = _Element("input", {"id": "auth-mfa-otpcode"}, value="123456")
+    otp_submit = _Element("input", {"id": "auth-signin-button", "type": "submit", "value": "Sign in"})
+
+    def selected():
+        page.saved_status = None
+        page.elements = [password, submit]
+
+    def signed_in():
+        page.replace_document("https://sellercentral.amazon.de/ap/mfa", [otp, otp_submit])
+
+    page.on_select = selected
+    submit.on_click = signed_in
+    otp_submit.on_click = lambda: _saved_to_home(page)
+    result = await _password_test_advancer().advance(page)
+    assert result.actions == ("saved_account_choice", "password_signin", "otp_signin")
+    assert (page.account_clicks, submit.clicks, otp_submit.clicks) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["no_accounts", "disabled", "ambiguous", "blocked", "untrusted_route"])
+async def test_saved_account_invalid_state_is_explicit_and_never_clicks(status):
+    page = _SavedAccountPage(status=status)
+    with pytest.raises(HumanAuthRequired) as error:
+        await _advancer().advance(page)
+    assert error.value.diagnostic.stage == "saved_account_choice"
+    assert page.account_clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_saved_account_unchanged_page_has_three_attempts_not_infinite_retry():
+    page = _SavedAccountPage()
+    advancer = _advancer()
+    with pytest.raises(HumanAuthRequired) as error:
+        await advancer.advance(page)
+    assert error.value.diagnostic.reason_code == "AUTH_RETRY_EXHAUSTED"
+    assert page.account_clicks == 3
+    with pytest.raises(HumanAuthRequired):
+        await advancer.advance(page)
+    assert page.account_clicks == 3
+
+
+@pytest.mark.asyncio
+async def test_saved_account_two_click_errors_retry_and_then_succeed():
+    page = _SavedAccountPage()
+    def selected():
+        if page.account_clicks < 3:
+            raise amazon_login_module.PlaywrightError("fixture page changed")
+        _saved_to_home(page)
+    page.on_select = selected
+    result = await _advancer().advance(page)
+    assert result.status == "advanced"
+    assert page.account_clicks == 3
+
+
+@pytest.mark.asyncio
+async def test_saved_account_completed_during_pacing_does_not_click_old_form():
+    page = _SavedAccountPage()
+    page.on_wait = lambda: _saved_to_home(page)
+    result = await _advancer().advance(page)
+    assert result.status == "advanced"
+    assert result.actions == ()
+    assert page.account_clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_saved_account_foreign_host_during_pacing_never_clicks():
+    page = _SavedAccountPage()
+    page.on_wait = lambda: setattr(page, "url", "https://sellercentral.amazon.de.example/ap/signin")
+    with pytest.raises(HumanAuthRequired):
+        await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+    assert page.account_clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_saved_account_probe_timeout_has_explicit_exit():
+    page = _SavedAccountPage()
+    original = page.evaluate
+    async def hangs(expression, arg=None):
+        if expression == amazon_login_module.SAVED_ACCOUNT_ACTION:
+            await asyncio.Future()
+        return await original(expression, arg)
+    page.evaluate = hangs
+    advancer = _advancer()
+    advancer._transition_settle_timeout_ms = 1
+    with pytest.raises(HumanAuthRequired) as error:
+        await advancer.advance(page)
+    assert error.value.diagnostic.reason_code == "AUTH_PAGE_CHANGED"
+    assert page.account_clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_initial_login_redirect_waits_for_delayed_saved_account_page():
+    page = _SavedAccountPage(status=None)
+    def paint():
+        if page.elapsed_ms >= 2000:
+            page.saved_status = "ready"
+    page.on_wait = paint
+    page.on_select = lambda: _saved_to_home(page)
+    result = await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+    assert result.actions == ("saved_account_choice",)
+    assert page.account_clicks == 1
+    assert 2000 <= page.elapsed_ms < 15000
+
+
+@pytest.mark.asyncio
+async def test_initial_login_redirect_that_never_paints_has_finite_exit():
+    page = _SavedAccountPage(status=None)
+    with pytest.raises(HumanAuthRequired) as error:
+        await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+    assert error.value.diagnostic.reason_code == "AUTH_PAGE_UNSUPPORTED"
+    assert page.elapsed_ms == 15000
+    assert page.account_clicks == 0
+
+
+@pytest.mark.asyncio
+async def test_initial_settle_stops_when_captcha_appears():
+    page = _SavedAccountPage(status=None)
+    def paint():
+        page.elements = [_Element("div", {"data-testid": "captcha"})]
+    page.on_wait = paint
+    with pytest.raises(HumanAuthRequired) as error:
+        await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+    assert error.value.diagnostic.reason_code == "AUTH_CHALLENGE"
+    assert page.elapsed_ms == 500
+    assert page.account_clicks == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://sellercentral.amazon.de/home",
+    "https://sellercentral.amazon.de.example/ap/signin",
+])
+async def test_initial_settle_rechecks_route_without_clicking(url):
+    page = _SavedAccountPage(status=None)
+    page.on_wait = lambda: setattr(page, "url", url)
+    if url.endswith("/home"):
+        result = await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+        assert result.status == "advanced"
+    else:
+        with pytest.raises(HumanAuthRequired):
+            await _advancer().advance(page, expected_host="sellercentral.amazon.de")
+    assert page.account_clicks == 0
