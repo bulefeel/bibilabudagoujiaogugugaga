@@ -101,7 +101,12 @@ async def test_a_switch_that_does_not_complete_goes_to_a_human(reason) -> None:
 
     # 不叫 sign_in:这不是登录问题,运行详情和卡片要说对是哪一步卡住了。
     assert caught.value.kind == "marketplace_switch"
-    assert reason in str(caught.value)
+    assert caught.value.diagnostic.reason_code == {
+        "not_offered": "MARKETPLACE_NOT_OFFERED",
+        "ambiguous": "MARKETPLACE_AMBIGUOUS",
+        "selection_not_registered": "MARKETPLACE_ACTION_UNAVAILABLE",
+        "timeout": "NAVIGATION_TIMEOUT",
+    }[reason]
 
 
 async def test_without_return_to_nothing_is_clicked_and_a_human_decides() -> None:

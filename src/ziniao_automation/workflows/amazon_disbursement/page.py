@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 from weakref import WeakKeyDictionary
 
 from ..amazon_account_switcher import AmazonAccountSwitcher
+from ..setup_diagnostics import switch_diagnostic
 from ..amazon_login import AmazonLoginAdvancer
 from ..contracts import MarketplacePageAdapter
 from ..errors import (
@@ -1519,6 +1520,8 @@ class AmazonPaymentsPage:
             raise HumanAuthRequired(
                 "页面停在亚马逊账户/站点选择页，且无法确定选完应回到哪一页",
                 kind="marketplace_switch",
+                reason_code="MARKETPLACE_TARGET_UNKNOWN",
+                stage="marketplace_switch", page_category="SITE_SWITCHER",
             )
         outcome = await self._account_switcher.select_marketplace(
             page, marketplace.domain, expected_path=target
@@ -1529,10 +1532,14 @@ class AmazonPaymentsPage:
             return page
         if not outcome.ok:
             # kind 不叫 sign_in:这不是登录问题,运行详情和卡片要说对是哪一步卡住了。
+            diagnostic = switch_diagnostic(
+                outcome.reason, offered=outcome.offered,
+                page_category=outcome.page_category,
+            )
             raise HumanAuthRequired(
-                f"页面停在亚马逊账户/站点选择页，未能自动选定 {marketplace.code}"
-                f"（{outcome.reason}）",
+                f"{marketplace.code}: {diagnostic.message}",
                 kind="marketplace_switch",
+                **diagnostic.to_payload(),
             )
         # 页面契约原本是在切换页上等的,落回业务页之后要重新等一次,
         # 否则余额行还没渲染就会被判成「页面结构不符」。

@@ -1,0 +1,12 @@
+# Read-only onboarding policy; contains no store data or credentials.
+schema_version = 1
+total_deadline_seconds = 1800
+candidate_ready_timeout_ms = 15000
+stable_sample_count = 2
+sample_interval_ms = 500
+diagnostic_text_limit = 256
+diagnostic_candidate_limit = 50
+cleanup_grace_seconds = 15
+
+# Empty/unusable OTP ends this site attempt instead of holding the batch for 30 minutes.
+otp_autofill_timeout_ms = 15000

@@ -76,6 +76,30 @@ class Locator:
         if not self.nodes:
             raise RuntimeError("empty locator")
 
+    async def evaluate_all(self, expression: str, limit: int):
+        from ziniao_automation.workflows.store_setup.identity import DASHBOARD_IDENTITY_SNAPSHOT
+        if expression != DASHBOARD_IDENTITY_SNAPSHOT:
+            raise AssertionError("Unregistered fixture snapshot expression")
+        if len(self.nodes) > limit:
+            return {"truncated": True, "items": []}
+        items = []
+        for node in self.nodes:
+            visible = node.tag != "meta"
+            parent = node
+            while parent is not None:
+                style = str(parent.attrs.get("style") or "").replace(" ", "")
+                if ("hidden" in parent.attrs or parent.attrs.get("aria-hidden") == "true"
+                        or "display:none" in style or "visibility:hidden" in style):
+                    visible = False
+                parent = parent.parent
+            items.append({
+                "machine": [(str(node.attrs.get(key) or "").strip(), f"dom:{key}")
+                            for key in ("content", "data-merchant-id", "data-seller-id")],
+                "visible": ([(str(node.attrs.get(key) or "").strip(), f"dom:{key}")
+                            for key in ("label", "value")] + [(node.text, "dom:visible_account")]) if visible else [],
+            })
+        return {"truncated": False, "items": items}
+
     async def evaluate(self, expression: str) -> str:
         if "childNodes" in expression:
             return " ".join(
@@ -112,23 +136,24 @@ def select(root: Node, selector: str) -> list[Node]:
         if expression.startswith("xpath="):
             continue
         if ">" in expression:
-            # The production balance parser deliberately requires direct
-            # children so a nested/recent-payout row cannot be index-aligned
-            # with the three balance cards.  Support that small CSS subset in
-            # this browser-free fixture DOM as well.
-            left, right = expression.rsplit(">", 1)
-            parent_parts = left.strip().split()
-            child = right.strip()
-            for node in nodes:
+            tokens = re.findall(r">|[^\s>]+", expression)
+            def chain(node, position):
+                if node is None:
+                    return False
+                part = tokens[position]
+                if (node is not root if part == ":scope" else not _matches(node, part)):
+                    return False
+                if position == 0:
+                    return True
+                if tokens[position - 1] == ">":
+                    return chain(node.parent, position - 2)
                 parent = node.parent
-                if (
-                    parent is not None
-                    and parent_parts
-                    and _matches(node, child)
-                    and _matches(parent, parent_parts[-1])
-                    and _ancestors_match(parent.parent, parent_parts[:-1])
-                ):
-                    result.append(node)
+                while parent is not None:
+                    if chain(parent, position - 1):
+                        return True
+                    parent = parent.parent
+                return False
+            result.extend(node for node in nodes if chain(node, len(tokens) - 1))
             continue
         parts = expression.split()
         for node in nodes:

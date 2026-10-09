@@ -41,14 +41,7 @@ def test_diagnostics_distinguishes_registered_from_readable_credentials(
                 )
             )
             session.commit()
-        response = client.post(
-            "/auth/bootstrap",
-            json={
-                "username": "operator",
-                "password": "Local-Ledger-2026!",
-                "confirm_password": "Local-Ledger-2026!",
-            },
-        )
+        response = client.get("/")
         assert response.status_code == 200
         page = client.get("/diagnostics")
         assert page.status_code == 200

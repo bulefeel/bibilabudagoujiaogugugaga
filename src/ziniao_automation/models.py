@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from typing import Any
@@ -11,6 +12,8 @@ from sqlalchemy import (
     Boolean,
     CheckConstraint,
     DateTime,
+    DDL,
+    event,
     ForeignKey,
     Index,
     Integer,
@@ -55,8 +58,95 @@ class ZiniaoAccount(TimestampMixin, Base):
     stores: Mapped[list["Store"]] = relationship(back_populates="account")
 
 
+# 紫鸟 getBrowserList 里亚马逊的 platform_id。2026-09-26 在线上库里量过:34 家亚马逊
+# 店全是 1,唯一一家 TikTok Shop 是 92。官方文档只说这是「平台id」,没给对照表。
+AMAZON_PLATFORM_ID = "1"
+UNKNOWN_PLATFORM_LABEL = "平台未知"
+
+
+@dataclass(frozen=True, slots=True)
+class StorePlatform:
+    """一家紫鸟店铺环境属于哪个电商平台。
+
+    紫鸟的公司账号下混着亚马逊、沃尔玛、TikTok 店铺,而这里的三条流程只对亚马逊
+    生效。同步接口给的 ``platform_id`` / ``platform_name`` 原样躺在 ``raw_profile``
+    里,这个值对象只是把它读出来 —— **不另存列**:每次同步都会整体覆盖
+    ``raw_profile``,单独存一份反而会过期。
+
+    ``platform_name`` 长成「亚马逊-加拿大」「TikTok Shop-全球跨境(自运营)(新)」:
+    「-」前面是平台家族,后面是紫鸟登记该环境时选的站点/业务线。亚马逊那个
+    「加拿大」只是环境注册地,**不等于**这家店开通了哪些站点(北美统一账号在
+    「亚马逊-美国」环境里照样能开 CA),所以站点绑定仍由建档流程自己核验。
+    """
+
+    id: str
+    name: str
+
+    @property
+    def known(self) -> bool:
+        return bool(self.id or self.name)
+
+    @property
+    def family(self) -> str:
+        return self.name.split("-", 1)[0].strip()
+
+    @property
+    def region(self) -> str:
+        head, sep, tail = self.name.partition("-")
+        return tail.strip() if sep else ""
+
+    @property
+    def label(self) -> str:
+        return "亚马逊" if self.is_amazon else (self.family or UNKNOWN_PLATFORM_LABEL)
+
+    @property
+    def is_amazon(self) -> bool:
+        # id 是主判据;家族文案兜底,免得 id 对照表哪天变了页面上写着「亚马逊」
+        # 却被当成别的平台。两个都不像亚马逊才算不是。
+        return self.id == AMAZON_PLATFORM_ID or self.family.lower() in {"亚马逊", "amazon"}
+
+    @classmethod
+    def from_raw_profile(cls, raw: Any) -> "StorePlatform":
+        record = raw if isinstance(raw, dict) else {}
+        platform_id = record.get("platform_id")
+        platform_name = record.get("platform_name")
+        return cls(
+            id="" if platform_id is None else str(platform_id).strip(),
+            name="" if platform_name is None else str(platform_name).strip(),
+        )
+
+
+class StoreHistory(Base):
+    """Historical identity, never a runnable store or a hidden Store row.
+
+    Re-granted environments reuse this ID so resync cannot reset financial
+    deduplication. No credentials, raw profile or enabled flag are kept here.
+    """
+    __tablename__ = "store_history"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(160), nullable=False)
+    selector_type: Mapped[str] = mapped_column(String(12), nullable=False)
+    selector_value: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    runs: Mapped[list["Run"]] = relationship(back_populates="store")
+    __table_args__ = {"sqlite_autoincrement": True}
+
+
+class MarketplaceHistory(Base):
+    """Minimal site identity for old results, not an executable site binding."""
+    __tablename__ = "marketplace_history"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_history.id", ondelete="RESTRICT"), nullable=False)
+    code: Mapped[str] = mapped_column(String(2), nullable=False)
+    domain: Mapped[str] = mapped_column(String(255), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    site_runs: Mapped[list["SiteRun"]] = relationship(back_populates="marketplace")
+    __table_args__ = {"sqlite_autoincrement": True}
+
+
 class Store(TimestampMixin, Base):
     __tablename__ = "stores"
+
+    setup_revision: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     account_id: Mapped[int | None] = mapped_column(
@@ -80,11 +170,15 @@ class Store(TimestampMixin, Base):
         back_populates="store", cascade="all, delete-orphan"
     )
     schedules: Mapped[list["Schedule"]] = relationship(back_populates="store")
-    runs: Mapped[list["Run"]] = relationship(back_populates="store")
-
     __table_args__ = (
         CheckConstraint("selector_type IN ('oauth','id')", name="ck_store_selector_type"),
+        {"sqlite_autoincrement": True},
     )
+
+    @property
+    def platform(self) -> StorePlatform:
+        """紫鸟登记的平台归属,读自最近一次同步的 ``raw_profile``。"""
+        return StorePlatform.from_raw_profile(self.raw_profile)
 
 
 class StoreMarketplace(TimestampMixin, Base):
@@ -104,8 +198,6 @@ class StoreMarketplace(TimestampMixin, Base):
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     store: Mapped[Store] = relationship(back_populates="marketplaces")
-    site_runs: Mapped[list["SiteRun"]] = relationship(back_populates="marketplace")
-
     __table_args__ = (
         UniqueConstraint("store_id", "code", name="uq_store_marketplace_code"),
         # 迁移 0010 把 DE 加了进来。这里**故意保留 CHECK 而不是删掉**：SQLite 改
@@ -115,6 +207,7 @@ class StoreMarketplace(TimestampMixin, Base):
             "code IN ('CA', 'UK', 'AU', 'DE')", name="ck_v1_marketplace_code"
         ),
         CheckConstraint("length(currency) = 3", name="ck_marketplace_currency"),
+        {"sqlite_autoincrement": True},
     )
 
 
@@ -225,7 +318,7 @@ class Run(TimestampMixin, Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     store_id: Mapped[int] = mapped_column(
-        ForeignKey("stores.id", ondelete="RESTRICT"), nullable=False, index=True
+        ForeignKey("store_history.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     schedule_id: Mapped[int | None] = mapped_column(
         ForeignKey("schedules.id", ondelete="SET NULL"), index=True
@@ -258,7 +351,7 @@ class Run(TimestampMixin, Base):
         Integer, default=1, server_default=text("1"), nullable=False
     )
 
-    store: Mapped[Store] = relationship(back_populates="runs")
+    store: Mapped[StoreHistory] = relationship(back_populates="runs")
     schedule: Mapped[Schedule | None] = relationship(back_populates="runs")
     site_runs: Mapped[list["SiteRun"]] = relationship(
         back_populates="run", cascade="all, delete-orphan"
@@ -389,7 +482,7 @@ class SiteRun(TimestampMixin, Base):
         ForeignKey("runs.id", ondelete="CASCADE"), nullable=False, index=True
     )
     marketplace_id: Mapped[int] = mapped_column(
-        ForeignKey("store_marketplaces.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("marketplace_history.id", ondelete="RESTRICT"), nullable=False
     )
     marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
     status: Mapped[str] = mapped_column(String(40), default="PENDING", nullable=False)
@@ -407,7 +500,7 @@ class SiteRun(TimestampMixin, Base):
     )
 
     run: Mapped[Run] = relationship(back_populates="site_runs")
-    marketplace: Mapped[StoreMarketplace] = relationship(back_populates="site_runs")
+    marketplace: Mapped[MarketplaceHistory] = relationship(back_populates="site_runs")
     guards: Mapped[list["OperationGuard"]] = relationship(back_populates="site_run")
     notification_deliveries: Mapped[list["NotificationDelivery"]] = relationship(
         back_populates="site_run", cascade="all, delete-orphan"
@@ -430,7 +523,7 @@ class OperationGuard(TimestampMixin, Base):
         ForeignKey("site_runs.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     store_id: Mapped[int] = mapped_column(
-        ForeignKey("stores.id", ondelete="RESTRICT"), nullable=False
+        ForeignKey("store_history.id", ondelete="RESTRICT"), nullable=False
     )
     workflow: Mapped[str] = mapped_column(String(80), nullable=False)
     marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
@@ -647,7 +740,7 @@ class FeedbackReview(TimestampMixin, Base):
         ForeignKey("runs.id", ondelete="SET NULL"), index=True
     )
     store_id: Mapped[int] = mapped_column(
-        ForeignKey("stores.id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("store_history.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
     order_id: Mapped[str] = mapped_column(String(40), nullable=False)
@@ -672,7 +765,7 @@ class FeedbackReview(TimestampMixin, Base):
         MutableDict.as_mutable(JSON), default=dict, nullable=False
     )
 
-    store: Mapped[Store] = relationship()
+    store: Mapped[StoreHistory] = relationship()
 
     __table_args__ = (
         UniqueConstraint(
@@ -692,3 +785,127 @@ class SystemSetting(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
     )
+
+
+# Triggers cover ORM and SQL writes, keeping the minimal history identity in
+# the same transaction as the live store, before a run can reference it.
+HISTORY_TRIGGERS = (
+    ("stores", "store_history_insert", "INSERT"),
+    ("stores", "store_history_update", "UPDATE"),
+    ("store_marketplaces", "marketplace_history_insert", "INSERT"),
+    ("store_marketplaces", "marketplace_history_update", "UPDATE"),
+)
+
+def history_trigger_sql(table: str, name: str, action: str) -> str:
+    if table == "stores":
+        target, columns = "store_history", ("id", "name", "selector_type", "selector_value")
+    else:
+        target, columns = "marketplace_history", ("id", "store_id", "code", "domain", "currency")
+    updates = ", ".join(f"{column}=excluded.{column}" for column in columns[1:])
+    values = ", ".join(f"NEW.{column}" for column in columns)
+    return (
+        f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {action} ON {table} BEGIN "
+        f"INSERT INTO {target} ({', '.join(columns)}) VALUES ({values}) "
+        f"ON CONFLICT(id) DO UPDATE SET {updates}; END"
+    )
+
+
+for _table, _name, _action in HISTORY_TRIGGERS:
+    event.listen(
+        Base.metadata.tables[_table], "after_create",
+        DDL(history_trigger_sql(_table, _name, _action)).execute_if(dialect="sqlite"),
+    )
+
+
+class StoreSetupProbe(Base):
+    __tablename__ = "store_setup_probes"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    store_id: Mapped[int] = mapped_column(ForeignKey("stores.id", ondelete="CASCADE"), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(36))
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_aliases: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    resource_snapshot: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    setup_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    config_snapshot: Mapped[dict] = mapped_column(JSON, nullable=False)
+    requested_marketplace_codes: Mapped[list] = mapped_column(JSON, nullable=False)
+    scope: Mapped[str] = mapped_column(String(24), nullable=False)
+    adapter_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    policy_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    lifecycle: Mapped[str] = mapped_column(String(20), nullable=False)
+    phase: Mapped[str] = mapped_column(String(24), nullable=False)
+    resume_phase: Mapped[str | None] = mapped_column(String(24))
+    current_marketplace: Mapped[str | None] = mapped_column(String(2))
+    outcome: Mapped[str | None] = mapped_column(String(24))
+    identity_result: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+    message: Mapped[str] = mapped_column(String(400), nullable=False)
+    diagnostics: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    cleanup_state: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deadline_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("store_id", "request_id", name="uq_setup_request"),
+        Index("uq_setup_active_store", "store_id", unique=True, sqlite_where=text("lifecycle != 'FINISHED'")),
+        Index("ix_setup_history", "store_id", "created_at"),
+        CheckConstraint("kind IN ('unified','identity','marketplace')"),
+        CheckConstraint("scope IN ('full','retry_unverified')"),
+        CheckConstraint("outcome IS NULL OR outcome IN ('SUCCEEDED','PARTIAL','FAILED','NEEDS_REVIEW','CANCELLED','TIMED_OUT','INTERRUPTED')"),
+        CheckConstraint("(lifecycle = 'FINISHED' AND outcome IS NOT NULL) OR (lifecycle != 'FINISHED' AND outcome IS NULL)"),
+        CheckConstraint("lifecycle IN ('QUEUED','CHECKING','WAITING_AUTH','FINISHED')"),
+        CheckConstraint("cleanup_state IN ('PENDING','CONFIRMED','UNCONFIRMED')"),
+        CheckConstraint("setup_revision >= 0"),
+    )
+
+
+class StoreSetupSiteResult(Base):
+    __tablename__ = "store_setup_site_results"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    probe_id: Mapped[str] = mapped_column(ForeignKey("store_setup_probes.id", ondelete="CASCADE"), nullable=False)
+    marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    attempted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    outcome: Mapped[str | None] = mapped_column(String(16))
+    identity_check: Mapped[str] = mapped_column(String(16), nullable=False, default="NOT_CHECKED")
+    access_check: Mapped[str] = mapped_column(String(16), nullable=False, default="NOT_CHECKED")
+    payment_capability: Mapped[str] = mapped_column(String(24), nullable=False, default="NOT_CHECKED")
+    reason_code: Mapped[str | None] = mapped_column(String(64))
+    message: Mapped[str] = mapped_column(String(400), nullable=False)
+    page_category: Mapped[str] = mapped_column(String(32), nullable=False, default="UNKNOWN_PAGE")
+    domain: Mapped[str] = mapped_column(String(255), nullable=False)
+    adapter_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    evidence_state: Mapped[str] = mapped_column(String(16), default="unavailable", nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    __table_args__ = (
+        UniqueConstraint("probe_id", "marketplace_code", name="uq_setup_site"),
+        CheckConstraint("marketplace_code IN ('CA','UK','AU')"),
+        CheckConstraint("outcome IS NULL OR outcome IN ('PASSED','BLOCKED','FAILED','NOT_RUN','CANCELLED')"),
+    )
+
+
+# SQLite owns the revision counter, including direct SQL and sync updates.
+# Unrelated rename / task enable switches deliberately do not change it.
+_SETUP_REVISION_TRIGGERS = (
+    """CREATE TRIGGER IF NOT EXISTS setup_store_revision AFTER UPDATE OF
+    selector_type, selector_value, expected_seller_id, identity_confirmed ON stores
+    WHEN OLD.selector_type IS NOT NEW.selector_type OR OLD.selector_value IS NOT NEW.selector_value
+      OR OLD.expected_seller_id IS NOT NEW.expected_seller_id OR OLD.identity_confirmed IS NOT NEW.identity_confirmed
+    BEGIN UPDATE stores SET setup_revision = setup_revision + 1 WHERE id = NEW.id; END""",
+    """CREATE TRIGGER IF NOT EXISTS setup_site_insert AFTER INSERT ON store_marketplaces
+    BEGIN UPDATE stores SET setup_revision = setup_revision + 1 WHERE id = NEW.store_id; END""",
+    """CREATE TRIGGER IF NOT EXISTS setup_site_delete AFTER DELETE ON store_marketplaces
+    BEGIN UPDATE stores SET setup_revision = setup_revision + 1 WHERE id = OLD.store_id; END""",
+    """CREATE TRIGGER IF NOT EXISTS setup_site_update AFTER UPDATE ON store_marketplaces
+    WHEN OLD.code IS NOT NEW.code OR OLD.domain IS NOT NEW.domain OR OLD.currency IS NOT NEW.currency
+      OR OLD.enabled IS NOT NEW.enabled OR OLD.store_id IS NOT NEW.store_id
+    BEGIN UPDATE stores SET setup_revision = setup_revision + 1 WHERE id IN (OLD.store_id, NEW.store_id); END""",
+)
+
+@event.listens_for(Base.metadata, "after_create")
+def _install_setup_revision_triggers(metadata, connection, **kwargs):
+    if connection.dialect.name == "sqlite":
+        for statement in _SETUP_REVISION_TRIGGERS:
+            connection.exec_driver_sql(statement)

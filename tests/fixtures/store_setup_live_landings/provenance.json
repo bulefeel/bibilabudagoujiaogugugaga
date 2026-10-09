@@ -1,0 +1,6 @@
+{
+  "sample": "observations.json",
+  "sha256": "3a6dd9cd2ced79c7772a86213f578c1c8fcabca3621852ee80f3663587ff7d2e",
+  "captured_date": "2026-09-27",
+  "capture_method": "Project read-only onboarding via Ziniao CDP; production DB unchanged; synthetic navigation replay tests are separate."
+}

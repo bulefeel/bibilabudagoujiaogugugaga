@@ -162,13 +162,15 @@ def test_0006_upgrades_real_legacy_shape_without_rebuilding_schedule_audit_links
         )
     engine.dispose()
 
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     upgraded = sa.create_engine(f"sqlite:///{database.as_posix()}")
     with upgraded.connect() as connection:
         assert connection.exec_driver_sql(
             "SELECT version_num FROM alembic_version"
-        ).scalar() == _head_revision()
+        ).scalar() == "0010"
         assert connection.exec_driver_sql(
             "SELECT workflow_config FROM schedules WHERE id=1"
         ).scalar() == '{"marketplace_codes": ["UK"]}'
@@ -582,7 +584,9 @@ def test_existing_0001_only_replays_queued_runs_with_expected_priority(
     database = tmp_path / "legacy.db"
     engine = _legacy_0001_database(database)
 
-    init_database(engine)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     with engine.connect() as connection:
         rows = connection.execute(
@@ -602,7 +606,7 @@ def test_existing_0001_only_replays_queued_runs_with_expected_priority(
         assert connection.scalar(
             sa.text("SELECT COUNT(*) FROM run_queue_entries WHERE run_id = 'terminal'")
         ) == 0
-        assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == _head_revision()
+        assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == "0010"
 
 
 def test_unversioned_legacy_database_is_adopted_and_upgraded(tmp_path: Path) -> None:
@@ -891,7 +895,9 @@ def test_0004_drops_the_cycle_wide_guard_unique_and_keeps_everything_else(
     database = tmp_path / "pre_0004.db"
     engine = _database_with_cycle_wide_guard_unique(database)
 
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     with engine.connect() as connection:
         schema = connection.scalar(
@@ -1015,7 +1021,9 @@ def test_0005_drops_the_baseline_and_adds_the_observed_tail(tmp_path: Path) -> N
     database = tmp_path / "pre_0005.db"
     engine = _database_with_payout_account_baseline(database)
 
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     with engine.connect() as connection:
         schema = connection.scalar(
@@ -1270,7 +1278,9 @@ def test_0010_widens_the_check_and_gives_every_store_a_de_row(tmp_path: Path) ->
     database = tmp_path / "pre_0010.db"
     engine = _database_before_de(database)
 
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     with engine.connect() as connection:
         rows = connection.execute(
@@ -1318,7 +1328,9 @@ def test_0010_accepts_de_but_still_refuses_an_unlisted_code(tmp_path: Path) -> N
 
     database = tmp_path / "pre_0010.db"
     engine = _database_before_de(database)
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     with engine.begin() as connection:
         connection.execute(
@@ -1385,7 +1397,9 @@ def test_0010_backfill_leaves_an_existing_de_row_alone(tmp_path: Path) -> None:
             {"ts": "2026-09-14 00:00:00"},
         )
 
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
 
     with engine.connect() as connection:
         # 已存在的那行保持 enabled=0 不被改写；其余两家补 enabled=1。
@@ -1402,7 +1416,9 @@ def test_0010_round_trip_narrows_the_check_and_drops_only_de(tmp_path: Path) -> 
 
     database = tmp_path / "pre_0010.db"
     engine = _database_before_de(database)
-    _upgrade(database)
+    # Partial historical fixture: exercise its migration chain, not the newer
+    # full-store history schema (covered by test_store_history_migration.py).
+    _upgrade(database, "0010")
     _downgrade(database, "0009")
 
     with engine.connect() as connection:
@@ -1420,7 +1436,7 @@ def test_0010_round_trip_narrows_the_check_and_drops_only_de(tmp_path: Path) -> 
         ).all() == [(1, "CA"), (1, "UK"), (2, "AU")]
         assert connection.scalar(sa.text("PRAGMA integrity_check")) == "ok"
 
-    _upgrade(database)
+    _upgrade(database, "0010")
     with engine.connect() as connection:
         assert connection.scalar(
             sa.text("SELECT COUNT(*) FROM store_marketplaces WHERE code = 'DE'")

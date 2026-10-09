@@ -284,6 +284,10 @@ class ZiniaoClient:
         records = _extract_browser_records(response.payload)
         profiles: list[BrowserProfile] = []
         for record in records:
+            for key in ("browserOauth", "browserOAuth", "oauth", "browserId", "id"):
+                value = record.get(key)
+                if value is not None and (isinstance(value, bool) or not isinstance(value, (str, int))):
+                    raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺环境标识格式异常；本次同步未执行")
             oauth = _first_string(record, "browserOauth", "browserOAuth", "oauth") or None
             browser_id = _first_string(record, "browserId", "id") or None
             if oauth:
@@ -291,8 +295,7 @@ class ZiniaoClient:
             elif browser_id:
                 selector = ProfileSelector("id", browser_id)
             else:
-                logger.warning("Ignoring Ziniao browser record without an identifier")
-                continue
+                raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺记录缺少环境标识；本次同步未执行")
             name = _first_string(
                 record,
                 "browserName",
@@ -309,6 +312,9 @@ class ZiniaoClient:
                     raw=dict(record),
                 )
             )
+        keys = [profile.selector_value for profile in profiles]
+        if len(keys) != len(set(keys)):
+            raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺列表包含重复环境标识；本次同步未执行")
         return profiles
 
     async def update_core(self) -> ZiniaoApiResponse:
@@ -349,22 +355,39 @@ class ZiniaoClient:
 
 
 def _extract_browser_records(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
-    candidates: list[Any] = []
-    for key in ("browserList", "data", "list", "rows"):
-        candidates.append(payload.get(key))
+    """Accept only an explicit complete list; never turn malformed data into []."""
+    candidates: list[Any] = [payload]
+    records: list[dict[str, Any]] | None = None
+    totals: list[int] = []
     while candidates:
         candidate = candidates.pop(0)
         if isinstance(candidate, list):
-            return [item for item in candidate if isinstance(item, dict)]
-        if isinstance(candidate, dict):
-            # Some client versions return a single browser object in data.
-            if any(
-                key in candidate
-                for key in ("browserOauth", "browserOAuth", "browserId", "oauth")
-            ):
-                return [dict(candidate)]
-            candidates.extend(candidate.get(key) for key in ("browserList", "list", "rows", "data"))
-    return []
+            if not all(isinstance(item, dict) for item in candidate):
+                raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺列表包含无效记录")
+            if records is not None and records != candidate:
+                raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺列表返回了相互矛盾的数据")
+            records = candidate
+        elif isinstance(candidate, dict):
+            for key in ("total", "totalCount", "total_count"):
+                if key in candidate:
+                    try:
+                        total = int(candidate[key])
+                        if str(total) != str(candidate[key]).strip() or total < 0:
+                            raise ValueError()
+                        totals.append(total)
+                    except (TypeError, ValueError):
+                        raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺列表总数格式异常") from None
+            if any(str(candidate.get(key, "false")).lower() not in ("false", "0", "none", "")
+                   for key in ("hasMore", "has_more", "hasNext", "has_next")):
+                raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺列表尚有未获取的分页")
+            if any(key in candidate for key in ("browserOauth", "browserOAuth", "browserId", "oauth")):
+                # Historical client versions wrap a single environment in data.
+                candidates.append([candidate])
+            else:
+                candidates.extend(candidate[key] for key in ("browserList", "list", "rows", "data") if key in candidate)
+    if records is None or any(total != len(records) for total in totals):
+        raise ZiniaoApiError("getBrowserList", "INCOMPLETE_LIST", "店铺列表未完整返回；本次同步未执行")
+    return records
 
 
 def _first_string(record: Mapping[str, Any], *keys: str) -> str:

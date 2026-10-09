@@ -11,11 +11,10 @@ from typing import Sequence
 
 from sqlalchemy import select
 
-from .auth import hash_password
 from .config import Settings
 from .db import create_sqlite_engine, init_database, make_session_factory
 from .logging_config import purge_expired_artifacts
-from .models import AdminCredential, SystemSetting, ZiniaoAccount
+from .models import SystemSetting, ZiniaoAccount
 from .ziniao.credentials import (
     DEFAULT_FEISHU_TARGET,
     DEFAULT_ZINIAO_TARGET,
@@ -34,8 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
     configure_sub = configure.add_subparsers(dest="kind", required=True)
     ziniao = configure_sub.add_parser("ziniao", help="配置紫鸟账号")
     ziniao.add_argument("--credential-ref", default=DEFAULT_ZINIAO_TARGET)
-    admin = configure_sub.add_parser("admin", help="配置单一管理员")
-    admin.add_argument("--username")
     feishu = configure_sub.add_parser("feishu", help="配置飞书 App")
     feishu.add_argument("--credential-ref", default=DEFAULT_FEISHU_TARGET)
     feishu.add_argument(
@@ -63,8 +60,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "configure":
         if args.kind == "ziniao":
             return _configure_ziniao(settings, args.credential_ref)
-        if args.kind == "admin":
-            return _configure_admin(settings, args.username)
         if args.kind == "feishu":
             return _configure_feishu(
                 settings,
@@ -135,32 +130,6 @@ def _configure_ziniao(settings: Settings, credential_ref: str) -> int:
         engine.dispose()
     # The password is deliberately neither returned nor printed.
     print(f"紫鸟凭据已保存到 Windows 凭据管理器：{credential_ref}")
-    return 0
-
-
-def _configure_admin(settings: Settings, requested_username: str | None) -> int:
-    username = (requested_username or input("管理员用户名: ")).strip()
-    password = _confirmed_secret("管理员密码", confirm=True)
-    engine, sessions = _database(settings)
-    try:
-        with sessions() as session:
-            existing = session.get(AdminCredential, 1)
-            if existing is None:
-                session.add(
-                    AdminCredential(
-                        id=1,
-                        username=username,
-                        password_hash=hash_password(password),
-                    )
-                )
-            else:
-                existing.username = username
-                existing.password_hash = hash_password(password)
-                existing.session_epoch += 1
-            session.commit()
-    finally:
-        engine.dispose()
-    print("单一管理员账号已配置，旧会话已失效")
     return 0
 
 

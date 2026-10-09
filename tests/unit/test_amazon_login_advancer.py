@@ -1448,8 +1448,9 @@ async def test_otp_navigation_away_during_stability_wait_never_clicks() -> None:
         else None
     )
 
-    with pytest.raises(HumanAuthRequired, match="稳定保持"):
-        await _advancer().advance(page)
+    result = await _advancer().advance(page)
+    assert result.status == "advanced"
+    assert result.page is page
 
     assert sum(page.waits) == 1_000
     assert button.clicks == 0
@@ -1904,11 +1905,14 @@ async def test_managed_passkey_three_runtime_failures_stop_at_retry_limit() -> N
     page.context = context
 
     advancer = _default_timing_advancer()
-    with pytest.raises(HumanAuthRequired):
+    with pytest.raises(HumanAuthRequired) as caught:
         await advancer.advance(
             page, expected_host="sellercentral.amazon.co.uk"
         )
 
+    assert caught.value.diagnostic.reason_code == "AUTH_RETRY_EXHAUSTED"
+    assert caught.value.diagnostic.action == "managed_passkey"
+    assert caught.value.diagnostic.attempts == 3
     assert context.click_attempts == 3
     assert context.clicks == 0
 
@@ -2863,9 +2867,12 @@ async def test_empty_or_implausible_otp_never_clicks(value: str) -> None:
         "https://sellercentral.amazon.co.uk/ap/mfa",
         [_Element("input", {"name": "otpCode"}, value=value), button],
     )
-    with pytest.raises(HumanAuthRequired):
+    with pytest.raises(HumanAuthRequired) as caught:
         await _advancer().advance(page)
     assert button.clicks == 0
+
+    assert caught.value.diagnostic.reason_code == "AUTH_INPUT_NOT_READY"
+    assert caught.value.diagnostic.stage == "otp_signin"
 
 
 @pytest.mark.asyncio
@@ -4219,4 +4226,22 @@ async def test_a_programming_error_in_the_prefill_wait_is_not_swallowed() -> Non
         await _password_test_advancer().advance(
             page, expected_host="sellercentral.amazon.co.uk"
         )
+    assert button.clicks == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    "https://sellercentral.amazon.co.uk.evil.test/home",
+    "https://sellercentral.amazon.ca/home",
+    "http://sellercentral.amazon.co.uk/home",
+    "https://sellercentral.amazon.co.uk/payments/disburse/details",
+    "https://sellercentral.amazon.co.uk/unknown",
+])
+async def test_otp_wait_never_treats_untrusted_redirect_as_success(url):
+    otp = _Element("input", {"id":"auth-mfa-otpcode", "name":"otpCode"}, value="")
+    button = _Element("button", {"id":"auth-signin-button"}, text="登录")
+    page = _Page("https://sellercentral.amazon.co.uk/ap/mfa", [otp, button])
+    page.on_wait = lambda: setattr(page, "url", url) if page.elapsed_ms == 1000 else None
+    with pytest.raises(HumanAuthRequired):
+        await _advancer().advance(page, expected_host="sellercentral.amazon.co.uk")
     assert button.clicks == 0

@@ -246,4 +246,52 @@
 .bulk-count.active{color:var(--red);font-weight:700}
 .toolbar-actions .button[disabled]{opacity:.45;cursor:not-allowed}
 @media(max-width:760px){.bulk-count{min-width:0}}
+/* 店铺账册：平台标签 + 筛选条。紫鸟公司账号下混着亚马逊、沃尔玛、TikTok，三条流程
+   只对亚马逊生效，所以亚马逊用墨色（和站点旗标同色系），其他平台用琥珀警示色一眼分开，
+   没拿到平台字段的用灰色留白。 */
+.store-filter{display:flex;flex-wrap:wrap;align-items:flex-end;gap:12px;margin:-8px 0 20px}
+.store-filter label{display:grid;gap:6px;font-size:11px;font-weight:700}
+.store-filter select{border:1px solid #aca697;background:#f8f5ec;padding:9px 11px;outline:none;min-width:150px}
+.store-filter select:focus{border-color:var(--red);box-shadow:0 0 0 2px rgba(180,60,47,.1)}
+.store-filter-count{margin-left:auto;align-self:center;color:var(--muted);font:10px var(--mono);white-space:nowrap}
+.platform-tag{display:inline-flex;align-items:center;gap:5px;margin-right:9px;padding:3px 7px;border:1px solid var(--ink);background:var(--ink);color:#fff;font:9px var(--mono);letter-spacing:.04em;white-space:nowrap;vertical-align:middle}
+.platform-tag em{font-style:normal;color:#cfd6cc}
+.platform-tag.is-other{border-color:#c69a3f;background:#eadfc7;color:#89601e}
+.platform-tag.is-other em{color:#a37f3c}
+.platform-tag.is-unknown{border-color:#cdc6b8;background:#f2efe8;color:#8b8478}
+@media(max-width:760px){.store-filter{display:block}.store-filter label{margin-bottom:10px}.store-filter-count{display:block;margin:0}}
 /* 任何带 hidden 属性的元素一律不显示。⚠️ 必须是整个文件的**最后一条**:.store-target / .check-row / .mini-check 也写了 display:…!important,选择器权重和 [hidden] 相同,谁在后面谁赢 —— 放在文件开头时 [hidden] 输给了它们,排期页的店铺搜索永远藏不住行（09-23 自审复核）。别在它后面再加规则。 */[hidden]{display:none!important}
+
+/* 店铺账册：延续纸质账册风格，用文字区分配置与任务开关。 */
+.store-ledger-summary{display:flex;flex-wrap:wrap;gap:12px 26px;padding:0 0 16px;margin:0 0 18px;border-bottom:1px solid var(--line,#cfc7b6);font-size:12px;color:var(--muted)}
+.store-ledger-summary b{margin-left:5px;color:var(--ink);font:600 16px var(--mono)}
+.store-filter{margin-bottom:10px}
+.store-filter .store-filter-search{flex:1;min-width:190px;max-width:320px}
+.store-filter input{width:100%;min-height:37px;border:1px solid #aca697;background:#f8f5ec;padding:9px 11px;border-radius:0;font:inherit}
+.store-filter input:focus{outline:2px solid var(--ink);outline-offset:2px}
+.store-filter .button{min-height:37px;padding:9px 12px}
+.store-filter-count{font-size:11px}
+.store-ledger-help{font-size:12px;line-height:1.8;color:var(--muted);margin:0 0 8px}
+.store-bulk-scope{font-size:12px;line-height:1.8;margin:0 0 20px;padding:10px 14px;border-left:3px solid var(--ink);background:rgba(25,39,33,.045)}
+.store-filter-empty{padding:30px 24px;border:1px dashed #c8bfad;margin:0 0 20px}
+.store-filter-empty p{font-size:13px;color:var(--muted);margin-bottom:0}
+.store-config-state{margin:0 22px 8px;font-size:12px;line-height:1.7;color:var(--muted)}
+@media(max-width:760px){.store-filter .store-filter-search{max-width:none}.store-filter-count{margin:12px 0}.store-ledger-summary{gap:12px 18px}.store-filter .button{margin-top:2px}}
+
+/* Onboarding facts remain separate from configuration and task switches. */
+.setup-batch-tools{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin:14px 0;padding:14px;border:1px solid var(--line,#dedbd2);border-radius:12px;background:var(--surface,#fff)}
+.setup-batch-tools label{display:flex;align-items:center;gap:10px}.setup-batch-tools span,.setup-store-choice{font-size:12px;color:var(--muted,#666)}
+.setup-store-choice{display:flex;align-items:center;gap:6px;margin-bottom:12px}.setup-store-choice input{width:16px;height:16px}
+.setup-check-summary{border-top:1px solid var(--line,#ddd);padding:12px 0;font-size:12px;line-height:1.8}.setup-check-summary b{display:block;font-size:13px}.setup-check-summary p{margin:3px 0}.setup-check-summary .setup-incomplete{color:#91521c}
+.setup-preview-dialog{max-width:820px;width:90vw;padding:24px}.setup-preview-dialog h2{margin-top:0}.setup-preview-dialog>p{font-size:13px;line-height:1.7}.setup-preview-scroll{max-height:52vh;overflow:auto;margin:18px 0}.setup-preview-scroll table{width:100%;border-collapse:collapse;text-align:left}.setup-preview-scroll th,.setup-preview-scroll td{padding:10px;border-bottom:1px solid #e3e0d8}.setup-preview-scroll th{position:sticky;top:0;background:#f5f3ed}.setup-preview-excluded{color:#8c5a36}
+
+/* Batch reset shares the ledger's restrained red destructive-action styling. */
+.danger-outline{color:var(--red);border-color:var(--red)}
+.danger-outline:disabled{opacity:.45;cursor:not-allowed}
+.setup-reset-dialog{width:min(720px,92vw);max-height:88vh;padding:28px;overflow:auto}
+.setup-reset-dialog h2{margin-top:0}
+.setup-reset-dialog>p{font-size:13px;line-height:1.8}
+.setup-reset-dialog ol{margin:0;padding:0 0 0 28px}
+.setup-reset-dialog li{padding:7px 5px;border-bottom:1px solid var(--line);font-size:13px;overflow-wrap:anywhere}
+.setup-reset-preserved{padding:12px;border-left:3px solid var(--ink);background:rgba(25,39,33,.045)}
+.setup-reset-result{color:var(--red);white-space:pre-wrap;overflow-wrap:anywhere}

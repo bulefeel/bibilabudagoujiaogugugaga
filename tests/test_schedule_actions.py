@@ -87,14 +87,7 @@ def seed(factory, *, mode: str = "dry_run", enabled: bool = False) -> int:
 
 
 def bootstrap(client: TestClient) -> str:
-    response = client.post(
-        "/auth/bootstrap",
-        json={
-            "username": "operator",
-            "password": "Local-Ledger-2026!",
-            "confirm_password": "Local-Ledger-2026!",
-        },
-    )
+    response = client.get("/")
     assert response.status_code == 200
     return client.cookies["ziniao_csrf"]
 

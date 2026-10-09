@@ -171,7 +171,7 @@ def build_runtime(
         recovery_loader=run_loader.recovery_runs,
         ziniao_controller=controller,
         session_factory=session_factory,
-        identity_auth_timeout_seconds=float(settings.auth_wait_minutes * 60),
+        setup_policy_path=settings.project_root / "onboarding-policy.toml",
     )
     automation_service.set_delivery_service(delivery_service)
     # The worker uses the same persistent service for cross-day and account

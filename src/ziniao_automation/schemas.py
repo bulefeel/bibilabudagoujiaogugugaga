@@ -39,7 +39,7 @@ class MarketplaceView(ApiModel):
     enabled: bool
 
 
-class MarketplaceSetupInput(ApiModel):
+class MarketplaceSetupInput(StrictApiModel):
     marketplace_codes: list[MarketplaceCode] = Field(min_length=1)
 
     @field_validator("marketplace_codes")
@@ -47,6 +47,55 @@ class MarketplaceSetupInput(ApiModel):
     def unique_codes(cls, value: list[MarketplaceCode]) -> list[MarketplaceCode]:
         if len(value) != len(set(value)):
             raise ValueError("自动建档站点不可重复")
+        return value
+
+
+class StoreSetupInput(MarketplaceSetupInput):
+    request_id: UUID | None = None
+    scope: Literal["full", "retry_unverified"] = "full"
+    expected_setup_revision: int | None = Field(None, ge=0)
+
+    @field_validator("marketplace_codes")
+    @classmethod
+    def supported_setup_codes(cls, value):
+        if set(value) - {"CA", "UK", "AU"}:
+            raise ValueError("统一核验仅支持CA/UK/AU，DE配置单独保存")
+        return value
+
+
+class StoreSetupBatchPreview(StrictApiModel):
+    store_ids: list[int] = Field(min_length=1, max_length=500)
+    mode: Literal["fill_missing", "retry_unverified", "recheck"] = "fill_missing"
+    selections: dict[int, list[Literal["CA", "UK", "AU"]]] = Field(default_factory=dict)
+
+    @field_validator("store_ids")
+    @classmethod
+    def unique_stores(cls, value):
+        if len(set(value)) != len(value) or any(i <= 0 for i in value):
+            raise ValueError("店铺编号必须为不重复的正整数")
+        return value
+
+    @field_validator("selections")
+    @classmethod
+    def unique_sites(cls, value):
+        if any(len(codes) != len(set(codes)) for codes in value.values()):
+            raise ValueError("站点不可重复")
+        return value
+
+
+class StoreSetupResetTarget(StrictApiModel):
+    store_id: int = Field(gt=0, strict=True)
+    expected_setup_revision: int = Field(ge=0, strict=True)
+
+
+class StoreSetupBatchResetInput(StrictApiModel):
+    stores: list[StoreSetupResetTarget] = Field(min_length=1, max_length=500)
+
+    @field_validator("stores")
+    @classmethod
+    def unique_stores(cls, value):
+        if len({item.store_id for item in value}) != len(value):
+            raise ValueError("店铺编号不可重复")
         return value
 
 
@@ -99,6 +148,7 @@ class StorePatch(ApiModel):
 
 
 class StoreView(ApiModel):
+    setup_revision: int = 0
     id: int
     name: str
     selector_type: str
@@ -270,36 +320,3 @@ class RunView(ApiModel):
 
 class ApprovalAction(ApiModel):
     approval_id: str | None = None
-
-
-class LoginInput(ApiModel):
-    username: str = Field(min_length=1, max_length=80)
-    password: str = Field(min_length=1, max_length=256)
-
-
-class BootstrapInput(ApiModel):
-    username: str = Field(min_length=3, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
-    password: str = Field(min_length=12, max_length=256)
-    confirm_password: str
-
-    @field_validator("password")
-    @classmethod
-    def strong_enough(cls, value: str) -> str:
-        categories = sum(
-            (
-                any(char.islower() for char in value),
-                any(char.isupper() for char in value),
-                any(char.isdigit() for char in value),
-                any(not char.isalnum() for char in value),
-            )
-        )
-        if categories < 3:
-            raise ValueError("密码需包含大写、小写、数字、符号中的至少三类")
-        return value
-
-    @field_validator("confirm_password")
-    @classmethod
-    def matching_password(cls, value: str, info: Any) -> str:
-        if info.data.get("password") != value:
-            raise ValueError("两次密码不一致")
-        return value

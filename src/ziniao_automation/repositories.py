@@ -9,7 +9,7 @@ import json
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
-from sqlalchemy import Select, and_, func, or_, select, update
+from sqlalchemy import Select, and_, delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -24,6 +24,7 @@ from .models import (
     Schedule,
     SiteRun,
     Store,
+    StoreHistory,
     StoreMarketplace,
     ZiniaoAccount,
 )
@@ -105,6 +106,16 @@ def canonical_hash(value: Any) -> str:
     return sha256(body).hexdigest()
 
 
+def assert_setup_editable(session: Session, store_id: int) -> None:
+    from .models import StoreSetupProbe
+    probe = session.scalar(select(StoreSetupProbe.id).where(
+        StoreSetupProbe.store_id == store_id,
+        (StoreSetupProbe.lifecycle != "FINISHED") | (StoreSetupProbe.cleanup_state == "UNCONFIRMED"),
+    ).limit(1))
+    if probe:
+        raise ConflictError("该店铺仍有活动核验或窗口释放待确认，请先取消并确认清理")
+
+
 class StoreRepository:
     # Runs that still hold the browser, or that a scheduler may still pick up.
     # Resetting under one of these pulls ``expected_seller_id`` out from under
@@ -165,7 +176,9 @@ class StoreRepository:
             raise ValueError("selector_type 只能是 oauth 或 id")
         if not selector_value.strip():
             raise ValueError("selector_value 不可为空")
+        history = self.session.scalar(select(StoreHistory).where(StoreHistory.selector_value == selector_value.strip()))
         store = Store(
+            id=history.id if history is not None else None,
             name=name.strip(),
             selector_type=selector_type,
             selector_value=selector_value.strip(),
@@ -199,6 +212,8 @@ class StoreRepository:
         unknown = set(changes) - allowed
         if unknown:
             raise ValueError(f"不允许修改字段：{', '.join(sorted(unknown))}")
+        if set(changes) & {"expected_seller_id", "identity_confirmed", "selector_type", "selector_value"}:
+            assert_setup_editable(self.session, store_id)
         previous_identity = _seller_identity(store.expected_seller_id)
         previous_selector = (str(store.selector_type), str(store.selector_value))
         seller_identity_changed = False
@@ -240,6 +255,7 @@ class StoreRepository:
         for key, value in changes.items():
             setattr(store, key, value.strip() if isinstance(value, str) else value)
         self.session.flush()
+        self.session.refresh(store)
         return store
 
     def upsert_profiles(
@@ -273,6 +289,8 @@ class StoreRepository:
                 assert existing is not None
                 created += 1
             else:
+                if str(existing.selector_type) != selector_type:
+                    assert_setup_editable(self.session, existing.id)
                 existing.name = str(profile.get("name") or existing.name)
                 existing.selector_type = selector_type
                 existing.browser_oauth = profile.get("browser_oauth")
@@ -285,6 +303,70 @@ class StoreRepository:
         self.session.flush()
         return created, updated
 
+    def missing_profile_ids(self, profiles: Sequence[Mapping[str, Any]], *, account_id: int) -> list[int]:
+        selectors = [str(item["selector_value"]).strip() for item in profiles]
+        # Only rows previously supplied by this account's sync are candidates.
+        # A manually added or another-account store is outside this snapshot.
+        stmt = select(Store.id).where(Store.account_id == account_id, Store.last_seen_at.is_not(None))
+        if selectors:
+            stmt = stmt.where(Store.selector_value.not_in(selectors))
+        return list(self.session.scalars(stmt.order_by(Store.id)))
+
+    def delete_missing_profiles(self, profiles: Sequence[Mapping[str, Any]], *, account_id: int) -> dict[str, Any]:
+        """Caller holds a SQLite IMMEDIATE transaction; preserve every history row."""
+        ids = self.missing_profile_ids(profiles, account_id=account_id)
+        if not ids:
+            return {"deleted": 0, "deleted_schedule_ids": [], "cancelled_runs": 0}
+        for store_id in ids:
+            assert_setup_editable(self.session, store_id)
+        # A running action must finish before deleting its environment. No
+        # mid-click cancellation and no retained hidden/waiting Store record.
+        busy = self.session.scalar(select(Run.id).where(
+            Run.store_id.in_(ids), Run.status.in_(("RUNNING", "WAITING_AUTH", "RECONCILING"))
+        ).limit(1))
+        claimed = self.session.scalar(select(RunQueueEntry.id).join(Run, Run.id == RunQueueEntry.run_id).where(
+            Run.store_id.in_(ids), RunQueueEntry.state == "CLAIMED"
+        ).limit(1))
+        if busy or claimed:
+            raise ConflictError("待删除店铺仍有正在执行的任务；请在当前任务结束后重新同步。本次未删除店铺")
+        now = utc_now()
+        schedule_ids = list(self.session.scalars(select(Schedule.id).where(Schedule.store_id.in_(ids))))
+        runs = list(self.session.scalars(select(Run).where(Run.store_id.in_(ids))))
+        unfinished = [run for run in runs if run.status in ACTIVE_RUN_STATUSES]
+        for run in runs:
+            run.result_summary = {**(run.result_summary or {}), "store_removed": True}
+        for run in unfinished:
+            guarded = self.session.scalar(select(OperationGuard.id).where(
+                OperationGuard.run_id == run.id,
+                OperationGuard.state.in_(("ARMED", "SUBMITTED", "UNCERTAIN")),
+            ).limit(1))
+            previous = run.status
+            run.status = "UNCERTAIN_FINANCIAL" if guarded else "CANCELLED"
+            run.finished_at = now
+            run.auth_deadline = None
+            run.error = "同步后店铺已从本地账册删除；历史保留，不再执行后续任务"
+            self.session.add(RunEvent(run_id=run.id, event_type="STORE_REMOVED", from_status=previous,
+                to_status=run.status, message=run.error))
+        run_ids = [run.id for run in runs]
+        if run_ids:
+            self.session.execute(update(RunQueueEntry).where(
+                RunQueueEntry.run_id.in_(run_ids), RunQueueEntry.state == "READY"
+            ).values(state="CANCELLED", finished_at=now))
+            self.session.execute(update(ApprovalRequest).where(
+                ApprovalRequest.run_id.in_(run_ids), ApprovalRequest.status.in_(("PENDING", "APPROVED"))
+            ).values(status="CANCELLED", cancelled_at=now, invalid_reason="店铺已从本地账册删除"))
+            self.session.execute(update(SiteRun).where(
+                SiteRun.run_id.in_([run.id for run in unfinished]),
+                SiteRun.status.in_(("PENDING", "QUEUED", "WAITING_APPROVAL", "WAITING_AUTH", "PLANNED")),
+                ~SiteRun.guards.any(),
+            ).values(status="CANCELLED", finished_at=now))
+        self.session.flush()
+        # SQL deletion deliberately avoids ORM relationship nulling. Database
+        # cascades remove schedules/site bindings; history FKs target snapshots.
+        self.session.execute(delete(Store).where(Store.id.in_(ids)))
+        self.session.flush()
+        return {"deleted": len(ids), "deleted_schedule_ids": schedule_ids, "cancelled_runs": len(unfinished)}
+
     def replace_marketplaces(
         self, store_id: int, definitions: Sequence[dict[str, Any]]
     ) -> list[StoreMarketplace]:
@@ -295,6 +377,7 @@ class StoreRepository:
         disabled so an old site cannot remain operational by accident.
         """
 
+        assert_setup_editable(self.session, store_id)
         store = self.get(store_id)
         incoming: dict[str, dict[str, Any]] = {}
         for item in definitions:
@@ -335,20 +418,10 @@ class StoreRepository:
             )
         )
 
-    def reset_setup(self, store_id: int) -> tuple[Store, list[int]]:
-        """Clear the store's identity baseline without deleting anything else.
+    def require_setup_resettable(self, store_id: int) -> Store:
+        """Read-only precheck shared by single and atomic batch reset."""
 
-        Only store identity and schedules are touched: ``expected_seller_id``,
-        ``identity_confirmed``, ``enabled``, and any schedule that could still
-        fire.  Marketplace rows, evidence, run history and — critically —
-        ``operation_guards`` are all left exactly as they are.
-
-        Still fail-closed around work in flight.  A queued item is checked
-        independently of ``Run.status`` so an inconsistent crash snapshot cannot
-        slip through.  Schedules are retained for audit and later
-        reconfiguration, but disabled before identity is removed.
-        """
-
+        assert_setup_editable(self.session, store_id)
         store = self.get(store_id)
         # Name the blockers.  A bare "there is still an unfinished task" leaves
         # the operator with nowhere to look, and the UI does not surface every
@@ -385,6 +458,17 @@ class StoreRepository:
                 + "；".join(blockers)
             )
 
+        return store
+
+    def reset_setup(self, store_id: int) -> tuple[Store, list[int]]:
+        """Reset identity and disable schedules, preserving sites and history.
+
+        Never delete evidence, runs, setup history or financial guards. Advancing
+        setup_revision invalidates past verification instead of relabelling it.
+        The caller commits the transaction after all required checks succeed.
+        """
+        store = self.require_setup_resettable(store_id)
+        store.setup_revision += 1
         schedule_ids = list(
             self.session.scalars(
                 select(Schedule.id).where(

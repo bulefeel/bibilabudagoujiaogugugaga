@@ -1,0 +1,26 @@
+[
+  {
+    "sample": "S01",
+    "fixture": "s01-20260927.html",
+    "sha256": "84f84a3559fb9409e08eb71cf6007d1489ea051516de687badd06cf62dd989f1",
+    "current_account_observed": false,
+    "source": "live Ziniao CDP, exact Amazon account-switcher route, three stable samples",
+    "redaction": "allowlisted classes and state attributes; account/non-allowlisted labels replaced; scripts, inputs, URLs and IDs omitted"
+  },
+  {
+    "sample": "S02",
+    "fixture": "s02-20260927.html",
+    "sha256": "281cfcdf4c2b6c0164930f867cc419ff7a2ead71b51980105e586fc25708b744",
+    "current_account_observed": false,
+    "source": "live Ziniao CDP, exact Amazon account-switcher route, three stable samples",
+    "redaction": "allowlisted classes and state attributes; account/non-allowlisted labels replaced; scripts, inputs, URLs and IDs omitted"
+  },
+  {
+    "sample": "S03",
+    "fixture": "s03-20260927.html",
+    "sha256": "178dbad350c6c3f55154a0e1e3b003623242ff6645c56d1cd2bd08aa8b4d3a3a",
+    "current_account_observed": true,
+    "source": "live Ziniao CDP, exact Amazon account-switcher route, three stable samples",
+    "redaction": "allowlisted classes and state attributes; account/non-allowlisted labels replaced; scripts, inputs, URLs and IDs omitted"
+  }
+]

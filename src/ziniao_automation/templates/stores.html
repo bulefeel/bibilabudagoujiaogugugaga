@@ -1,6 +1,35 @@
 {% extends "base.html" %}
 {% block content %}
-<div class="toolbar"><div><p class="lead">一个紫鸟账号，可对应多家独立店铺环境。统一建档成功后会自动绑定并确认卖家身份；身份冲突时才需要人工复核。</p></div><div class="toolbar-actions"><button class="button dark" data-action="detect-all-store-setups">一键自动建档全部店铺</button><button class="button primary" data-action="sync-stores">↻ 同步紫鸟店铺</button></div></div>
+{# 兼容仍在运行的旧后台：模板可自行计算概况，不依赖新增路由参数。 #}
+{% if platform_counts is not defined %}
+{% set platform_counts = namespace(amazon=0, other=0, unknown=0) %}
+{% for item in stores %}
+  {% if item.platform.is_amazon %}{% set platform_counts.amazon = platform_counts.amazon + 1 %}
+  {% elif item.platform.known %}{% set platform_counts.other = platform_counts.other + 1 %}
+  {% else %}{% set platform_counts.unknown = platform_counts.unknown + 1 %}{% endif %}
+{% endfor %}
+{% endif %}
+<div class="toolbar"><div><p class="lead">这里管理亚马逊店铺的身份与站点配置。先筛选店铺，再批量补全建档；同步会更新店铺资料，并删除当前账号已不再返回的店铺及排期；历史与截图保留，不会自动开始任务。</p></div><div class="toolbar-actions"><button type="button" class="button dark" data-action="detect-all-store-setups">批量建档当前筛选</button><button type="button" class="button primary" data-action="sync-stores">↻ 同步紫鸟店铺</button></div></div>
+<div class="store-ledger-summary" aria-label="同步店铺概况"><span>已同步 <b>{{ stores|length }}</b> 家</span><span>亚马逊 <b>{{ platform_counts.amazon }}</b></span><span>其他平台 <b>{{ platform_counts.other }}</b></span><span>平台待确认 <b>{{ platform_counts.unknown }}</b></span></div>
+<form class="store-filter" data-store-filter aria-label="筛选店铺">
+  <label class="store-filter-search">店铺名称<input type="search" name="q" placeholder="输入店铺名称" autocomplete="off"></label>
+  <label>平台<select name="platform"><option value="">全部平台</option>{% for label in platform_labels %}<option value="{{ label }}" {{ 'selected' if label == '亚马逊' else '' }}>{{ label }}</option>{% endfor %}</select></label>
+  <label>建档配置<select name="setup"><option value="">全部</option><option value="needed">待补全</option><option value="done">已配置</option></select></label>
+  <label>任务开关<select name="enabled"><option value="">全部</option><option value="true">允许任务</option><option value="false">暂停任务</option></select></label>
+  <button class="button ghost" type="button" data-action="reset-store-filters">恢复默认</button>
+  <span class="store-filter-count" data-store-filter-count aria-live="polite">共 {{ stores|length }} 家</span>
+</form>
+<p class="store-ledger-help">默认只看亚马逊。平台标签中的地区是紫鸟登记地区，不代表已开通站点。“已配置”表示身份已确认且已选择站点，运行时仍会核验登录与身份。</p>
+<section class="setup-batch-tools" aria-label="批量核验操作">
+  <label>操作<select data-setup-batch-mode><option value="fill_missing">补齐配置</option><option value="retry_unverified">重试未通过站点</option><option value="recheck">复核所选店铺</option></select></label>
+  <button type="button" class="button ghost" data-action="select-visible-setups">选择当前可见亚马逊店铺</button>
+  <button type="button" class="button ghost" data-action="clear-setup-selection">清空勾选</button>
+  <button type="button" class="button danger-outline" data-action="batch-reset-store-setups" disabled>批量删除建档（0）</button>
+  <span data-setup-reset-count aria-live="polite">仅对当前可见且已勾选的亚马逊店铺操作。</span>
+  <span>只核验 CA / UK / AU；DE 配置保留，不自动扩展站点。</span>
+</section>
+<p class="store-bulk-scope" data-store-bulk-scope aria-live="polite"></p>
+<div class="store-filter-empty" data-store-filter-empty hidden><b>没有匹配的店铺</b><p>调整名称、平台或状态筛选；其他店铺并未被删除。</p></div>
 <section class="bulk-setup-progress" data-bulk-store-setup-progress hidden aria-live="polite">
   <div><span class="marketplace-autofill-kicker">批量建档队列</span><b data-bulk-store-setup-title>准备按店铺顺序检测</b><p data-bulk-store-setup-message>每次只打开一家紫鸟店铺，在同一窗口核验卖家身份与所选站点；上一家结束后才会继续。</p></div>
   <!-- 「其中」/「次」不是修辞：站点未通过是「身份已建档」的子集，曾等待验证按暂停次数计，
@@ -18,16 +47,47 @@
 {% endfor %}
 {% set identity_ready = true if store.expected_seller_id and store.identity_confirmed else false %}
 {% set setup_needed = true if not identity_ready or not store_data.enabled_codes else false %}
-<article class="store-card" data-store-card data-store-id="{{ store.id }}" data-store-name="{{ store.name }}" data-identity-state="{{ 'CONFIRMED' if identity_ready else ('UNCONFIRMED' if store.expected_seller_id else 'MISSING') }}" data-store-setup-needed="{{ 'true' if setup_needed else 'false' }}" data-store-setup-marketplaces='{{ store_data.enabled_codes|tojson }}' data-store-setup-defaulted="{{ 'true' if not store_data.enabled_codes else 'false' }}">
-  <header><span class="store-index">{{ '%02d'|format(loop.index) }}</span><div><h2>{{ store.name }}</h2><p>{{ store.selector_type|upper }} · {{ store.selector_value[-8:] }}</p></div><span class="switch-label {{ 'on' if store.enabled else '' }}">{{ '已启用' if store.enabled else '未启用' }}</span></header>
-  <div class="identity-block"><small>预期卖家身份</small><b>{{ store.expected_seller_id or '尚未绑定' }}</b><span class="verify-mark {{ 'ok' if store.identity_confirmed else '' }}">{{ '✓ 已确认' if store.identity_confirmed else ('待自动确认' if store.expected_seller_id else '待自动建档') }}</span></div>
-  <div class="market-list">
-    {% for site in store.marketplaces %}<div><i class="flag flag-{{ site.code|lower }}">{{ site.code }}</i><span><b>{{ site.domain }}</b><small>{{ site.currency }}</small></span><em class="{{ 'live' if site.enabled else '' }}">{{ '启用' if site.enabled else '关闭' }}</em></div>{% else %}<p class="empty-inline">还没有绑定 CA / UK / AU 站点</p>{% endfor %}
+{% set platform = store.platform %}
+{% set out_of_scope = platform.known and not platform.is_amazon %}
+{# data-platform-amazon 三态：true / false / 空（紫鸟没给平台字段，重新同步前不下结论）。
+   data-setup-state 给筛选用：非亚马逊店既不是「待建档」也不是「已建档」—— 它永远建不了档，
+   列进「待建档」只会让人再拿它去跑一次。 #}
+<article class="store-card" data-store-card data-store-id="{{ store.id }}" data-setup-revision="{{ store.setup_revision }}" data-store-name="{{ store.name }}" data-store-enabled="{{ 'true' if store.enabled else 'false' }}" data-platform-label="{{ platform.label }}" data-platform-amazon="{{ 'true' if platform.is_amazon else ('false' if platform.known else '') }}" data-setup-state="{{ 'n/a' if out_of_scope else ('needed' if setup_needed else 'done') }}" data-identity-state="{{ 'CONFIRMED' if identity_ready else ('UNCONFIRMED' if store.expected_seller_id else 'MISSING') }}" data-store-setup-needed="{{ 'true' if setup_needed else 'false' }}" data-store-setup-marketplaces='{{ store_data.enabled_codes|tojson }}' data-store-setup-defaulted="{{ 'true' if not store_data.enabled_codes else 'false' }}" {{ 'hidden' if not platform.is_amazon else '' }}>
+  <label class="setup-store-choice"><input type="checkbox" data-setup-select aria-label="选择 {{ store.name }}" {{ 'disabled' if not platform.is_amazon else '' }}> 选择店铺</label>
+  <header><span class="store-index">{{ '%02d'|format(loop.index) }}</span><div><h2>{{ store.name }}</h2><p><span class="platform-tag {{ 'is-amazon' if platform.is_amazon else ('is-other' if platform.known else 'is-unknown') }}" title="{{ '紫鸟登记的平台：' ~ platform.name if platform.known else '紫鸟没有返回平台字段，重新同步紫鸟店铺后显示' }}">{{ platform.label }}{% if platform.region %}<em>{{ platform.region }}</em>{% endif %}</span>{{ store.selector_type|upper }} · {{ store.selector_value[-8:] }}</p></div><span data-store-task-state class="switch-label {{ 'on' if store.enabled else '' }}" title="店铺任务总开关；与下方的站点选择分开设置">{{ '允许任务' if store.enabled else '暂停任务' }}</span></header>
+  <div class="identity-block"><small>预期卖家身份</small><b data-store-identity-value>{{ store.expected_seller_id or '尚未绑定' }}</b><span data-store-identity-state class="verify-mark {{ 'ok' if store.identity_confirmed else '' }}">{{ '不参与建档' if out_of_scope else ('✓ 身份已确认' if identity_ready else ('身份待确认' if store.expected_seller_id else '待自动建档')) }}</span></div>
+  {% if not out_of_scope %}<p data-store-config-state class="store-config-state">{% if not identity_ready %}待补全：{{ '卖家身份尚未确认' if store.expected_seller_id else '尚未绑定卖家身份' }}{% elif not store_data.enabled_codes %}待补全：尚未选择站点{% else %}建档已配置 · {{ '可创建任务' if store.enabled else '任务已暂停，建档仍保留' }}{% endif %}</p>{% endif %}
+  <div class="market-list" data-store-markets aria-label="任务可选站点">
+    {# ⚠️ 提示不能只在「没有站点」时才出：线上那家 TikTok 店被早先的一键建档默认勾上了
+       CA/UK/AU，卡片看起来和一家待建档的亚马逊店一模一样（2026-09-26 实测）。 #}
+    {% if out_of_scope %}<p class="empty-inline">{{ platform.label }} 店铺不在自动化范围内：提现、反馈、安全证明三条流程都只对亚马逊生效，一键建档会跳过它</p>{% endif %}
+    {% for site in store.marketplaces %}<div><i class="flag flag-{{ site.code|lower }}">{{ site.code }}</i><span><b>{{ site.domain }}</b><small>{{ site.currency }}</small></span><em class="{{ 'live' if site.enabled else '' }}">{{ '已选择' if site.enabled else '未选择' }}</em></div>{% else %}{% if not out_of_scope %}<p class="empty-inline">尚未选择任务站点</p>{% endif %}{% endfor %}
   </div>
-  <footer><button type="button" class="button ghost" data-action="edit-store" data-store-id="{{ store.id }}" data-store='{{ {"id":store.id,"name":store.name,"expected_seller_id":store.expected_seller_id,"identity_confirmed":store.identity_confirmed,"enabled":store.enabled,"marketplaces":store_data.marketplaces}|tojson }}'>编辑建档</button><button type="button" class="button dark" data-action="new-run" data-store-id="{{ store.id }}" {{ 'disabled' if not store.enabled else '' }}>发起检查</button></footer>
+  <section class="setup-check-summary" data-setup-summary aria-live="polite">最近核验：加载中</section>
+  <footer><button type="button" class="button ghost" data-action="edit-store" data-store-id="{{ store.id }}" data-store='{{ {"id":store.id,"name":store.name,"expected_seller_id":store.expected_seller_id,"identity_confirmed":store.identity_confirmed,"enabled":store.enabled,"marketplaces":store_data.marketplaces}|tojson }}'>编辑建档</button><button type="button" class="button dark" data-action="new-run" data-store-id="{{ store.id }}" {{ 'disabled' if not store.enabled or not identity_ready or not ('CA' in store_data.enabled_codes or 'UK' in store_data.enabled_codes or 'AU' in store_data.enabled_codes) else '' }} title="提现检查需要允许任务、确认身份，并选择 CA / UK / AU 中至少一个站点">提现检查</button></footer>
 </article>
 {% else %}<div class="blank-slate"><span>空</span><h2>店铺账册还没有记录</h2><p>先启动紫鸟客户端，再点击“同步紫鸟店铺”。同步只读取环境，不会打开亚马逊或执行资金操作。</p></div>{% endfor %}
 </div>
+<dialog id="setup-reset-batch-dialog" class="sheet-dialog setup-reset-dialog" aria-labelledby="setup-reset-title">
+  <p class="eyebrow">RESET SELECTED STORE RECORDS</p>
+  <h2 id="setup-reset-title">批量删除建档</h2>
+  <p>只重置下列店铺的建档，不删除店铺或紫鸟环境。确认后清空卖家 ID 和身份确认、关闭店铺任务开关，并停用这些店铺的排期。</p>
+  <p class="setup-reset-preserved">保留：站点勾选（含 DE）、历史核验、运行记录、截图和资金防重复记录。旧核验会因配置版本变化而失效，可以重新建档。</p>
+  <p data-setup-reset-queue-note hidden>本页暂停的建档队列包含所选店铺；删除成功后会清除这份本地队列，防止再次自动建档。已运行的历史保留。</p>
+  <div class="setup-preview-scroll"><ol data-setup-reset-list></ol></div>
+  <p data-setup-reset-summary></p>
+  <p>正在建档、等待验证、窗口释放待确认或有未结束任务的店铺会阻止整批操作；不会只删除一部分。</p>
+  <p class="setup-reset-result" data-setup-reset-result role="status" aria-live="polite"></p>
+  <div class="toolbar-actions">
+    <button type="button" class="button ghost" data-setup-reset-cancel>取消</button>
+    <button type="button" class="button primary" data-setup-reset-confirm>确认删除所选建档</button>
+  </div>
+</dialog>
+<dialog id="setup-batch-preview" class="sheet-dialog setup-preview-dialog" aria-labelledby="setup-preview-title">
+  <h2 id="setup-preview-title">确认批量核验范围</h2><p>按下表顺序逐店执行；执行前再次检查配置版本。关闭页面不会自动发起后续店铺。补测时可能只读访问已通过站点来核对身份，不重复该站的完整核验。</p>
+  <div class="setup-preview-scroll"><table><thead><tr><th>顺序</th><th>店铺</th><th>核验站点</th><th>预检结果</th></tr></thead><tbody data-setup-preview-rows></tbody></table></div>
+  <p data-setup-preview-count></p><div class="toolbar-actions"><button class="button ghost" type="button" data-setup-preview-cancel>取消</button><button class="button primary" type="button" data-setup-preview-confirm>按此范围开始</button></div>
+</dialog>
 <dialog id="store-dialog" class="sheet-dialog">
   <form data-store-form>
     <button type="button" class="dialog-close" data-action="close-dialog">×</button>
@@ -43,11 +103,11 @@
         <div>
           <span class="marketplace-autofill-kicker">卖家身份 + 站点核验</span>
           <b>一次打开，一次完成核验</b>
-          <p>程序会读取卖家身份，并逐站打开付款控制面板核验域名与身份。<strong>全程不点击页面上的任何按钮。</strong></p>
+          <p>程序会读取卖家身份，并逐站打开付款控制面板核验域名与身份。<strong>仅处理登录与站点选择，不点击请求付款或最终付款按钮。</strong></p>
         </div>
         <button class="button dark" type="button" data-action="detect-store-setup">自动获取卖家ID并核验站点</button>
       </aside>
-      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选 CA、UK、AU 中需要的站点，再点击统一建档。卖家身份与各站点核验结果会直接保存到账册；只有卖家身份与原建档冲突才需要人工复核。<b>德国站不参与统一建档</b>——核验要读付款控制面板，德国站没有那条链路，所以勾选后直接保存即可。</p>
+      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选 CA、UK、AU 中需要的站点，再点击统一建档。卖家身份与各站点核验结果会保存到账册，页面刷新和后台重启后仍可查看；只有卖家身份与原建档冲突才需要人工复核。<b>德国站不参与统一建档</b>——核验要读付款控制面板，德国站没有那条链路，所以勾选后直接保存即可。</p>
       {% for code, label, domain, probeable in [
         ('CA', '加拿大', 'sellercentral.amazon.ca', true),
         ('UK', '英国', 'sellercentral.amazon.co.uk', true),
@@ -79,7 +139,7 @@
           <button class="button ghost" type="button" data-action="cancel-store-setup">取消并关闭该店铺窗口</button>
         </div>
       </section>
-      <p class="marketplace-setup-note">核验只打开付款控制面板并比对域名与卖家身份，<strong>全程不点击任何按钮，也不读取金额</strong>。某个站点核验未通过时，只标记该站点，不会改动店铺启用状态，也不会取消你勾选的站点；三种模式均可保存和运行。可提现金额与近 24 小时限流由提现任务在运行现场判断，不在建档阶段预先记录。</p>
+      <p class="marketplace-setup-note">核验只打开付款控制面板并比对域名与卖家身份，<strong>可能点击登录、国家选择及确认按钮，不点击请求付款或最终付款按钮</strong>。某个站点核验未通过时，只标记该站点，不会改动店铺启用状态，也不会取消你勾选的站点；核验结果与任务开关分开；任务执行仍需实时检查域名、身份与资金条件。可提现金额与近 24 小时限流由提现任务在运行现场判断，不在建档阶段预先记录。</p>
     </fieldset>
     <label class="check-row"><input name="identity_confirmed" type="checkbox"><span><b>卖家身份已确认</b><small>统一建档成功后自动勾选；异常复核时也可手工调整</small></span></label>
     <label class="check-row"><input name="enabled" type="checkbox"><span><b>启用这家店铺</b><small>新建或补全身份时自动启用；之后可按需要手工关闭</small></span></label>

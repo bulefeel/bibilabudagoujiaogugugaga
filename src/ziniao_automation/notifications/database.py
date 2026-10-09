@@ -30,6 +30,7 @@ from ..models import (
     Schedule,
     SiteRun,
     Store,
+    StoreHistory,
     StoreMarketplace,
 )
 from .dto import (
@@ -135,11 +136,11 @@ class DatabaseNoticeBuilder:
                     Run.error,
                     Run.workflow,
                     Run.store_id,
-                    Store.name.label("store_name"),
+                    StoreHistory.name.label("store_name"),
                     Schedule.name.label("schedule_name"),
                     Schedule.timezone.label("schedule_timezone"),
                 )
-                .join(Store, Store.id == Run.store_id)
+                .join(StoreHistory, StoreHistory.id == Run.store_id)
                 .outerjoin(Schedule, Schedule.id == Run.schedule_id)
                 .where(Run.id == run_id)
             ).one_or_none()

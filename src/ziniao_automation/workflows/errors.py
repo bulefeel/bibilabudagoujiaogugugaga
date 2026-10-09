@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .setup_diagnostics import SetupDiagnostic
+
 
 class WorkflowError(RuntimeError):
     code = "workflow_error"
@@ -70,9 +72,22 @@ class HumanAuthRequired(WorkflowError):
         *,
         kind: str = "unknown",
         dispatch_recorded: bool | None = None,
+        reason_code: str = "AUTH_UNKNOWN",
+        stage: str = "unknown",
+        action: str | None = None,
+        attempts: int | None = None,
+        candidate_count: int | None = None,
+        page_category: str = "UNKNOWN_PAGE",
     ) -> None:
         super().__init__(message)
         self.kind = kind
+        if reason_code == "AUTH_UNKNOWN" and kind == "marketplace_switch":
+            reason_code = "MARKETPLACE_UNKNOWN"
+        self.diagnostic = SetupDiagnostic(
+            reason_code=reason_code, stage=stage, action=action,
+            attempts=attempts, candidate_count=candidate_count,
+            page_category=page_category,
+        )
         # 这一下不可逆点击到底点没点下去。
         #
         # ``None`` = 不知道(默认,也是**唯一安全的默认**):调用方一个字都不许动那条

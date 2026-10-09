@@ -5,11 +5,16 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import inspect
+import asyncio
+from functools import wraps
 import logging
 from pathlib import Path
 import re
 import socket
 from typing import Any, AsyncIterator, Protocol
+
+from ziniao_automation.setup_repository import SetupRepository, SetupConflict
+from ziniao_automation.schemas import StoreSetupInput, StoreSetupBatchPreview
 
 from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
@@ -17,14 +22,14 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from .auth import AuthService, AuthenticatedAdmin
+from .auth import LocalAccess, LocalOperator, is_loopback_client, is_same_origin_request
 from .config import Settings
-from .db import create_sqlite_engine, database_revision, init_database, make_session_factory
+from .db import backup_sqlite_database, create_sqlite_engine, database_revision, init_database, make_session_factory
 from .models import (
     ApprovalRequest,
     Evidence,
@@ -34,6 +39,7 @@ from .models import (
     RunQueueEntry,
     SiteRun,
     Store,
+    StoreHistory,
     SystemSetting,
     ZiniaoAccount,
 )
@@ -52,10 +58,8 @@ from .scheduler import ScheduleProjectionReport
 from .schemas import (
     BatchScheduleCreateInput,
     BatchSchedulePreviewInput,
-    BootstrapInput,
     FeedbackDecisionInput,
     FeishuSettingsInput,
-    LoginInput,
     MarketplaceSetupInput,
     RunCreate,
     WebdriverStart,
@@ -68,6 +72,7 @@ from .schemas import (
     StoreCreate,
     StorePatch,
     StoreSetupResetView,
+    StoreSetupBatchResetInput,
     StoreView,
     ZiniaoSettingsInput,
 )
@@ -123,7 +128,7 @@ def _release_before_automation(db: Session) -> None:
     db.commit()
 
 
-SESSION_COOKIE = "ziniao_session"
+SESSION_COOKIE = "ziniao_local_session"
 CSRF_COOKIE = "ziniao_csrf"
 
 
@@ -393,6 +398,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.create_schema_on_start:
             init_database(engine, backup_dir=settings.backup_dir)
+        SetupRepository(sessions).recover()
         runtime = None
         try:
             try:
@@ -437,15 +443,25 @@ def create_app(
         (build_amazon_disbursement_definition(),)
     )
     app.state.templates = templates
+    local_access = LocalAccess(session_hours=settings.session_hours)
+    app.state.local_access = local_access
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "testserver"],
+        allowed_hosts=["127.0.0.1", "localhost"] + (["testserver"] if settings.testing else []),
     )
     app.mount("/static", StaticFiles(directory=str(package_dir / "static")), name="static")
 
     @app.middleware("http")
     async def security_headers(request: Request, call_next: Any) -> Response:
-        response = await call_next(request)
+        peer = request.client.host if request.client else None
+        if not is_loopback_client(peer, testing=settings.testing):
+            response = JSONResponse({"detail": "管理后台仅允许本机访问"}, status_code=403)
+        elif not is_same_origin_request(
+            request.headers.get("origin"), request.headers.get("sec-fetch-site"), str(request.url)
+        ):
+            response = JSONResponse({"detail": "请从本机管理后台页面操作"}, status_code=403)
+        else:
+            response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
@@ -470,33 +486,17 @@ def create_app(
         finally:
             session.close()
 
-    def current_admin(
-        request: Request,
-        db: Session = Depends(get_session),
-    ) -> AuthenticatedAdmin:
-        auth = AuthService(db, session_hours=settings.session_hours)
-        if not auth.is_initialized():
-            raise HTTPException(status_code=428, detail="请先完成管理员初始化")
-        admin = auth.validate(request.cookies.get(SESSION_COOKIE))
-        if admin is None:
-            raise HTTPException(status_code=401, detail="登录已失效")
-        return admin
+    def current_operator() -> LocalOperator:
+        # All requests already passed the peer/Host/origin middleware.
+        return LocalOperator()
 
-    def verified_admin(
+    def verified_operator(
         request: Request,
         x_csrf_token: str | None = Header(None),
-        db: Session = Depends(get_session),
-    ) -> AuthenticatedAdmin:
-        auth = AuthService(db, session_hours=settings.session_hours)
-        admin = auth.validate(request.cookies.get(SESSION_COOKIE))
-        # The readable CSRF cookie is a delivery channel, not proof.  State
-        # changes must echo it in this custom header.
-        csrf = x_csrf_token
-        if admin is None:
-            raise HTTPException(status_code=401, detail="登录已失效")
-        if not auth.validate_csrf(request.cookies.get(SESSION_COOKIE), csrf):
+    ) -> LocalOperator:
+        if not local_access.validate_csrf(request.cookies.get(SESSION_COOKIE), x_csrf_token):
             raise HTTPException(status_code=403, detail="页面校验已失效，请刷新后重试")
-        return admin
+        return LocalOperator()
 
     def render(
         request: Request,
@@ -506,20 +506,18 @@ def create_app(
         db: Session,
         page_title: str,
     ) -> Response:
-        auth = AuthService(db, session_hours=settings.session_hours)
-        if not auth.is_initialized():
-            return RedirectResponse("/setup", status_code=303)
-        admin = auth.validate(request.cookies.get(SESSION_COOKIE))
-        if admin is None:
-            return RedirectResponse("/login", status_code=303)
         common = {
             "request": request,
-            "admin": admin,
             "page_title": page_title,
             "active_path": request.url.path,
             **context,
         }
-        return templates.TemplateResponse(request=request, name=template, context=common)
+        response = templates.TemplateResponse(request=request, name=template, context=common)
+        token, csrf = local_access.page_tokens(request.cookies.get(SESSION_COOKIE))
+        _set_session_cookies(response, token, csrf, settings)
+        if "ziniao_session" in request.cookies:
+            response.delete_cookie("ziniao_session", path="/")
+        return response
 
     @app.exception_handler(NotFoundError)
     async def not_found_handler(_: Request, exc: NotFoundError) -> JSONResponse:
@@ -561,63 +559,11 @@ def create_app(
             )
         raise exc
 
-    @app.get("/setup", response_class=HTMLResponse)
-    def setup_page(request: Request, db: Session = Depends(get_session)) -> Response:
-        if AuthService(db).is_initialized():
-            return RedirectResponse("/login", status_code=303)
-        return templates.TemplateResponse(
-            request=request, name="setup.html", context={"request": request, "page_title": "首次初始化"}
-        )
-
-    @app.post("/auth/bootstrap")
-    def bootstrap(payload: BootstrapInput, response: Response, db: Session = Depends(get_session)) -> dict[str, str]:
-        try:
-            new_session = AuthService(db, session_hours=settings.session_hours).bootstrap(
-                payload.username, payload.password
-            )
-            db.commit()
-        except RuntimeError as exc:
-            db.rollback()
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except IntegrityError as exc:
-            db.rollback()
-            raise HTTPException(status_code=409, detail="管理员已经初始化") from exc
-        _set_session_cookies(response, new_session.session_token, new_session.csrf_token, settings)
-        return {"next": "/", "username": new_session.username}
-
-    @app.get("/login", response_class=HTMLResponse)
-    def login_page(request: Request, db: Session = Depends(get_session)) -> Response:
-        auth = AuthService(db)
-        if not auth.is_initialized():
-            return RedirectResponse("/setup", status_code=303)
-        if auth.validate(request.cookies.get(SESSION_COOKIE)):
-            return RedirectResponse("/", status_code=303)
-        return templates.TemplateResponse(
-            request=request, name="login.html", context={"request": request, "page_title": "管理员登录"}
-        )
-
-    @app.post("/auth/login")
-    def login(payload: LoginInput, response: Response, db: Session = Depends(get_session)) -> dict[str, str]:
-        new_session = AuthService(db, session_hours=settings.session_hours).authenticate(
-            payload.username, payload.password
-        )
-        if new_session is None:
-            raise HTTPException(status_code=401, detail="账号或密码不正确，连续失败将暂时锁定")
-        db.commit()
-        _set_session_cookies(response, new_session.session_token, new_session.csrf_token, settings)
-        return {"next": "/"}
-
-    @app.post("/auth/logout")
-    def logout(
-        request: Request,
-        response: Response,
-        _: AuthenticatedAdmin = Depends(verified_admin),
-        db: Session = Depends(get_session),
-    ) -> Response:
-        AuthService(db).logout(request.cookies.get(SESSION_COOKIE))
-        response.delete_cookie(SESSION_COOKIE, path="/")
-        response.delete_cookie(CSRF_COOKIE, path="/")
-        return {"next": "/login"}
+    @app.get("/setup", include_in_schema=False)
+    @app.get("/login", include_in_schema=False)
+    def legacy_login_page() -> Response:
+        """Old bookmarks go straight to the console; no credential forms remain."""
+        return RedirectResponse("/", status_code=303)
 
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request, db: Session = Depends(get_session)) -> Response:
@@ -627,7 +573,22 @@ def create_app(
 
     @app.get("/stores", response_class=HTMLResponse)
     def stores_page(request: Request, db: Session = Depends(get_session)) -> Response:
-        return render(request, "stores.html", {"stores": StoreRepository(db).list()}, db=db, page_title="店铺账册")
+        stores = StoreRepository(db).list()
+        # 筛选项只列账册里真有的平台;亚马逊固定排第一,因为三条流程只认它。
+        platforms = {store.platform.label: store.platform.is_amazon for store in stores}
+        platform_labels = ["亚马逊", *sorted(label for label in platforms if label != "亚马逊")]
+        platform_counts = {
+            "amazon": sum(store.platform.is_amazon for store in stores),
+            "other": sum(store.platform.known and not store.platform.is_amazon for store in stores),
+            "unknown": sum(not store.platform.known for store in stores),
+        }
+        return render(
+            request,
+            "stores.html",
+            {"stores": stores, "platform_labels": platform_labels, "platform_counts": platform_counts},
+            db=db,
+            page_title="店铺账册",
+        )
 
     @app.get("/schedules", response_class=HTMLResponse)
     def schedules_page(request: Request, db: Session = Depends(get_session)) -> Response:
@@ -683,7 +644,7 @@ def create_app(
         reviews = list(db.scalars(stmt.limit(500)))
 
         store_names = {
-            int(row.id): str(row.name) for row in db.scalars(select(Store))
+            int(row.id): str(row.name) for row in db.scalars(select(StoreHistory))
         }
         # Counts per store+site over the WHOLE ledger, not the filtered view —
         # the point of the summary is to show where the reviews actually are.
@@ -831,7 +792,7 @@ def create_app(
     @app.get("/evidence/{evidence_id}")
     def evidence_file(
         evidence_id: str,
-        _: AuthenticatedAdmin = Depends(current_admin),
+        _: LocalOperator = Depends(current_operator),
         db: Session = Depends(get_session),
     ) -> FileResponse:
         record = db.get(Evidence, evidence_id)
@@ -846,7 +807,19 @@ def create_app(
             raise HTTPException(404, "证据文件不存在")
         return FileResponse(path, filename=path.name)
 
-    api = APIRouter(prefix="/api", dependencies=[Depends(current_admin)])
+    api = APIRouter(prefix="/api", dependencies=[Depends(current_operator)])
+    catalog_lock = asyncio.Lock()
+
+    def serialized_store_catalog(handler):
+        # Serialize starting/resuming probes with sync deletion. Running probes
+        # are still checked explicitly; ordinary workflow claims use SQLite's
+        # IMMEDIATE write transaction as their cross-process boundary.
+        @wraps(handler)
+        async def guarded(*args, **kwargs):
+            async with catalog_lock:
+                return await handler(*args, **kwargs)
+        return guarded
+
 
     def active_workflow_registry(request: Request) -> WorkflowRegistry:
         registry = getattr(request.app.state, "workflow_registry", None)
@@ -1017,7 +990,7 @@ def create_app(
     @api.post("/settings/feishu", status_code=200)
     async def save_feishu_settings(
         payload: FeishuSettingsInput,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         """Store the Feishu app the same way ``configure feishu`` does.
@@ -1070,7 +1043,7 @@ def create_app(
 
     @api.post("/settings/feishu/test", status_code=200)
     async def test_feishu_settings(
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         """Send one real card, so a wrong Chat ID is found now rather than later.
@@ -1106,7 +1079,7 @@ def create_app(
     @api.post("/settings/ziniao", status_code=200)
     async def save_ziniao_settings(
         payload: ZiniaoSettingsInput,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         """Store the Ziniao login exactly as ``configure ziniao`` does."""
@@ -1156,7 +1129,7 @@ def create_app(
     async def start_webdriver_mode(
         payload: WebdriverStart,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         """Put Ziniao into WebDriver mode, which force-closes its open windows.
@@ -1188,9 +1161,10 @@ def create_app(
         return result
 
     @api.post("/ziniao/sync")
+    @serialized_store_catalog
     async def sync_ziniao(
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         _release_before_automation(db)
@@ -1200,41 +1174,89 @@ def create_app(
             raise HTTPException(503, str(exc)) from exc
         if not isinstance(result, dict):
             raise HTTPException(502, "紫鸟同步服务返回了无效结构")
-        profiles = list(result.get("profiles") or [])
-        if not profiles:
-            return {**result, "created": int(result.get("created", 0)), "updated": int(result.get("updated", 0))}
+        if result.get("complete") is True and "profiles" not in result:
+            raise HTTPException(502, "完整同步结果缺少店铺列表，本次未同步或删除")
+        profiles = result.get("profiles", [])
+        if not isinstance(profiles, list):
+            raise HTTPException(502, "紫鸟返回了无效的店铺列表，本次未同步或删除")
+        complete = result.get("complete") is True
+        selectors: set[str] = set()
         for profile in profiles:
             if not isinstance(profile, dict):
                 raise HTTPException(502, "紫鸟返回了无效的店铺记录")
-            if profile.get("selector_type") not in {"oauth", "id"} or not profile.get("selector_value"):
-                raise HTTPException(502, "紫鸟返回了缺少显式环境选择器的店铺记录")
+            value = str(profile.get("selector_value") or "").strip()
+            if profile.get("selector_type") not in {"oauth", "id"} or not value or value in selectors:
+                raise HTTPException(502, "紫鸟店铺标识缺失或重复，本次未同步或删除")
+            selectors.add(value)
+        if not profiles and not complete:
+            return {**result, "created": int(result.get("created", 0)), "updated": int(result.get("updated", 0)), "deleted": 0}
         account = db.scalar(select(ZiniaoAccount).order_by(ZiniaoAccount.id).limit(1))
-        if account is None:
-            account = ZiniaoAccount(display_name="紫鸟主账号")
-            db.add(account)
-            db.flush()
+        account_id = account.id if account is not None else None
+        missing = StoreRepository(db).missing_profile_ids(profiles, account_id=account_id) if complete and account_id else []
+        _release_before_automation(db)
+        active_probe = getattr(request.app.state.automation_service, "has_active_store_setup", None)
+        for store_id in missing:
+            if not callable(active_probe):
+                raise HTTPException(409, "当前服务未提供建档状态检查，本次同步删除未执行")
+            if await active_probe(store_id):
+                raise HTTPException(409, "待删除店铺正在建档或等待验证；请完成或取消建档后重新同步。本次未删除店铺")
+        if missing:
+            database = request.app.state.engine.url.database
+            if database and database != ":memory:":
+                await asyncio.to_thread(
+                    backup_sqlite_database, Path(database), settings.backup_dir,
+                    from_revision="before-store-sync", to_revision="store-sync",
+                )
         try:
-            created, updated = StoreRepository(db).upsert_profiles(
-                profiles, account_id=account.id
-            )
+            # The worker uses this same SQLite transaction mode for claiming.
+            # Either it claims first (deletion reports busy), or sync cancels
+            # queued work first (there is nothing left for the worker to claim).
+            db.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            account = db.get(ZiniaoAccount, account_id) if account_id else None
+            if account is None:
+                account = ZiniaoAccount(display_name="紫鸟主账号")
+                db.add(account)
+                db.flush()
+            repo = StoreRepository(db)
+            removal = repo.delete_missing_profiles(profiles, account_id=account.id) if complete else {"deleted": 0, "deleted_schedule_ids": [], "cancelled_runs": 0}
+            created, updated = repo.upsert_profiles(profiles, account_id=account.id)
+            account.last_synced_at = datetime.now(timezone.utc)
+            account.sync_error = None
+            db.commit()
+        except ConflictError as exc:
+            db.rollback()
+            raise HTTPException(409, str(exc)) from exc
         except IntegrityError as exc:
             db.rollback()
-            raise HTTPException(
-                409, "紫鸟店铺标识存在冲突，请重试同步或检查重复环境"
-            ) from exc
-        account.last_synced_at = datetime.now(timezone.utc)
-        account.sync_error = None
-        return {**result, "created": created, "updated": updated}
+            raise HTTPException(409, "紫鸟店铺标识存在冲突；本次同步和删除均已回滚") from exc
+        response = {**result, "created": created, "updated": updated, **removal}
+        if removal["deleted_schedule_ids"]:
+            manager = request.app.state.schedule_manager
+            try:
+                refresh = getattr(manager, "refresh", None)
+                if callable(refresh):
+                    await refresh()
+                elif manager is not None:
+                    for schedule_id in removal["deleted_schedule_ids"]:
+                        await refresh_schedule_projection(manager, schedule_id)
+                response["scheduler_refreshed"] = manager is not None
+            except Exception:
+                # Deletion is committed, and stale callbacks recheck SQLite.
+                # Do not turn success into a retry of a destructive operation.
+                response["scheduler_refreshed"] = False
+                response["warning"] = "店铺及排期已删除；定时器列表暂未刷新，旧回调不会再创建这些店铺的任务"
+        return response
 
     @api.get("/stores", response_model=list[StoreView])
     def api_stores(db: Session = Depends(get_session)) -> list[Any]:
         return StoreRepository(db).list()
 
     @api.post("/stores/{store_id}/detect-identity")
+    @serialized_store_catalog
     async def api_detect_store_identity(
         store_id: int,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1294,11 +1316,12 @@ def create_app(
         return await _identity_probe_action(request, store_id, probe_id, "get_identity_probe")
 
     @api.post("/stores/{store_id}/identity-probes/{probe_id}/continue")
+    @serialized_store_catalog
     async def api_continue_identity_probe(
         store_id: int,
         probe_id: str,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1311,7 +1334,7 @@ def create_app(
         store_id: int,
         probe_id: str,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1338,11 +1361,12 @@ def create_app(
         return JSONResponse(result, status_code=202 if waiting else 200)
 
     @api.post("/stores/{store_id}/detect-marketplace-setup")
+    @serialized_store_catalog
     async def api_detect_marketplace_setup(
         store_id: int,
         payload: MarketplaceSetupInput,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1373,11 +1397,12 @@ def create_app(
         )
 
     @api.post("/stores/{store_id}/marketplace-setup-probes/{probe_id}/continue")
+    @serialized_store_catalog
     async def api_continue_marketplace_setup_probe(
         store_id: int,
         probe_id: str,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1390,7 +1415,7 @@ def create_app(
         store_id: int,
         probe_id: str,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1398,12 +1423,35 @@ def create_app(
             request, store_id, probe_id, "cancel_marketplace_setup_probe"
         )
 
+    @api.post("/stores/{store_id}/store-setup-probes/{probe_id}/check-release")
+    async def api_setup_check_release(store_id: int, probe_id: str, _: LocalOperator = Depends(verified_operator)):
+        try:
+            return await SetupRepository(sessions).check_release(store_id, probe_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except SetupConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+
+    @api.get("/stores/{store_id}/setup-summary")
+    async def api_setup_summary(store_id: int, _: LocalOperator = Depends(current_operator)):
+        try:
+            return SetupRepository(sessions).summary(store_id)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+
+    @api.post("/stores/setup-batch/preview")
+    async def api_setup_batch_preview(payload: StoreSetupBatchPreview, _: LocalOperator = Depends(verified_operator)):
+        if set(payload.selections) - set(payload.store_ids):
+            raise HTTPException(422, "站点选择包含未选择的店铺")
+        return SetupRepository(sessions).preview(payload.store_ids, payload.mode, payload.selections)
+
     @api.post("/stores/{store_id}/detect-store-setup")
+    @serialized_store_catalog
     async def api_detect_store_setup(
         store_id: int,
-        payload: MarketplaceSetupInput,
+        payload: StoreSetupInput,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1413,7 +1461,8 @@ def create_app(
         if not callable(detector):
             raise HTTPException(503, "店铺统一自动建档服务尚未配置")
         try:
-            result = await detector(store_id, payload.marketplace_codes)
+            options = payload.model_dump(exclude_unset=True, exclude={"marketplace_codes"})
+            result = await detector(store_id, payload.marketplace_codes, **options)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ZiniaoCredentialError as exc:
@@ -1434,6 +1483,8 @@ def create_app(
                     ),
                 },
             ) from exc
+        except SetupConflict as exc:
+            raise HTTPException(409, {"code": "SETUP_CONFLICT", "message": str(exc), "probe_id": exc.probe_id}) from exc
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
         waiting = result.get("status") in {"WAITING_AUTH", "CHECKING"}
@@ -1480,11 +1531,12 @@ def create_app(
         )
 
     @api.post("/stores/{store_id}/store-setup-probes/{probe_id}/continue")
+    @serialized_store_catalog
     async def api_continue_store_setup_probe(
         store_id: int,
         probe_id: str,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1497,7 +1549,7 @@ def create_app(
         store_id: int,
         probe_id: str,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Response:
         StoreRepository(db).get(store_id)
@@ -1508,7 +1560,7 @@ def create_app(
     @api.post("/stores", response_model=StoreView, status_code=201)
     def api_create_store(
         payload: StoreCreate,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Any:
         return StoreRepository(db).create(**payload.model_dump())
@@ -1546,7 +1598,7 @@ def create_app(
         store_id: int,
         payload: StorePatch,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Any:
         await _require_no_active_store_setup(request, store_id)
@@ -1561,13 +1613,82 @@ def create_app(
             store = repo.get(store_id)
         return store
 
+    @api.post("/stores/setup/reset-batch")
+    async def api_reset_store_setup_batch(
+        payload: StoreSetupBatchResetInput,
+        request: Request,
+        _: LocalOperator = Depends(verified_operator),
+        db: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        # Async process-local checks happen BEFORE reserving SQLite for writing.
+        # Probe creation also reserves SQLite before launching a browser, so the
+        # durable checks below close the gap between checking and resetting.
+        process_blockers: dict[int, str] = {}
+        for item in payload.stores:
+            try:
+                await _require_no_active_store_setup(request, item.store_id)
+            except ConflictError as exc:
+                process_blockers[item.store_id] = str(exc)
+        db.rollback()
+        db.execute(text("BEGIN IMMEDIATE"))
+        repo = StoreRepository(db)
+        blocked = []
+        for item in payload.stores:
+            name = f"店铺 #{item.store_id}"
+            try:
+                store = repo.get(item.store_id)
+                name = store.name
+                if not store.platform.is_amazon:
+                    raise ConflictError("批量删除建档只处理亚马逊店铺")
+                if store.setup_revision != item.expected_setup_revision:
+                    raise ConflictError("建档已变化，请刷新页面、重新勾选并确认")
+                if item.store_id in process_blockers:
+                    raise ConflictError(process_blockers[item.store_id])
+                repo.require_setup_resettable(item.store_id)
+            except (ConflictError, NotFoundError) as exc:
+                blocked.append({"store_id": item.store_id, "store_name": name,
+                                "eligible": False, "reason": str(exc)})
+        if blocked:
+            db.rollback()
+            raise HTTPException(409, detail={"code": "BATCH_SETUP_RESET_BLOCKED",
+                "message": "整批未修改，请处理受阻店铺或取消勾选后重试", "targets": blocked})
+        disabled = []
+        reset_ids = []
+        # No await / network work until this one transaction is committed.
+        for item in payload.stores:
+            _, schedule_ids = repo.reset_setup(item.store_id)
+            disabled.extend(schedule_ids)
+            reset_ids.append(item.store_id)
+        db.commit()
+        response = {"status": "reset", "reset_store_ids": reset_ids,
+                    "reset_count": len(reset_ids), "disabled_schedules": len(disabled),
+                    "scheduler_refreshed": True}
+        if disabled:
+            # One full refresh, not N store/schedule refreshes. Failure after
+            # commit is explicitly reported as committed; never invite replay.
+            try:
+                manager = request.app.state.schedule_manager
+                if manager is None:
+                    raise RuntimeError("scheduler not configured")
+                projection = await refresh_schedule_projection(manager, disabled[0])
+                if projection is not None:
+                    projected = set(projection.projected_schedule_ids)
+                    failed = set(projection.failed_schedule_ids)
+                    if set(disabled) & (projected | failed):
+                        raise RuntimeError("disabled schedules still projected")
+            except Exception:
+                logger.exception("batch_setup_reset_scheduler_refresh_failed")
+                response.update(scheduler_refreshed=False,
+                    warning="建档已删除，排期已在数据库停用；定时器刷新未完成，请勿重复删除。重新启动后台后会按数据库重建定时器。")
+        return response
+
     @api.delete(
         "/stores/{store_id}/setup", response_model=StoreSetupResetView
     )
     async def api_reset_store_setup(
         store_id: int,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Any:
         repo = StoreRepository(db)
@@ -1598,7 +1719,7 @@ def create_app(
     def api_preview_schedule_batch(
         payload: BatchSchedulePreviewInput,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         template = payload.template.model_dump()
@@ -1620,7 +1741,7 @@ def create_app(
     async def api_create_schedule_batch(
         payload: BatchScheduleCreateInput,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         service = BatchScheduleService(db, active_workflow_registry(request))
@@ -1721,7 +1842,7 @@ def create_app(
     async def api_create_schedule(
         payload: ScheduleCreate,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Any:
         values = payload.model_dump()
@@ -1760,7 +1881,7 @@ def create_app(
         schedule_id: int,
         payload: SchedulePatch,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Any:
         repo = ScheduleRepository(db, active_workflow_registry(request))
@@ -1816,7 +1937,7 @@ def create_app(
     async def api_delete_schedule(
         schedule_id: int,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         ScheduleRepository(db).delete(schedule_id)
@@ -1840,7 +1961,7 @@ def create_app(
     async def api_run_schedule_now(
         schedule_id: int,
         request: Request,
-        admin: AuthenticatedAdmin = Depends(verified_admin),
+        operator: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, Any]:
         del db  # ScheduleManager owns the short atomic creation transaction.
@@ -1860,7 +1981,7 @@ def create_app(
                 workflow_registry=active_workflow_registry(request),
             )
         try:
-            run_id = await manager.run_now(schedule_id, requested_by=admin.username)
+            run_id = await manager.run_now(schedule_id, requested_by=operator.username)
         except ConflictError:
             raise
         except RuntimeError as exc:
@@ -1875,7 +1996,7 @@ def create_app(
     async def api_create_run(
         payload: RunCreate,
         request: Request,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> Any:
         if isinstance(request.app.state.automation_service, UnconfiguredAutomationService):
@@ -1943,7 +2064,7 @@ def create_app(
     async def api_approve_run(
         run_id: str,
         request: Request,
-        admin: AuthenticatedAdmin = Depends(verified_admin),
+        operator: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, str]:
         run = WorkflowRepository(db).get_run(run_id)
@@ -1958,7 +2079,7 @@ def create_app(
         try:
             action = request.app.state.automation_service.approve_run
             try:
-                await action(run.id, approval.id, actor=admin.username)
+                await action(run.id, approval.id, actor=operator.username)
             except TypeError:
                 # Small injected test doubles may still expose the V1 shape.
                 await action(run.id, approval.id)
@@ -1967,7 +2088,7 @@ def create_app(
         return {"status": "queued"}
 
     @api.post("/runs/{run_id}/continue-auth", status_code=202)
-    async def api_continue_auth(run_id: str, request: Request, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
+    async def api_continue_auth(run_id: str, request: Request, _: LocalOperator = Depends(verified_operator), db: Session = Depends(get_session)) -> dict[str, str]:
         WorkflowRepository(db).get_run(run_id)
         _release_before_automation(db)
         try:
@@ -1977,7 +2098,7 @@ def create_app(
         return {"status": "queued"}
 
     @api.post("/runs/{run_id}/cancel", status_code=202)
-    async def api_cancel_run(run_id: str, request: Request, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
+    async def api_cancel_run(run_id: str, request: Request, _: LocalOperator = Depends(verified_operator), db: Session = Depends(get_session)) -> dict[str, str]:
         WorkflowRepository(db).get_run(run_id)
         _release_before_automation(db)
         try:
@@ -1987,7 +2108,7 @@ def create_app(
         return {"status": "queued"}
 
     @api.post("/runs/{run_id}/guards/{guard_key}/release", status_code=200)
-    async def api_release_guard(run_id: str, guard_key: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
+    async def api_release_guard(run_id: str, guard_key: str, _: LocalOperator = Depends(verified_operator), db: Session = Depends(get_session)) -> dict[str, str]:
         """Clear a money guard for which no dispatch was ever recorded.
 
         The only escape from an operation that armed but never reached the
@@ -2059,7 +2180,7 @@ def create_app(
         return {"status": "released", "marketplace_code": marketplace_code}
 
     @api.post("/runs/{run_id}/guards/{guard_key}/acknowledge", status_code=200)
-    async def api_acknowledge_guard(run_id: str, guard_key: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
+    async def api_acknowledge_guard(run_id: str, guard_key: str, _: LocalOperator = Depends(verified_operator), db: Session = Depends(get_session)) -> dict[str, str]:
         """Close out a dispatched operation after a person checked Seller Central.
 
         The mirror image of ``release``.  That one covers "the click never
@@ -2153,7 +2274,7 @@ def create_app(
     async def api_decide_feedback_reason(
         review_id: str,
         payload: FeedbackDecisionInput,
-        _: AuthenticatedAdmin = Depends(verified_admin),
+        _: LocalOperator = Depends(verified_operator),
         db: Session = Depends(get_session),
     ) -> dict[str, str]:
         """Let an operator pick the reason the classifier declined to choose.
@@ -2188,7 +2309,7 @@ def create_app(
         }
 
     @api.post("/runs/{run_id}/settle", status_code=200)
-    async def api_settle_run(run_id: str, _: AuthenticatedAdmin = Depends(verified_admin), db: Session = Depends(get_session)) -> dict[str, str]:
+    async def api_settle_run(run_id: str, _: LocalOperator = Depends(verified_operator), db: Session = Depends(get_session)) -> dict[str, str]:
         """End a run whose money questions have all been answered by hand.
 
         ``UNCERTAIN_FINANCIAL`` had no way out. Read-back can reach a terminal

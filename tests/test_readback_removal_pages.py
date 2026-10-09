@@ -43,14 +43,7 @@ def client(tmp_path: Path):
     )
     app = create_app(settings, automation_service=_FakeAutomation())
     with TestClient(app) as test_client:
-        response = test_client.post(
-            "/auth/bootstrap",
-            json={
-                "username": "operator",
-                "password": "Local-Ledger-2026!",
-                "confirm_password": "Local-Ledger-2026!",
-            },
-        )
+        response = test_client.get("/")
         assert response.status_code == 200, response.text
         yield app, test_client, {"X-CSRF-Token": test_client.cookies["ziniao_csrf"]}
 

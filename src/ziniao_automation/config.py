@@ -54,6 +54,8 @@ class Settings:
             raise ValueError("后台端口不合法")
         if not 1 <= int(self.ziniao_port) <= 65535:
             raise ValueError("紫鸟端口不合法")
+        if self.session_hours < 1:
+            raise ValueError("本地页面会话有效期至少为 1 小时")
         if self.auth_wait_minutes < 1:
             raise ValueError("人工验证等待时间至少为 1 分钟")
         if self.database_url is None:

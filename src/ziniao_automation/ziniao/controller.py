@@ -311,7 +311,7 @@ class ZiniaoController:
     async def _stop_browser_after_cancel(
         self,
         selector: ProfileSelector,
-    ) -> None:
+    ) -> bool:
         """Bounded best-effort per-store stop without leaking the launch lock."""
 
         launch_acquired = False
@@ -329,9 +329,9 @@ class ZiniaoController:
                     launch_acquired = bool(acquire_task.result())
                 raise
             if not acquired:
-                return
+                return False
             launch_acquired = True
-            stopped, _ = await self._bounded_cancel_cleanup_step(
+            stopped, acknowledged = await self._bounded_cancel_cleanup_step(
                 self.client.stop_browser(selector, ignore_errors=True),
                 operation="stop_browser",
             )
@@ -340,6 +340,7 @@ class ZiniaoController:
                     "Cancelled Ziniao session could not confirm stopBrowser: selector_type=%s",
                     selector.type,
                 )
+            return bool(stopped and acknowledged)
         except asyncio.CancelledError:
             raise
         except BaseException:
@@ -348,6 +349,7 @@ class ZiniaoController:
                 selector.type,
                 exc_info=True,
             )
+            return False
         finally:
             # asyncio.Lock is not task-owned. This scope is the sole acquirer,
             # so synchronous release is safe even when stopBrowser ignores
@@ -395,12 +397,12 @@ class ZiniaoController:
             finally:
                 try:
                     if cancellation_mode:
-                        await self._stop_browser_after_cancel(selector)
+                        handle.cleanup_confirmed = bool(await self._stop_browser_after_cancel(selector))
                     else:
                         async with self.locks.launch:
-                            await self.client.stop_browser(
+                            handle.cleanup_confirmed = bool(await self.client.stop_browser(
                                 selector, ignore_errors=True
-                            )
+                            ))
                 finally:
                     if store_lock.locked():
                         store_lock.release()

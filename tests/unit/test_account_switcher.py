@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import asyncio
 import pytest
+from html import escape
+from tests.workflows.fixture_dom import FixturePage
 
 from ziniao_automation.workflows.amazon_account_switcher import (
     CONFIRM_BUTTON_SELECTOR,
@@ -82,6 +84,26 @@ class _Page:
         self._lands_on = lands_on
         self.clicks: list[tuple[float, float]] = []
         self.mouse = self
+
+    def locator(self, selector):
+        if selector == ".full-page-account-switcher":
+            texts = self.buttons
+            if self._empty_reads > 0:
+                self._empty_reads -= 1
+                texts = []
+            elif self._partial_first_read:
+                self._partial_first_read = False
+                texts = self.buttons[:2]
+            countries = ''.join(
+                '<div class="full-page-account-switcher-account"><button class="full-page-account-switcher-account-details">'
+                + escape(text) + '</button></div>' for text in texts)
+            html = ('<body><div class="full-page-account-switcher"><div class="full-page-account-switcher-inner">'
+                    '<div class="full-page-account-switcher-accounts-wrapper"><div class="full-page-account-switcher-accounts">'
+                    '<div class="full-page-account-switcher-account"><button class="full-page-account-switcher-account-details">'
+                    'Fixture (current)</button><div class="full-page-account-switcher-accounts">' + countries
+                    + '</div></div></div></div></div></div></body>')
+            self._dom = FixturePage(html, self.url)
+        return self._dom.locator(selector)
 
     async def evaluate(self, script: str, arg=None):
         # 按**调用约定**分派，不按脚本字面：参数的形状就是契约。
@@ -152,7 +174,7 @@ def test_pick_marketplace_takes_only_one_exact_match() -> None:
 
     assert pick_marketplace(LISTING, names) == (2, "")
     # 带后缀的不算：那是「账号没开这个站点」
-    assert pick_marketplace(["德國 (待註冊)", "加拿大"], names) == (None, "not_offered")
+    assert pick_marketplace(["德國 (待註冊)", "加拿大"], names) == (None, "registration_required")
     # 部分匹配不算
     assert pick_marketplace(["德國站", "新德國"], names) == (None, "not_offered")
     # 多账号卖家同一国家出现两次：点哪个都可能错
@@ -206,7 +228,7 @@ async def test_both_steps_run_on_the_right_country_and_landing_is_what_counts() 
 @pytest.mark.parametrize(
     ("buttons", "reason"),
     [
-        (["加拿大", "德國 (待註冊)"], "not_offered"),
+        (["加拿大", "德國 (待註冊)"], "registration_required"),
         (["德國", "加拿大", "德國"], "ambiguous"),
     ],
 )
@@ -402,3 +424,158 @@ async def test_a_half_rendered_list_is_not_judged() -> None:
 
     assert outcome.ok is True, outcome
     assert page.clicks[0] == _xy(LISTING.index("德國"))
+
+
+@pytest.mark.asyncio
+async def test_inactive_account_finishes_as_known_blocker_not_timeout(caplog):
+    page = _Page(lands_on=f"https://{DE}/inactiveAccount?token=PRIVATE_TOKEN")
+    outcome = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert not outcome.ok
+    assert outcome.reason == "inactive_account"
+    assert outcome.page_category == "INACTIVE_ACCOUNT"
+    assert page.clicks == [_xy(2), CONFIRM_XY]
+    assert page.waits <= 2, "known landing must not consume the navigation timeout"
+    assert "PRIVATE_TOKEN" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("url", [
+    f"https://{DE}.evil.invalid{POLICIES_PATH}",
+    f"http://{DE}{POLICIES_PATH}",
+    f"https://user:secret@{DE}{POLICIES_PATH}",
+    f"https://{DE}:8765{POLICIES_PATH}",
+    "https://[bad/url",
+])
+async def test_matching_path_on_wrong_origin_never_counts_as_landing(url):
+    page = _Page(lands_on=url)
+    outcome = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert not outcome.ok
+    assert outcome.reason == "domain_mismatch"
+    assert outcome.page_category == "DOMAIN_MISMATCH"
+
+
+@pytest.mark.asyncio
+async def test_wrong_origin_before_selection_clicks_nothing():
+    page = _Page()
+    page.url = "https://evil.invalid/account-switcher/default/merchantMarketplace"
+    outcome = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert outcome.reason == "domain_mismatch"
+    assert page.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_unknown_landing_timeout_logs_no_raw_path_or_query(caplog):
+    page = _Page(lands_on=f"https://{DE}/PRIVATE_SELLER?token=PRIVATE_TOKEN")
+    outcome = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert outcome.reason == "timeout"
+    assert outcome.page_category == "UNKNOWN_PAGE"
+    assert "PRIVATE_SELLER" not in caplog.text
+    assert "PRIVATE_TOKEN" not in caplog.text
+    assert "UNKNOWN_PAGE" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text,reason", [
+    ("德国（待注册）", "registration_required"),
+    ("Germany (Pending registration)", "registration_required"),
+    ("德国（不可用）", "unavailable"),
+    ("Germany (unknown status)", "layout_unknown"),
+])
+async def test_explicit_country_states_never_click(text, reason):
+    page = _Page([text])
+    result = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert not result.ok and result.reason == reason
+    assert page.clicks == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text", ["德国（当前）", "Germany (current)", "德國"])
+async def test_current_and_available_country_use_existing_two_step_navigation(text):
+    page = _Page([text])
+    result = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert result.ok
+    assert page.clicks == [_xy(0), CONFIRM_XY]
+
+
+@pytest.mark.asyncio
+async def test_unknown_tree_contract_does_not_fall_back_to_global_buttons():
+    page = _Page()
+    original = page.locator
+    def unknown(selector):
+        if selector == '.full-page-account-switcher':
+            page._dom = FixturePage('<body><button>Germany</button></body>', page.url)
+            return page._dom.locator(selector)
+        if not hasattr(page, '_dom'):
+            return original(selector)
+        return page._dom.locator(selector)
+    page.locator = unknown
+    result = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert result.reason == 'layout_unknown'
+    assert page.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_read_hang_is_bounded_before_any_click(monkeypatch):
+    import ziniao_automation.workflows.amazon_account_switcher as module
+    page = _Page()
+    cancelled = asyncio.Event()
+    async def hung(*args, **kwargs):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    monkeypatch.setattr(module, 'read_switcher_snapshot', hung)
+    result = await asyncio.wait_for(_switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH), timeout=1)
+    assert not result.ok
+    assert cancelled.is_set()
+    assert result.reason == 'list_not_loaded'
+    assert page.clicks == []
+
+
+@pytest.mark.asyncio
+async def test_changed_owner_before_confirmation_is_not_confirmed(monkeypatch):
+    import ziniao_automation.workflows.amazon_account_switcher as module
+    from dataclasses import replace
+    from ziniao_automation.workflows.amazon_switcher_contract import AccountCandidate
+    original = module.read_switcher_snapshot
+    page = _Page()
+    async def changed(*args, **kwargs):
+        snapshot = await original(*args, **kwargs)
+        if page.clicks:
+            snapshot = replace(snapshot, accounts=(AccountCandidate('Changed (current)'),))
+        return snapshot
+    monkeypatch.setattr(module, 'read_switcher_snapshot', changed)
+    result = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert result.reason == 'list_changed'
+    assert page.clicks == [_xy(2)]
+
+
+@pytest.mark.asyncio
+async def test_login_during_list_load_is_handed_back_without_waiting_for_structure(monkeypatch):
+    import ziniao_automation.workflows.amazon_account_switcher as module
+    original = module.read_switcher_snapshot
+    page = _Page()
+    async def redirects(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        page.url = SIGNIN
+        return result
+    monkeypatch.setattr(module, 'read_switcher_snapshot', redirects)
+    result = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert result.reason == 'auth_required'
+    assert page.clicks == []
+    assert page.waits <= 1
+
+
+@pytest.mark.asyncio
+async def test_domain_change_after_hit_testing_still_prevents_the_first_click():
+    page = _Page()
+    original = page.evaluate
+    async def external(script, arg=None):
+        result = await original(script,arg)
+        if isinstance(arg,dict) and 'index' in arg:
+            page.url = 'https://other.invalid/'
+        return result
+    page.evaluate = external
+    result = await _switcher().select_marketplace(page, DE, expected_path=POLICIES_PATH)
+    assert result.reason == 'domain_mismatch'
+    assert page.clicks == []

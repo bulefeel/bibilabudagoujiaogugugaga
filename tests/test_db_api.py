@@ -219,65 +219,24 @@ def app_client(tmp_path: Path):
 
 
 def bootstrap(client: TestClient) -> str:
-    response = client.post(
-        "/auth/bootstrap",
-        json={
-            "username": "operator",
-            "password": "Local-Ledger-2026!",
-            "confirm_password": "Local-Ledger-2026!",
-        },
-    )
+    response = client.get("/")
     assert response.status_code == 200, response.text
-    assert "ziniao_session" in client.cookies
+    assert "ziniao_local_session" in client.cookies
     return client.cookies["ziniao_csrf"]
 
 
-def test_one_time_setup_login_and_csrf(app_client):
+def test_passwordless_page_and_csrf(app_client):
     _, client, _ = app_client
-    assert client.get("/").history[-1].headers["location"] == "/setup"
+    page = client.get("/")
+    assert page.status_code == 200
+    assert not page.history
     csrf = bootstrap(client)
-
-    duplicate = client.post(
-        "/auth/bootstrap",
-        json={
-            "username": "another",
-            "password": "Another-Strong-2026!",
-            "confirm_password": "Another-Strong-2026!",
-        },
-    )
-    assert duplicate.status_code == 409
-
-    no_header = client.post(
-        "/api/stores",
-        json={"name": "店铺 A", "selector_type": "oauth", "selector_value": "oauth-a"},
-    )
-    assert no_header.status_code == 403
-
-    denied = client.post(
-        "/api/stores",
-        json={"name": "店铺 A", "selector_type": "oauth", "selector_value": "oauth-a"},
-        headers={"X-CSRF-Token": "incorrect"},
-    )
-    assert denied.status_code == 403
-
-    logout = client.post("/auth/logout", json={}, headers={"X-CSRF-Token": csrf})
-    assert logout.status_code == 200
-    login = client.post(
-        "/auth/login", json={"username": "operator", "password": "Local-Ledger-2026!"}
-    )
-    assert login.status_code == 200
-
-
-
-
-
-
-
-
-
-
-
-
+    payload = {"name": "店铺 A", "selector_type": "oauth", "selector_value": "oauth-a"}
+    assert client.post("/api/stores", json=payload).status_code == 403
+    assert client.post("/api/stores", json=payload, headers={"X-CSRF-Token": "incorrect"}).status_code == 403
+    assert client.post("/api/stores", json=payload, headers={"X-CSRF-Token": csrf}).status_code == 201
+    for path in ("/auth/bootstrap", "/auth/login", "/auth/logout"):
+        assert client.post(path, json={}).status_code == 404
 
 
 def test_operation_guard_is_unique_and_never_rearmed(app_client):
@@ -991,6 +950,115 @@ def test_every_html_page_renders_for_a_store_that_has_marketplaces(app_client):
     assert 'data-store-setup-marketplaces=\'["CA", "UK"]\'' in page.text
 
 
+class PlatformSyncAutomation(FakeAutomation):
+    """紫鸟返回三家店：一家亚马逊、一家 TikTok、一条没有平台字段的老记录。"""
+
+    async def sync_ziniao(self):
+        def profile(name: str, value: str, raw: dict) -> dict:
+            return {
+                "name": name,
+                "selector_type": "oauth",
+                "selector_value": value,
+                "browser_oauth": value,
+                "browser_id": None,
+                "raw": raw,
+            }
+
+        return {
+            "created": 0,
+            "updated": 0,
+            "profiles": [
+                profile(
+                    "Amazon CA Store",
+                    "oauth-amz",
+                    {"browserOauth": "oauth-amz", "platform_id": 1, "platform_name": "亚马逊-加拿大", "siteId": 2},
+                ),
+                profile(
+                    "TikTok Store",
+                    "oauth-tt",
+                    {
+                        "browserOauth": "oauth-tt",
+                        "platform_id": 92,
+                        "platform_name": "TikTok Shop-全球跨境(自运营)(新)",
+                        "siteId": 458,
+                    },
+                ),
+                profile("Legacy Store", "oauth-old", {"browserOauth": "oauth-old"}),
+            ],
+        }
+
+
+def test_stores_page_tags_each_card_with_its_ziniao_platform_and_lists_a_filter(tmp_path: Path):
+    """紫鸟公司账号下混着亚马逊、沃尔玛、TikTok 店铺，而流程只对亚马逊生效。
+
+    页面原来只显示店铺名，操作员分不清哪家是亚马逊，建档就在 TikTok 环境里去找
+    亚马逊后台。平台来自同步时存下的 raw_profile；这里断言的是渲染结果，不是模板
+    字面。
+    """
+    settings = Settings(
+        project_root=tmp_path,
+        data_dir=tmp_path / "data",
+        database_url=f"sqlite:///{(tmp_path / 'platform.db').as_posix()}",
+        testing=True,
+    )
+    app = create_app(settings, automation_service=PlatformSyncAutomation())
+    with TestClient(app) as client:
+        csrf = bootstrap(client)
+        synced = client.post("/api/ziniao/sync", json={}, headers={"X-CSRF-Token": csrf})
+        assert synced.status_code == 200, synced.text
+        assert synced.json()["created"] == 3
+        # 线上那家 TikTok 店被早先的一键建档默认勾上了 CA/UK/AU。有站点时卡片也必须
+        # 说清楚它不在范围内 —— 否则它和一家待建档的亚马逊店长得一模一样。
+        tiktok = next(s for s in client.get("/api/stores").json() if s["name"] == "TikTok Store")
+        ticked = client.patch(
+            f"/api/stores/{tiktok['id']}",
+            json={"marketplaces": [{"code": code, "enabled": True} for code in ("CA", "UK", "AU")]},
+            headers={"X-CSRF-Token": csrf},
+        )
+        assert ticked.status_code == 200, ticked.text
+
+        page = client.get("/stores")
+
+    assert page.status_code == 200
+    text = page.text
+    # 每张卡片带上平台三态：true / false / 空（紫鸟没给字段，不下结论）。
+    assert 'data-platform-label="亚马逊" data-platform-amazon="true"' in text
+    assert 'data-platform-label="TikTok Shop" data-platform-amazon="false"' in text
+    assert 'data-platform-label="平台未知" data-platform-amazon=""' in text
+    # 标签文字：平台家族 + 紫鸟登记的站点/业务线。
+    assert "亚马逊<em>加拿大</em>" in text
+    assert "TikTok Shop<em>全球跨境(自运营)(新)</em>" in text
+    assert text.count('class="platform-tag is-amazon"') == 1
+    assert text.count('class="platform-tag is-other"') == 1
+    assert text.count('class="platform-tag is-unknown"') == 1
+    # 筛选项只列账册里真有的平台，亚马逊固定排第一。
+    platform_select = text[text.index('name="platform"') : text.index('name="setup"')]
+    assert re.findall(r'<option value="([^"]*)"[^>]*>', platform_select) == [
+        "",
+        "亚马逊",
+        "TikTok Shop",
+        "平台未知",
+    ]
+    assert "共 3 家" in text
+    # 非亚马逊的卡片直说流程不适用 —— 即使它勾着亚马逊站点。
+    cards = re.findall(r"<article class=\"store-card\".*?</article>", text, flags=re.S)
+    by_label = {re.search(r'data-platform-label="([^"]*)"', card).group(1): card for card in cards}
+    assert set(by_label) == {"亚马逊", "TikTok Shop", "平台未知"}
+    tiktok_card = by_label["TikTok Shop"]
+    assert "sellercentral.amazon.ca" in tiktok_card  # 前提：确实带着站点
+    assert "TikTok Shop 店铺不在自动化范围内" in tiktok_card
+    assert "不参与建档" in tiktok_card and "待自动建档" not in tiktok_card
+    assert "尚未选择任务站点" not in tiktok_card
+    for label in ("亚马逊", "平台未知"):
+        assert "不在自动化范围内" not in by_label[label]
+        assert "待自动建档" in by_label[label]
+        assert "尚未选择任务站点" in by_label[label]
+    # 建档筛选三态：非亚马逊店既不「待建档」也不「已建档」；平台未知的不下结论，照旧待建档。
+    assert 'data-setup-state="n/a"' in tiktok_card
+    assert 'data-setup-state="needed"' in by_label["亚马逊"]
+    assert 'data-setup-state="needed"' in by_label["平台未知"]
+
+
 
 
 
@@ -1356,7 +1424,7 @@ def test_diagnostics_identifies_the_release_and_database_revision(app_client):
 
     assert page.status_code == 200
     assert "应用版本 / 构建" in page.text
-    assert "0.6.3" in page.text
+    assert "0.7.0" in page.text
     assert "数据库迁移版本" in page.text
     # 从迁移脚本读 head，而不是写死版本号。写死的话每加一条迁移都会多出一条
     # 无关的红，久而久之就训练成「看到红就改断言」——这条断言的意思是

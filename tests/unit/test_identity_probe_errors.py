@@ -25,7 +25,7 @@ async def test_identity_probe_wraps_transient_target_error_without_retry(tmp_pat
     init_database(engine)
     factory = make_session_factory(engine)
     with factory() as db:
-        store = Store(name="店铺 A", selector_type="id", selector_value="profile-a")
+        store = Store(name="店铺 A", selector_type="id", selector_value="profile-a", raw_profile={"platform_id":"1"})
         db.add(store)
         db.commit()
         store_id = store.id
@@ -37,14 +37,14 @@ async def test_identity_probe_wraps_transient_target_error_without_retry(tmp_pat
         @asynccontextmanager
         async def session(self, selector, store_key=None):
             self.opens += 1
-            yield type("Handle", (), {"page": object()})()
+            yield type("Handle", (), {"page": object(), "cleanup_confirmed": True})()
 
     async def target_closed(self, page, marketplace):
         del self, page, marketplace
         raise Exception("Target page, context or browser has been closed")
 
     monkeypatch.setattr(
-        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.detect_identity",
+        "ziniao_automation.workflows.runtime.AmazonStoreSetupPage.detect_identity",
         target_closed,
     )
     controller = Controller()
@@ -57,7 +57,7 @@ async def test_identity_probe_wraps_transient_target_error_without_retry(tmp_pat
 
     result = await service.detect_store_identity(store_id)
     assert result["status"] == "FAILED"
-    assert "对应紫鸟店铺窗口尚未稳定" in result["message"]
+    assert result["reason_code"] == "SETUP_FAILED"
     assert controller.opens == 1
 
 
@@ -72,7 +72,7 @@ def _identity_service(tmp_path, controller, *, timeout=1.0):
     init_database(engine)
     factory = make_session_factory(engine)
     with factory() as db:
-        store = Store(name="店铺 B", selector_type="id", selector_value="profile-b")
+        store = Store(name="店铺 B", selector_type="id", selector_value="profile-b", raw_profile={"platform_id":"1"})
         db.add(store)
         db.commit()
         store_id = store.id
@@ -95,7 +95,7 @@ class AuthController:
     @asynccontextmanager
     async def session(self, selector, store_key=None):
         self.opens += 1
-        self.handle = type("Handle", (), {"page": object()})()
+        self.handle = type("Handle", (), {"page": object(), "cleanup_confirmed": True})()
         try:
             yield self.handle
         finally:
@@ -147,20 +147,12 @@ async def test_identity_auth_continues_twice_on_same_handle_without_relaunch(tmp
         return "SELLER-B", "dom:test"
 
     monkeypatch.setattr(
-        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.detect_identity",
+        "ziniao_automation.workflows.runtime.AmazonStoreSetupPage.detect_identity",
         challenge_twice,
     )
     first = await service.detect_store_identity(store_id)
     assert first["status"] == "WAITING_AUTH"
-    assert "邮箱 Continue" in first["message"]
-    assert "紫鸟托管 Passkey" in first["message"]
-    assert "已填密码登录" in first["message"]
-    assert "已填好的 6 位 OTP" in first["message"]
-    assert "再次尝试自动登录并继续" in first["message"]
-    assert "每个页面动作最多自动点击 3 次" in first["message"]
-    assert "每个站点最多进行 3 轮完整验证" in first["message"]
-    assert "CA、UK、AU 分别计数" in first["message"]
-    assert "未填内容、候选不唯一、CAPTCHA、非托管 Passkey" in first["message"]
+    assert first["last_diagnostic"]["reason_code"] in {"AUTH_UNKNOWN", "AUTH_INPUT_NOT_READY"}
     probe_id = first["probe_id"]
     one = await service.continue_identity_probe(store_id, probe_id)
     assert one["status"] == "CHECKING"
@@ -170,8 +162,6 @@ async def test_identity_auth_continues_twice_on_same_handle_without_relaunch(tmp
             break
         await asyncio.sleep(0)
     assert again["status"] == "WAITING_AUTH"
-    assert "再次尝试自动登录并继续" in again["message"]
-    assert "每个页面动作最多自动点击 3 次" in again["message"]
     await service.continue_identity_probe(store_id, probe_id)
     for _ in range(20):
         result = await service.get_identity_probe(store_id, probe_id)
@@ -192,7 +182,7 @@ async def test_identity_probe_rejects_duplicate_and_cancel_joins_cleanup(tmp_pat
         raise HumanAuthRequired("challenge")
 
     monkeypatch.setattr(
-        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.detect_identity", challenge
+        "ziniao_automation.workflows.runtime.AmazonStoreSetupPage.detect_identity", challenge
     )
     first = await service.detect_store_identity(store_id)
     attached = await service.detect_store_identity(store_id)
@@ -213,13 +203,58 @@ async def test_identity_probe_total_deadline_expires_and_closes(tmp_path, monkey
         raise HumanAuthRequired("challenge")
 
     monkeypatch.setattr(
-        "ziniao_automation.workflows.runtime.AmazonPaymentsPage.detect_identity", challenge
+        "ziniao_automation.workflows.runtime.AmazonStoreSetupPage.detect_identity", challenge
     )
     waiting = await service.detect_store_identity(store_id)
     for _ in range(30):
         await asyncio.sleep(0.01)
         result = await service.get_identity_probe(store_id, waiting["probe_id"])
-        if result["status"] == "EXPIRED":
+        if result["outcome"] == "TIMED_OUT":
             break
-    assert result["status"] == "EXPIRED"
+    assert result["outcome"] == "TIMED_OUT"
+    assert controller.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_legacy_identity_wait_preserves_safe_specific_cause(tmp_path, monkeypatch, caplog):
+    import json
+    caplog.set_level("INFO", logger="ziniao_automation.workflows.runtime")
+    controller = AuthController()
+    service, store_id = _identity_service(tmp_path, controller)
+
+    async def challenge(self, page, marketplace):
+        raise HumanAuthRequired(
+            "SENTINEL_SECRET_PASSWORD", kind="sign_in",
+            reason_code="AUTH_RETRY_EXHAUSTED", stage="password_signin",
+            action="password_signin", attempts=3, page_category="LOGIN",
+        )
+
+    monkeypatch.setattr("ziniao_automation.workflows.runtime.AmazonStoreSetupPage.detect_identity", challenge)
+    first = await service.detect_store_identity(store_id)
+    try:
+        assert first["status"] == "WAITING_AUTH"
+        assert first["last_diagnostic"]["reason_code"] == "AUTH_RETRY_EXHAUSTED"
+        assert first["last_diagnostic"]["attempts"] == 3
+        assert "SENTINEL_SECRET_PASSWORD" not in json.dumps(first) + caplog.text
+    finally:
+        final = await service.cancel_identity_probe(store_id, first["probe_id"])
+    assert final["status"] == "CANCELLED"
+    assert final["last_diagnostic"]["reason_code"] == "AUTH_RETRY_EXHAUSTED"
+    assert controller.closed.is_set()
+
+
+@pytest.mark.asyncio
+async def test_legacy_identity_hung_read_has_whole_probe_deadline(tmp_path, monkeypatch):
+    controller = AuthController()
+    service, store_id = _identity_service(tmp_path, controller, timeout=0.02)
+    cancelled = asyncio.Event()
+    async def hung(self, page, marketplace):
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+    monkeypatch.setattr("ziniao_automation.workflows.runtime.AmazonStoreSetupPage.detect_identity", hung)
+    result = await asyncio.wait_for(service.detect_store_identity(store_id), timeout=1)
+    assert result["status"] == "FAILED"
+    assert cancelled.is_set()
     assert controller.closed.is_set()

@@ -89,7 +89,7 @@ def test_probe_results_do_not_clear_the_operator_site_selection() -> None:
     # operator selected for future runs.
     assert "enabled.checked = false" not in script
     assert "也不会取消你勾选的站点" in template
-    assert "三种模式均可保存和运行" in template
+    assert "任务执行仍需实时检查域名、身份与资金条件" in template
 
 
 def test_bulk_setup_is_serial_and_waiting_auth_can_resume_or_skip() -> None:
@@ -97,7 +97,7 @@ def test_bulk_setup_is_serial_and_waiting_auth_can_resume_or_skip() -> None:
     script = _script()
 
     assert 'data-action="detect-all-store-setups"' in template
-    assert "一键自动建档全部店铺" in template
+    assert "批量建档当前筛选" in template
     assert "每次只打开一家紫鸟店铺" in template
     assert "async function runNextBulkStoreSetup()" in script
     assert "bulkStoreSetup.index += 1" in script
@@ -143,17 +143,54 @@ def test_bulk_setup_includes_unconfirmed_stores_and_defaults_empty_sites() -> No
     assert "data-store-setup-needed" in template
     assert "data-store-setup-marketplaces" in template
     assert "data-store-setup-defaulted" in template
-    assert 'const cards = allCards.filter(card => card.dataset.storeSetupNeeded === "true")' in script
+    assert 'const cards = amazonCards.filter(card => card.dataset.storeSetupNeeded === "true")' in script
     assert 'if (defaulted) marketplaceCodes = ["CA", "UK", "AU"]' in script
-    assert "尚未选择站点，将默认按 CA、UK、AU 三站建档" in script
-    assert "另有 ${alreadyComplete} 家已完成，将跳过" in script
+    assert "将明确新增 CA/UK/AU 配置" in script
+    assert "${alreadyComplete} 家已配置，不重复建档" in script
     assert "identityState:String(card.dataset.identityState" in script
+
+
+def test_bulk_setup_only_queues_visible_amazon_cards() -> None:
+    """范围说明、确认框、入队共用筛选结果，不把隐藏卡片捞回来。"""
+    script = _script()
+    helper = script[script.index("function collectBulkStoreCandidates()"):script.index("function bulkStoreScopeCopy(")]
+    action = script[script.index('if (action === "detect-all-store-setups")'):script.index('if (action === "continue-bulk-store-setup")')]
+    assert "const allCards = everyCard.filter(card => !card.hidden)" in helper
+    assert 'card.dataset.platformAmazon !== "false"' in helper
+    assert 'card.dataset.storeSetupNeeded === "true"' in helper
+    assert "await previewSetupSelection()" in action
+    assert "queue:eligible" in action
+    assert "/api/stores/setup-batch/preview" in script
+    assert "preview.targets.forEach" in script
+
+
+def test_store_filter_reads_the_url_hides_cards_and_writes_the_choice_back() -> None:
+    """筛选只加 hidden、不重新请求；选择写进地址栏，同步 / 保存后的 reload 才不丢。"""
+
+    template = _template()
+    script = _script()
+    start = script.index("(function storeFilter()")
+    block = script[start : script.index("})();", start)]
+
+    assert 'data-store-filter' in template
+    assert 'name="platform"' in template and 'name="setup"' in template
+    assert '<option value="needed">待补全</option>' in template
+    assert 'data-platform-label="{{ platform.label }}"' in template
+    assert "new URLSearchParams(location.search)" in block
+    assert "card.dataset.platformLabel === platform" in block
+    # 按三态比较：非亚马逊店是 "n/a"，「待建档」「已建档」都不收它。
+    assert "card.dataset.setupState === setup" in block
+    assert "storeSetupNeeded" not in block
+    assert "card.hidden = !(platformOk && setupOk && enabledOk && nameOk)" in block
+    assert "history.replaceState" in block
+    # 非店铺页没有这个表单，整段必须直接返回，不能让后面的处理器绑不上。
+    assert 'if (!form) return;' in block
 
 
 def test_bulk_queue_is_persistent_and_network_errors_keep_current_position() -> None:
     script = _script()
 
-    assert 'const bulkSetupStorageKey = "ziniao.storeSetupQueue.v2"' in script
+    assert 'const bulkSetupStorageKey = "ziniao.storeSetupQueue.v3"' in script
     assert "persistBulkStoreSetup" in script
     assert "restoreBulkStoreSetup" in script
     assert "sessionStorage.setItem" in script
@@ -216,7 +253,7 @@ def test_bulk_terminal_result_and_queue_position_are_persisted_atomically() -> N
 
     assert "persistBulkStoreSetup()" not in summarize
     assert terminal.index("bulkStoreSetup.index += 1") < terminal.index(
-        "persistBulkStoreSetup()"
+        "persistBulkStoreSetup()", terminal.index("bulkStoreSetup.index += 1")
     )
 
 
@@ -307,7 +344,7 @@ def test_a_restored_bulk_queue_is_checked_against_the_cards_on_the_page() -> Non
 def test_an_unfinished_bulk_queue_can_always_be_abandoned() -> None:
     """A restored queue hijacks the toolbar button, so it needs a way out.
 
-    While one exists, 「一键自动建档全部店铺」 resumes it instead of starting a
+    While one exists, 「批量建档当前筛选」 resumes it instead of starting a
     fresh pass, and the only branch that re-picks eligible stores and zeroes the
     counters is unreachable. Nothing cleared the archive on operator request, so
     closing the tab was the sole escape — and no text on screen said so.
@@ -326,7 +363,7 @@ def test_an_unfinished_bulk_queue_can_always_be_abandoned() -> None:
     ]
     assert "sessionStorage.removeItem(bulkSetupStorageKey)" in discard
     assert "resumeAvailable: false" in discard
-    assert 'ui.start.textContent = "一键自动建档全部店铺"' in discard, (
+    assert "refreshBulkStoreScope()" in discard, (
         "放弃之后工具栏按钮必须变回全新一轮的文案"
     )
     assert 'if (action === "discard-bulk-store-setup")' in script
@@ -443,3 +480,9 @@ def test_no_probe_rows_never_receive_a_detection_status() -> None:
             in block[: block.index("setMarketplaceRowStatus(")]
         )
         assert guarded, header.strip()
+
+
+def test_setup_copy_distinguishes_login_navigation_from_payment_actions():
+    template = _template()
+    assert "全程不点击页面上的任何按钮" not in template
+    assert "仅处理登录与站点选择，不点击请求付款或最终付款按钮" in template

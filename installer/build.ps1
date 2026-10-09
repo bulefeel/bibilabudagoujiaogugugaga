@@ -17,6 +17,11 @@ param(
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
+# Match Install.bat's default index while preserving an explicit operator override.
+if (-not $env:UV_DEFAULT_INDEX) {
+    $env:UV_DEFAULT_INDEX = 'https://pypi.tuna.tsinghua.edu.cn/simple'
+}
+
 $InstallerDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ProjectRoot = Split-Path -Parent $InstallerDir
 $BuildDir = Join-Path $ProjectRoot 'build'
@@ -250,6 +255,7 @@ $Include = @(
     'pyproject.toml',
     'uv.lock',
     'alembic.ini',
+    'onboarding-policy.toml',
     'uv.exe',
     'Install.bat',
     'Start.bat',

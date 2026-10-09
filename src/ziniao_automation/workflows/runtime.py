@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import logging
 from pathlib import Path
@@ -28,11 +29,16 @@ from ziniao_automation.queue import (
     PRIORITY_RECOVERY,
 )
 from ziniao_automation.repositories import marketplace_codes_text
+from ziniao_automation.setup_errors import SetupConflict
 from ziniao_automation.ziniao.models import ProfileSelector
 from ziniao_automation.ziniao.errors import AuthWaitCancelled, AuthWaitExpired
 
 from .engine import WorkflowEngine
-from .amazon_disbursement import AmazonPaymentsPage
+from .setup_diagnostics import SetupDiagnostic
+from ziniao_automation.config import PROJECT_ROOT
+from .store_setup.adapter import AmazonStoreSetupPage, SiteSetupResult
+from .store_setup.identity import SetupRejected
+from .store_setup.policy import OnboardingPolicy
 from .amazon_disbursement.config import ALLOWED_MARKETPLACES
 from .errors import HumanAuthRequired, PreflightRejected, WorkflowNotRegistered
 from .types import (
@@ -73,8 +79,8 @@ class _MarketplaceSetupDeadlineExpired(TimeoutError):
 _ASSISTED_LOGIN_WAIT_MESSAGE = (
     "当前站点的自动登录已停止：程序会先等待紫鸟填充，再依次处理邮箱 Continue、"
     "紫鸟托管 Passkey、已填密码登录和已填好的 6 位 OTP；每个页面动作最多自动点击 3 次，"
-    "每个站点最多进行 3 轮完整验证，CA、UK、AU 分别计数。当前页面可能已达到次数上限，"
-    "或出现未填内容、候选不唯一、CAPTCHA、非托管 Passkey 等不适合自动点击的情况。"
+    "每个站点最多进行 3 轮完整验证，CA、UK、AU 分别计数。程序会在次数耗尽，或出现"
+    "未填内容、候选不唯一、CAPTCHA、非托管 Passkey 等情况时停止自动点击。"
     "请在原紫鸟窗口处理后点击“再次尝试自动登录并继续”；不会切换到普通 Chrome。"
 )
 
@@ -90,6 +96,7 @@ class _IdentityProbe:
     state: str = "CHECKING"
     result: dict[str, Any] | None = None
     message: str = "正在通过对应紫鸟店铺读取 Seller Central 身份"
+    last_diagnostic: SetupDiagnostic | None = None
 
 
 @dataclass(slots=True)
@@ -109,6 +116,7 @@ class _MarketplaceSetupProbe:
     message: str = "正在通过对应紫鸟店铺按顺序检测付款账户"
     unified: bool = False
     identity: dict[str, Any] | None = None
+    last_diagnostic: SetupDiagnostic | None = None
 
 
 # 说不清点没点下去的资金记录(存库的字符串值)。见 types.UNSETTLED_GUARD_STATES。
@@ -151,10 +159,12 @@ class DatabaseRunLoader:
             row = session.scalar(
                 select(Run)
                 .where(Run.id == run_id)
-                .options(selectinload(Run.store).selectinload(Store.marketplaces))
+                .options(selectinload(Run.store))
             )
             if row is None:
                 raise LookupError(f"任务 {run_id} 不存在")
+            if (row.result_summary or {}).get("store_removed"):
+                raise ValueError("该任务所属店铺已删除；历史仅供查看")
             if self.workflow_registry is not None:
                 try:
                     definition = self.workflow_registry.definition(row.workflow)
@@ -189,7 +199,9 @@ class DatabaseRunLoader:
                 )
                 if legacy_codes:
                     workflow_config = {"marketplace_codes": legacy_codes}
-            store = row.store
+            store = session.scalar(select(Store).where(Store.id == row.store_id).options(selectinload(Store.marketplaces)))
+            if store is None:
+                raise ValueError("该店铺已从本地账册删除；历史任务仅供查看，不再打开店铺执行")
             if not store.selector_type or not store.selector_value:
                 raise ValueError("店铺缺少明确的紫鸟环境选择器")
             store_ref = StoreRef(
@@ -286,6 +298,8 @@ class DatabaseRunLoader:
             )
             ordinary = session.execute(
                 select(Run.id, Run.status).where(
+                    Run.store_id.in_(select(Store.id)),
+                    Run.result_summary["store_removed"].as_boolean().is_not(True),
                     Run.status.in_(
                         (
                             "QUEUED",
@@ -356,7 +370,10 @@ class DatabaseRunLoader:
         with self.session_factory() as session:
             rows = session.execute(
                 select(OperationGuard.run_id, OperationGuard.marketplace_code)
-                .where(OperationGuard.state.in_(_UNSETTLED_GUARD_VALUES))
+                .join(Run, Run.id == OperationGuard.run_id)
+                .where(OperationGuard.state.in_(_UNSETTLED_GUARD_VALUES),
+                       Run.store_id.in_(select(Store.id)),
+                       Run.result_summary["store_removed"].as_boolean().is_not(True))
                 .order_by(OperationGuard.run_id, OperationGuard.marketplace_code)
             ).all()
         grouped: dict[str, list[str]] = {}
@@ -386,10 +403,12 @@ class DatabaseRunLoader:
             row = session.scalar(
                 select(Run)
                 .where(Run.id == run_id)
-                .options(selectinload(Run.store).selectinload(Store.marketplaces))
+                .options(selectinload(Run.store))
             )
             if row is None:
                 raise LookupError(f"任务 {run_id} 不存在")
+            if (row.result_summary or {}).get("store_removed"):
+                raise ValueError("该任务所属店铺已删除；历史仅供查看")
 
             # 一条**说不清**的资金记录(ARMED/UNCERTAIN)比一个矛盾的运行终态更可信:
             # 运行说「成功」、记录说「不知道点没点下去」,就按不知道处理。
@@ -447,7 +466,9 @@ class DatabaseRunLoader:
                 raise ValueError("当前版本没有该资金工作流的兼容回读适配器")
             workflow_config = {"marketplace_codes": list(codes)}
 
-            store = row.store
+            store = session.scalar(select(Store).where(Store.id == row.store_id).options(selectinload(Store.marketplaces)))
+            if store is None:
+                raise ValueError("该店铺已从本地账册删除；历史任务仅供查看，不再打开店铺执行")
             if store is None or not store.selector_type or not store.selector_value:
                 raise ValueError("店铺缺少明确的紫鸟环境选择器")
             store_ref = StoreRef(
@@ -581,8 +602,9 @@ class AutomationService:
         recovery_loader: Callable[[], Awaitable[Sequence[WorkflowRun]]] | None = None,
         profile_sink: Callable[[Sequence[dict[str, Any]]], Awaitable[tuple[int, int]]] | None = None,
         session_factory: sessionmaker[Session] | Any | None = None,
-        identity_auth_timeout_seconds: float = 1800.0,
-        setup_cleanup_grace_seconds: float = 2.0,
+        identity_auth_timeout_seconds: float | None = None,
+        setup_cleanup_grace_seconds: float | None = None,
+        setup_policy_path: Path = PROJECT_ROOT / "onboarding-policy.toml",
     ) -> None:
         self.engine = engine
         self.run_loader = run_loader
@@ -617,18 +639,31 @@ class AutomationService:
         # provide a database. Production always uses the durable queue above.
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._guard = asyncio.Lock()
-        if identity_auth_timeout_seconds <= 0:
+        self.setup_policy_path = Path(setup_policy_path)
+        self._policy_deadline = identity_auth_timeout_seconds is None
+        self._policy_cleanup = setup_cleanup_grace_seconds is None
+        # No implicit production defaults: a valid policy is required before
+        # any probe starts. Explicit overrides remain for isolated tests.
+        if identity_auth_timeout_seconds is not None and identity_auth_timeout_seconds <= 0:
             raise ValueError("identity_auth_timeout_seconds must be positive")
-        if setup_cleanup_grace_seconds <= 0:
+        if setup_cleanup_grace_seconds is not None and setup_cleanup_grace_seconds <= 0:
             raise ValueError("setup_cleanup_grace_seconds must be positive")
-        self.identity_auth_timeout_seconds = float(identity_auth_timeout_seconds)
-        self.setup_cleanup_grace_seconds = float(setup_cleanup_grace_seconds)
+        self.identity_auth_timeout_seconds = identity_auth_timeout_seconds
+        self.setup_cleanup_grace_seconds = setup_cleanup_grace_seconds
         self._identity_probes: dict[str, _IdentityProbe] = {}
         self._identity_store_probes: dict[int, str] = {}
         self._identity_guard = asyncio.Lock()
         self._marketplace_setup_probes: dict[str, _MarketplaceSetupProbe] = {}
         self._marketplace_setup_store_probes: dict[int, str] = {}
         self._marketplace_setup_guard = asyncio.Lock()
+
+    def _load_setup_policy(self) -> OnboardingPolicy:
+        policy = OnboardingPolicy.load(self.setup_policy_path)
+        if self._policy_deadline:
+            self.identity_auth_timeout_seconds = float(policy.total_deadline_seconds)
+        if self._policy_cleanup:
+            self.setup_cleanup_grace_seconds = float(policy.cleanup_grace_seconds)
+        return policy
 
     def set_delivery_service(self, deliveries: Any | None) -> None:
         """Attach explicit notices after composition has built the worker."""
@@ -738,7 +773,7 @@ class AutomationService:
             # Production FastAPI persists ``profiles`` with the current
             # ZiniaoAccount in one request-scoped transaction.
             created = updated = 0
-        return {"created": created, "updated": updated, "profiles": payload}
+        return {"created": created, "updated": updated, "profiles": payload, "complete": True}
 
     async def detect_store_identity(self, store_id: int) -> dict[str, Any]:
         """Start one non-blocking, read-only identity probe.
@@ -768,15 +803,25 @@ class AutomationService:
                 return await self._identity_probe_payload_locked(current)
             if current is not None and current.task.done():
                 self._identity_probes.pop(current.id, None)
-            probe_id = str(uuid4())
+            policy = self._load_setup_policy()
+            retained = self.setup_records.existing(store_id, [], kind="identity")
+            if retained:
+                return retained
+            durable = self.setup_records.begin(store_id, [], kind="identity",
+                seconds=self.identity_auth_timeout_seconds, policy_version="onboarding-policy-v1")
+            probe_id = durable["probe_id"]
             loop = asyncio.get_running_loop()
+            expires_at = loop.time() + self.identity_auth_timeout_seconds
             ready = asyncio.Event()
             task = asyncio.create_task(
-                self._run_identity_probe(
+                self._run_setup_probe_before_deadline(
                     probe_id=probe_id,
-                    store_id=store_id,
-                    selector=selector,
-                    ready=ready,
+                    expires_at=expires_at,
+                    cleanup_grace_seconds=self.setup_cleanup_grace_seconds,
+                    operation=lambda: self._run_identity_probe(
+                        probe_id=probe_id, store_id=store_id, selector=selector,
+                        ready=ready, policy=policy,
+                    ),
                 ),
                 name=f"identity-probe:{probe_id}",
             )
@@ -786,7 +831,7 @@ class AutomationService:
                 task=task,
                 ready=ready,
                 created_at=loop.time(),
-                expires_at=loop.time() + self.identity_auth_timeout_seconds,
+                expires_at=expires_at,
             )
             self._identity_probes[probe_id] = probe
             self._identity_store_probes[store_id] = probe_id
@@ -801,6 +846,7 @@ class AutomationService:
         await ready.wait()
         return await self.get_identity_probe(store_id, probe_id)
 
+
     async def _run_identity_probe(
         self,
         *,
@@ -808,13 +854,12 @@ class AutomationService:
         store_id: int,
         selector: ProfileSelector,
         ready: asyncio.Event,
+        policy: OnboardingPolicy,
     ) -> dict[str, Any]:
-        adapter = AmazonPaymentsPage()
+        adapter = AmazonStoreSetupPage(policy)
         failures: list[str] = []
         try:
-            async with self.ziniao_controller.session(
-                selector, store_key=str(store_id)
-            ) as handle:
+            async with self._setup_session(probe_id, selector, store_id, financial=False) as handle:
                 for code, (domain, currency) in ALLOWED_MARKETPLACES.items():
                     marketplace = MarketplaceRef(
                         id=f"identity-probe-{code.lower()}",
@@ -826,7 +871,7 @@ class AutomationService:
                         seller_id, source = await adapter.detect_identity(
                             handle.page, marketplace
                         )
-                    except HumanAuthRequired:
+                    except HumanAuthRequired as exc:
                         probe = self._identity_probes[probe_id]
                         await self.ziniao_controller.wait_for_auth(
                             handle,
@@ -835,9 +880,10 @@ class AutomationService:
                                 0.001,
                                 probe.expires_at - asyncio.get_running_loop().time(),
                             ),
-                            on_waiting=lambda: self._publish_identity_auth_wait(
+                            on_waiting=lambda d=exc.diagnostic: self._publish_identity_auth_wait(
                                 probe_id,
-                                _ASSISTED_LOGIN_WAIT_MESSAGE,
+                                self._setup_auth_wait_message(d),
+                                diagnostic=d,
                             ),
                         )
                         # Continue on the same page/handle and recheck this
@@ -849,7 +895,7 @@ class AutomationService:
                                     handle.page, marketplace
                                 )
                                 break
-                            except HumanAuthRequired:
+                            except HumanAuthRequired as exc:
                                 await self.ziniao_controller.wait_for_auth(
                                     handle,
                                     self._identity_auth_key(probe_id),
@@ -858,11 +904,19 @@ class AutomationService:
                                         probe.expires_at
                                         - asyncio.get_running_loop().time(),
                                     ),
-                                    on_waiting=lambda: self._publish_identity_auth_wait(
+                                    on_waiting=lambda d=exc.diagnostic: self._publish_identity_auth_wait(
                                         probe_id,
-                                        _ASSISTED_LOGIN_WAIT_MESSAGE,
+                                        self._setup_auth_wait_message(d),
+                                        diagnostic=d,
                                     ),
                                 )
+                    except SetupRejected as exc:
+                        self._identity_probes[probe_id].last_diagnostic = exc.diagnostic
+                        self._log_setup_diagnostic(probe_id, exc.diagnostic)
+                        if exc.stop_store:
+                            raise
+                        failures.append(f"{code}: {exc}")
+                        continue
                     except PreflightRejected as exc:
                         failures.append(f"{code}: {exc}")
                         continue
@@ -873,6 +927,7 @@ class AutomationService:
                         "seller_id": seller_id,
                         "source": source,
                         "marketplace_code": code,
+                        **adapter.last_identity_evidence,
                     }
         except RuntimeError:
             raise
@@ -898,6 +953,7 @@ class AutomationService:
             "未能从 CA/UK/AU Seller Central 页面读取卖家身份"
             + (f"：{detail}" if detail else "")
         )
+
 
     async def _finish_identity_probe(
         self, probe_id: str, task: asyncio.Task[dict[str, Any]]
@@ -925,41 +981,79 @@ class AutomationService:
                 if probe.state != "CANCELLED":
                     probe.state = "FAILED"
                     probe.message = str(exc) or "身份检测失败"
+                    if isinstance(exc, SetupRejected):
+                        probe.last_diagnostic = exc.diagnostic
+                        self._log_setup_diagnostic(probe_id, exc.diagnostic)
+            saved = self.setup_records.get(probe.store_id, probe.id)
+            if saved["lifecycle"] != "FINISHED":
+                self.setup_records.finish(probe.id, outcome="CANCELLED" if task.cancelled() else "FAILED",
+                    cleanup="CONFIRMED" if saved["lifecycle"] == "QUEUED" else "UNCONFIRMED",
+                    reason="SETUP_CANCELLED" if task.cancelled() else "SETUP_FAILED")
             probe.ready.set()
 
-    async def _publish_identity_auth_wait(self, probe_id: str, message: str) -> None:
+    @staticmethod
+    def _setup_auth_wait_message(diagnostic: SetupDiagnostic) -> str:
+        return (
+            f"本次停止原因：{diagnostic.message}（{diagnostic.reason_code}）。"
+            + _ASSISTED_LOGIN_WAIT_MESSAGE
+        )
+
+    @staticmethod
+    def _log_setup_diagnostic(probe_id: str, diagnostic: SetupDiagnostic) -> None:
+        logger.info("setup_probe diagnostic probe_id=%s details=%s",
+                    probe_id, diagnostic.to_payload())
+
+    @staticmethod
+    def _diagnosed_setup_payload(
+        payload: dict[str, Any], diagnostic: SetupDiagnostic | None
+    ) -> dict[str, Any]:
+        result = dict(payload)
+        if diagnostic is not None:
+            result["last_diagnostic"] = diagnostic.to_payload()
+        return result
+
+    async def _record_setup_site_failure(
+        self, probe_id: str, code: str, diagnostic: SetupDiagnostic
+    ) -> None:
+        async with self._marketplace_setup_guard:
+            probe = self._marketplace_setup_probes[probe_id]
+            probe.last_diagnostic = diagnostic
+            for site in probe.marketplaces or ():
+                if site.get("code") == code:
+                    site.update(
+                        status="FAILED", message=diagnostic.message,
+                        reason_code=diagnostic.reason_code,
+                        diagnostics=diagnostic.to_payload(),
+                    )
+                    self._log_setup_diagnostic(probe_id, diagnostic)
+                    return
+            raise RuntimeError("自动建档没有请求该站点")
+
+    async def _publish_identity_auth_wait(
+        self, probe_id: str, message: str, *, diagnostic: SetupDiagnostic | None = None
+    ) -> None:
         async with self._identity_guard:
             probe = self._identity_probes.get(probe_id)
             if probe is None:
                 raise RuntimeError("身份检测记录已释放")
             probe.state = "WAITING_AUTH"
             probe.message = message
+            if diagnostic is not None:
+                probe.last_diagnostic = diagnostic
+                self._log_setup_diagnostic(probe_id, diagnostic)
             probe.ready.set()
+        self._persist_setup_progress(probe_id)
 
     async def get_identity_probe(self, store_id: int, probe_id: str) -> dict[str, Any]:
-        async with self._identity_guard:
-            probe = self._identity_probes.get(str(probe_id))
-            if probe is None or probe.store_id != int(store_id):
-                raise LookupError("身份检测记录不存在或不属于该店铺")
-            return await self._identity_probe_payload_locked(probe)
+        return self.setup_records.get(store_id, probe_id, 'identity')
 
-    async def _identity_probe_payload_locked(
-        self, probe: _IdentityProbe
-    ) -> dict[str, Any]:
-        """Build a public payload while ``_identity_guard`` is held."""
-
-        remaining = max(0, int(probe.expires_at - asyncio.get_running_loop().time()))
-        if probe.state == "SUCCEEDED" and probe.result is not None:
-            return dict(probe.result)
-        return {
-            "status": probe.state,
-            "probe_id": probe.id,
-            "store_id": probe.store_id,
-            "expires_in_seconds": remaining,
-            "message": probe.message,
-        }
+    async def _identity_probe_payload_locked(self, probe: _IdentityProbe) -> dict[str, Any]:
+        return self.setup_records.get(probe.store_id, probe.id, "identity")
 
     async def continue_identity_probe(self, store_id: int, probe_id: str) -> dict[str, Any]:
+        saved = self.setup_records.get(store_id, probe_id)
+        if saved["lifecycle"] == "FINISHED":
+            return saved
         async with self._identity_guard:
             probe = self._identity_probes.get(str(probe_id))
             if probe is None or probe.store_id != int(store_id):
@@ -968,6 +1062,7 @@ class AutomationService:
                 raise RuntimeError(f"当前身份检测状态为 {probe.state}，无需继续")
             probe.state = "CHECKING"
             probe.message = "正在使用原紫鸟店铺窗口尝试自动登录并继续检测"
+            self._persist_setup_progress(probe_id)
         signal = getattr(self.ziniao_controller, "continue_auth", None)
         if not callable(signal) or not await signal(self._identity_auth_key(probe_id)):
             async with self._identity_guard:
@@ -977,7 +1072,11 @@ class AutomationService:
             raise RuntimeError("原紫鸟验证会话已失效，请重新发起身份检测")
         return await self.get_identity_probe(store_id, probe_id)
 
+
     async def cancel_identity_probe(self, store_id: int, probe_id: str) -> dict[str, Any]:
+        saved = self.setup_records.get(store_id, probe_id)
+        if saved["lifecycle"] == "FINISHED":
+            return saved
         async with self._identity_guard:
             probe = self._identity_probes.get(str(probe_id))
             if probe is None or probe.store_id != int(store_id):
@@ -1004,6 +1103,7 @@ class AutomationService:
             probe.task.cancel()
             await asyncio.gather(probe.task, return_exceptions=True)
         return await self.get_identity_probe(store_id, probe_id)
+
 
     async def shutdown_identity_probes(self) -> None:
         """Cancel and join every live setup/identity probe before shutdown."""
@@ -1048,10 +1148,104 @@ class AutomationService:
     def _identity_auth_key(probe_id: str) -> str:
         return f"identity-probe:{probe_id}"
 
-    async def _run_setup_probe_before_deadline(
+    @property
+    def setup_records(self):
+        from ziniao_automation.setup_repository import SetupRepository
+        return SetupRepository(self.session_factory)
+
+    def _persist_setup_progress(self, probe_id: str) -> None:
+        probe = self._marketplace_setup_probes.get(probe_id)
+        if probe is not None:
+            phase = "CHECK_SITE" if any(s.get("status") == "CHECKING" for s in (probe.marketplaces or ())) else "READ_IDENTITY"
+            self.setup_records.progress(probe_id, identity=probe.identity, sites=probe.marketplaces or (),
+                lifecycle=probe.state if probe.state in {"CHECKING", "WAITING_AUTH"} else None, phase=phase,
+                diagnostic=probe.last_diagnostic.to_payload() if probe.last_diagnostic else None)
+        else:
+            probe = self._identity_probes.get(probe_id)
+            if probe:
+                self.setup_records.progress(probe_id, lifecycle=probe.state if probe.state in {"CHECKING", "WAITING_AUTH"} else None,
+                    phase="READ_IDENTITY", diagnostic=probe.last_diagnostic.to_payload() if probe.last_diagnostic else None)
+
+    @asynccontextmanager
+    async def _setup_session(self, probe_id, selector, store_id, *, financial=True):
+        self.setup_records.assert_current(probe_id)
+        self.setup_records.progress(probe_id, lifecycle="CHECKING", phase="ACQUIRE_SESSION")
+        provider = self.ziniao_controller.financial_session if financial else self.ziniao_controller.session
+        manager = provider(selector, store_key=str(store_id))
+        handle = None
+        error = None
+        closed = False
+        try:
+            handle = await manager.__aenter__()
+            try:
+                from ziniao_automation.setup_resources import capture_process
+                self.setup_records.save_resource_proof(probe_id, await capture_process(handle))
+                self.setup_records.assert_current(probe_id)
+                self.setup_records.progress(probe_id, phase="READ_IDENTITY")
+                yield handle
+            except BaseException as exc:
+                error = exc
+                raise
+            finally:
+                self.setup_records.finalize_phase(probe_id)
+                cleanup_task = asyncio.create_task(manager.__aexit__(type(error) if error else None, error, error.__traceback__ if error else None))
+                try:
+                    done, _ = await asyncio.wait({cleanup_task}, timeout=self.setup_cleanup_grace_seconds)
+                    if cleanup_task in done:
+                        cleanup_task.result()
+                        closed = True
+                finally:
+                    if not cleanup_task.done():
+                        cleanup_task.cancel()
+                        cleanup_task.add_done_callback(self._consume_setup_operation_result)
+        finally:
+            if not hasattr(self, "_setup_cleanup"):
+                self._setup_cleanup = {}
+            confirmed = closed and getattr(handle, "cleanup_confirmed", False) is True
+            self._setup_cleanup[probe_id] = "CONFIRMED" if confirmed else "UNCONFIRMED"
+
+    async def _run_setup_probe_before_deadline(self, *, expires_at, cleanup_grace_seconds, operation, probe_id=None):
+        if probe_id is None:
+            return await self._run_setup_probe_before_deadline_impl(expires_at=expires_at, cleanup_grace_seconds=cleanup_grace_seconds, operation=operation)
+        outcome, reason, identity = "FAILED", None, None
+        try:
+            result = await self._run_setup_probe_before_deadline_impl(expires_at=expires_at, cleanup_grace_seconds=cleanup_grace_seconds, operation=operation)
+            self._persist_setup_progress(probe_id)
+            outcome = result.get("status", "FAILED")
+            if outcome == "UNAVAILABLE": outcome = "SUCCEEDED"
+            identity = result.get("identity")
+            if probe_id in self._identity_probes:
+                identity = result
+            return result
+        except (asyncio.CancelledError, AuthWaitCancelled):
+            outcome, reason = "CANCELLED", "SETUP_CANCELLED"
+            raise
+        except (TimeoutError, AuthWaitExpired):
+            outcome, reason = "TIMED_OUT", "SETUP_TIMED_OUT"
+            raise
+        except SetupConflict:
+            outcome, reason = "INTERRUPTED", "CONFIG_CHANGED"
+            raise
+        except SetupRejected as exc:
+            reason = exc.diagnostic.reason_code
+            if reason == "IDENTITY_MISMATCH": outcome = "NEEDS_REVIEW"
+            raise
+        except Exception:
+            current = self._marketplace_setup_probes.get(probe_id) or self._identity_probes.get(probe_id)
+            if current and current.last_diagnostic:
+                reason = current.last_diagnostic.reason_code
+                if reason == "IDENTITY_MISMATCH": outcome = "NEEDS_REVIEW"
+            raise
+        finally:
+            cleanup = getattr(self, "_setup_cleanup", {}).pop(probe_id, "UNCONFIRMED")
+            self.setup_records.finish(probe_id, outcome=outcome, cleanup=cleanup, identity=identity, reason=reason)
+
+
+    async def _run_setup_probe_before_deadline_impl(
         self,
         *,
         expires_at: float,
+        cleanup_grace_seconds: float,
         operation: Callable[[], Awaitable[dict[str, Any]]],
     ) -> dict[str, Any]:
         """Run every setup phase under one absolute, cancellation-safe limit.
@@ -1075,7 +1269,7 @@ class AutomationService:
             operation_task.cancel()
             cleanup_done, _ = await asyncio.wait(
                 {operation_task},
-                timeout=self.setup_cleanup_grace_seconds,
+                timeout=cleanup_grace_seconds,
             )
             if operation_task in cleanup_done:
                 self._consume_setup_operation_result(operation_task)
@@ -1096,7 +1290,7 @@ class AutomationService:
             try:
                 cleanup_done, _ = await asyncio.wait(
                     {operation_task},
-                    timeout=self.setup_cleanup_grace_seconds,
+                    timeout=cleanup_grace_seconds,
                 )
             except asyncio.CancelledError:
                 cleanup_done = set()
@@ -1108,6 +1302,7 @@ class AutomationService:
                     self._consume_setup_operation_result
                 )
             raise
+
 
     @staticmethod
     def _consume_setup_operation_result(task: asyncio.Task[Any]) -> None:
@@ -1122,14 +1317,13 @@ class AutomationService:
         self,
         store_id: int,
         marketplace_codes: Sequence[str] | None = None,
+        *, request_id: str | None = None, scope: str = "full", expected_setup_revision: int | None = None,
     ) -> dict[str, Any]:
-        """Discover seller identity and account tails in one Ziniao session.
+        """Discover identity and check site access in one Ziniao session.
 
-        Unlike the legacy account-only probe, this entry point deliberately
-        accepts an unconfigured store.  The live seller discovered from this
-        exact browser handle becomes the only identity allowed to receive the
-        account observations that follow.  It never calls the final payment
-        submit action or creates an operation guard.
+        Accept an unconfigured store, bind its observed seller, then check each
+        explicitly selected site with the read-only setup adapter. No balances,
+        payout tails, payment entry buttons, runs or operation guards are used.
         """
 
         if self.session_factory is None:
@@ -1150,6 +1344,10 @@ class AutomationService:
                 "；无效站点：" + "、".join(sorted(unknown))
             )
 
+        retained = self.setup_records.existing(store_id, normalized, request_id=request_id, scope=scope, expected_revision=expected_setup_revision)
+        if retained:
+            return retained
+
         with self.session_factory() as session:
             store = session.get(Store, int(store_id))
             if store is None:
@@ -1166,7 +1364,7 @@ class AutomationService:
                 self._finalize_marketplace_setup_probe_locked(current, current.task)
             if current is not None and current.state in {"CHECKING", "WAITING_AUTH"}:
                 if current.unified:
-                    return self._marketplace_setup_payload_locked(current)
+                    return self.setup_records.existing(store_id, normalized, request_id=request_id, scope=scope, expected_revision=expected_setup_revision)
                 raise RuntimeError("该店铺正在执行旧版付款账户建档，请完成或取消后再统一建档")
             if current is not None:
                 self._marketplace_setup_probes.pop(current.id, None)
@@ -1188,47 +1386,14 @@ class AutomationService:
             if callable(credential_preflight):
                 credential_preflight()
 
-            # Persist explicit site selection only after proving this request
-            # will create a new probe. Reattaching to an existing probe must be
-            # a strictly read-only operation with no hidden configuration edit.
-            with self.session_factory() as session:
-                persisted_store = session.get(Store, int(store_id))
-                if persisted_store is None:
-                    raise LookupError(f"店铺 {store_id} 不存在")
-                if (
-                    str(persisted_store.selector_type) != selector.type
-                    or str(persisted_store.selector_value) != selector.value
-                ):
-                    raise RuntimeError("建档开始前紫鸟店铺环境已变化，请重新发起")
-                # The explicitly requested codes are also the operator's
-                # explicit enable decision. Existing unrequested rows remain
-                # untouched.
-                for code in normalized:
-                    domain, currency = ALLOWED_MARKETPLACES[code]
-                    row = session.scalar(
-                        select(StoreMarketplace).where(
-                            StoreMarketplace.store_id == int(store_id),
-                            StoreMarketplace.code == code,
-                        )
-                    )
-                    if row is None:
-                        row = StoreMarketplace(
-                            store_id=int(store_id),
-                            code=code,
-                            domain=domain,
-                            currency=currency,
-                            enabled=True,
-                        )
-                        session.add(row)
-                    else:
-                        if row.domain.lower() != domain or row.currency.upper() != currency:
-                            raise RuntimeError(
-                                f"{code} 站点现有域名或币种不是固定白名单值，统一建档已停止"
-                            )
-                        row.enabled = True
-                session.commit()
-
-            probe_id = str(uuid4())
+            policy = self._load_setup_policy()
+            durable = self.setup_records.begin(int(store_id), normalized, kind="unified",
+                seconds=self.identity_auth_timeout_seconds, policy_version="onboarding-policy-v1",
+                request_id=request_id, scope=scope, expected_revision=expected_setup_revision)
+            if durable.get("no_work") or durable.get("reused"):
+                return durable
+            probe_id = durable["probe_id"]
+            normalized = tuple(item["code"] for item in durable["marketplaces"])
             loop = asyncio.get_running_loop()
             initial_sites = [
                 {
@@ -1236,6 +1401,9 @@ class AutomationService:
                     "domain": ALLOWED_MARKETPLACES[code][0],
                     "currency": ALLOWED_MARKETPLACES[code][1],
                     "status": "PENDING",
+                    "identity_check": "NOT_CHECKED",
+                    "access_check": "NOT_CHECKED",
+                    "payment_capability": "NOT_CHECKED",
                     "message": "等待卖家身份检测完成",
                 }
                 for code in normalized
@@ -1243,13 +1411,16 @@ class AutomationService:
             expires_at = loop.time() + self.identity_auth_timeout_seconds
             task = asyncio.create_task(
                 self._run_setup_probe_before_deadline(
+                    probe_id=probe_id,
                     expires_at=expires_at,
+                    cleanup_grace_seconds=self.setup_cleanup_grace_seconds,
                     operation=lambda: self._run_store_setup_probe(
                         probe_id=probe_id,
                         store_id=int(store_id),
                         store_name=store_name,
                         selector=selector,
                         marketplace_codes=normalized,
+                        policy=policy,
                     ),
                 ),
                 name=f"store-setup-probe:{probe_id}",
@@ -1285,6 +1456,7 @@ class AutomationService:
             )
             return self._marketplace_setup_payload_locked(probe)
 
+
     async def _run_store_setup_probe(
         self,
         *,
@@ -1293,17 +1465,19 @@ class AutomationService:
         store_name: str,
         selector: ProfileSelector,
         marketplace_codes: tuple[str, ...],
+        policy: OnboardingPolicy,
     ) -> dict[str, Any]:
         financial_session = getattr(self.ziniao_controller, "financial_session", None)
         if not callable(financial_session):
             raise RuntimeError("紫鸟控制器缺少资金全局锁，已停止统一建档")
-        adapter = AmazonPaymentsPage()
-        async with financial_session(selector, store_key=str(store_id)) as handle:
+        adapter = AmazonStoreSetupPage(policy)
+        identity_marketplace_codes = self.setup_records.identity_bootstrap_codes(probe_id)
+        async with self._setup_session(probe_id, selector, store_id) as handle:
             seller_id = ""
             identity_source = ""
             identity_code = ""
             failures: list[str] = []
-            for code in marketplace_codes:
+            for code in identity_marketplace_codes:
                 domain, currency = ALLOWED_MARKETPLACES[code]
                 marketplace = MarketplaceRef(
                     id=f"store-setup-identity-{code.lower()}",
@@ -1326,7 +1500,7 @@ class AutomationService:
                         handle.page = adapter.resolved_page_for(handle.page)
                         identity_code = code
                         break
-                    except HumanAuthRequired:
+                    except HumanAuthRequired as exc:
                         resolved_page = adapter.resolved_page_for(handle.page)
                         if resolved_page is not handle.page:
                             handle.page = resolved_page
@@ -1345,10 +1519,11 @@ class AutomationService:
                                 0.001,
                                 probe.expires_at - asyncio.get_running_loop().time(),
                             ),
-                            on_waiting=lambda c=code: self._publish_store_setup_identity_auth_wait(
+                            on_waiting=lambda c=code, d=exc.diagnostic: self._publish_store_setup_identity_auth_wait(
                                 probe_id,
                                 c,
-                                _ASSISTED_LOGIN_WAIT_MESSAGE,
+                                self._setup_auth_wait_message(d),
+                                diagnostic=d,
                             ),
                         )
                         await self._set_store_setup_identity(
@@ -1357,6 +1532,19 @@ class AutomationService:
                             marketplace_code=code,
                             message="正在复用原紫鸟窗口继续读取卖家身份",
                         )
+                    except SetupRejected as exc:
+                        probe = self._marketplace_setup_probes[probe_id]
+                        probe.last_diagnostic = exc.diagnostic
+                        self._log_setup_diagnostic(probe_id, exc.diagnostic)
+                        await self._set_store_setup_identity(
+                            probe_id, status="FAILED", message=exc.diagnostic.message,
+                            reason_code=exc.diagnostic.reason_code,
+                            diagnostics=exc.diagnostic.to_payload(),
+                        )
+                        if exc.stop_store:
+                            raise
+                        failures.append(f"{code}: {exc}")
+                        break
                     except PreflightRejected as exc:
                         failures.append(f"{code}: {exc}")
                         break
@@ -1375,6 +1563,7 @@ class AutomationService:
                 identity_confirmed,
                 store_enabled,
             ) = self._persist_store_setup_identity(
+                probe_id=probe_id,
                 store_id=store_id,
                 seller_id=seller_id,
                 selector=selector,
@@ -1433,6 +1622,7 @@ class AutomationService:
                 source=identity_source,
                 marketplace_code=identity_code,
                 persistence_state=identity_result,
+                **adapter.last_identity_evidence,
                 identity_confirmed=identity_confirmed,
                 store_enabled=store_enabled,
                 message=identity_message,
@@ -1460,6 +1650,7 @@ class AutomationService:
                 adapter=adapter,
             )
 
+
     async def _run_store_setup_account_sites(
         self,
         *,
@@ -1469,7 +1660,7 @@ class AutomationService:
         store_ref: StoreRef,
         marketplace_codes: tuple[str, ...],
         handle: Any,
-        adapter: AmazonPaymentsPage,
+        adapter: AmazonStoreSetupPage,
     ) -> dict[str, Any]:
         """Confirm each selected site opens as the same seller.
 
@@ -1500,14 +1691,6 @@ class AutomationService:
                 currency=currency,
                 enabled=True,
             )
-            run = WorkflowRun(
-                id=f"store-setup:{probe_id}",
-                workflow="amazon_disbursement",
-                mode=RunMode.DRY_RUN,
-                store=store_ref,
-                marketplaces=(marketplace,),
-                requested_by="unified-store-setup",
-            )
             await self._set_marketplace_setup_site(
                 probe_id,
                 code,
@@ -1516,16 +1699,18 @@ class AutomationService:
             )
             while True:
                 try:
-                    await adapter.preflight(handle.page, run, marketplace)
+                    site_result = await adapter.check_site(handle.page, store_ref, marketplace)
+                    if not isinstance(site_result, SiteSetupResult):
+                        raise RuntimeError("建档适配器返回了无效核验结果")
                     handle.page = adapter.resolved_page_for(handle.page)
                     break
                 except HumanAuthRequired as exc:
                     if exc.kind == "marketplace_switch":
                         # 选不定站点不是登录问题:等「完成登录」等满 30 分钟、还占着
                         # 资金锁,毫无意义。如实记下原因,接着核下一个站点。
-                        await self._set_marketplace_setup_site(
-                            probe_id, code, status="FAILED", message=str(exc)
-                        )
+                        await self._record_setup_site_failure(probe_id, code, exc.diagnostic)
+                        if exc.diagnostic.reason_code in {"DOMAIN_MISMATCH", "IDENTITY_MISMATCH"}:
+                            raise RuntimeError(exc.diagnostic.message) from None
                         break
                     resolved_page = adapter.resolved_page_for(handle.page)
                     if resolved_page is not handle.page:
@@ -1539,10 +1724,11 @@ class AutomationService:
                             0.001,
                             probe.expires_at - asyncio.get_running_loop().time(),
                         ),
-                        on_waiting=lambda c=code: self._publish_marketplace_setup_auth_wait(
+                        on_waiting=lambda c=code, d=exc.diagnostic: self._publish_marketplace_setup_auth_wait(
                             probe_id,
                             c,
-                            _ASSISTED_LOGIN_WAIT_MESSAGE,
+                            self._setup_auth_wait_message(d),
+                            diagnostic=d,
                         ),
                     )
                     await self._set_marketplace_setup_site(
@@ -1551,6 +1737,12 @@ class AutomationService:
                         status="CHECKING",
                         message="正在复用原紫鸟窗口继续核验",
                     )
+                except SetupRejected as exc:
+                    await self._record_setup_site_failure(probe_id, code, exc.diagnostic)
+                    await self._set_marketplace_setup_site(probe_id, code, **exc.checks_payload())
+                    if exc.stop_store:
+                        raise
+                    break
                 except PreflightRejected as exc:
                     await self._set_marketplace_setup_site(
                         probe_id, code, status="FAILED", message=str(exc)
@@ -1563,7 +1755,9 @@ class AutomationService:
                 probe_id,
                 code,
                 status="SUCCEEDED",
-                message="域名与卖家身份核验通过",
+                message=("域名与卖家身份核验通过；付款页面结构待适配"
+                         if site_result.payment_capability == "UNKNOWN" else "域名与卖家身份核验通过"),
+                **site_result.to_payload(),
             )
 
         sites = await self._marketplace_setup_sites_snapshot(probe_id)
@@ -1589,13 +1783,10 @@ class AutomationService:
         store_id: int,
         marketplace_codes: Sequence[str] | None = None,
     ) -> dict[str, Any]:
-        """Start one setup-only account-baseline probe for a Ziniao store.
+        """Check selected sites against an existing identity binding.
 
-        The probe may use Amazon's non-final dashboard transition because the
-        masked account tail is not present on the dashboard.  It runs under
-        the controller's global funds lock, never calls ``submit_once`` and
-        never creates an operation guard.  Only values read by the server from
-        a verified details page are persisted.
+        Share the existing session lock, but use only read-only setup checks.
+        No payment entry button is clicked and no account-tail baseline exists.
         """
 
         if self.session_factory is None:
@@ -1659,7 +1850,13 @@ class AutomationService:
             if identity_probe is not None and not identity_probe.task.done():
                 raise RuntimeError("该店铺正在检测卖家身份，请完成或取消后再自动建档")
 
-            probe_id = str(uuid4())
+            policy = self._load_setup_policy()
+            retained = self.setup_records.existing(store_id, normalized, kind="marketplace")
+            if retained:
+                return retained
+            durable = self.setup_records.begin(store_id, normalized, kind="marketplace",
+                seconds=self.identity_auth_timeout_seconds, policy_version="onboarding-policy-v1")
+            probe_id = durable["probe_id"]
             loop = asyncio.get_running_loop()
             initial_sites = [
                 {
@@ -1667,6 +1864,9 @@ class AutomationService:
                     "domain": ALLOWED_MARKETPLACES[code][0],
                     "currency": ALLOWED_MARKETPLACES[code][1],
                     "status": "PENDING",
+                    "identity_check": "NOT_CHECKED",
+                    "access_check": "NOT_CHECKED",
+                    "payment_capability": "NOT_CHECKED",
                     "message": "排队等待检测",
                 }
                 for code in normalized
@@ -1674,13 +1874,16 @@ class AutomationService:
             expires_at = loop.time() + self.identity_auth_timeout_seconds
             task = asyncio.create_task(
                 self._run_setup_probe_before_deadline(
+                    probe_id=probe_id,
                     expires_at=expires_at,
+                    cleanup_grace_seconds=self.setup_cleanup_grace_seconds,
                     operation=lambda: self._run_marketplace_setup_probe(
                         probe_id=probe_id,
                         store_id=int(store_id),
                         selector=selector,
                         store_ref=store_ref,
                         marketplace_codes=normalized,
+                        policy=policy,
                     ),
                 ),
                 name=f"marketplace-setup-probe:{probe_id}",
@@ -1704,6 +1907,7 @@ class AutomationService:
             )
             return self._marketplace_setup_payload_locked(probe)
 
+
     async def _run_marketplace_setup_probe(
         self,
         *,
@@ -1712,6 +1916,7 @@ class AutomationService:
         selector: ProfileSelector,
         store_ref: StoreRef,
         marketplace_codes: tuple[str, ...],
+        policy: OnboardingPolicy,
     ) -> dict[str, Any]:
         """Confirm each selected site opens as the expected seller.  No clicks.
 
@@ -1723,8 +1928,8 @@ class AutomationService:
         financial_session = getattr(self.ziniao_controller, "financial_session", None)
         if not callable(financial_session):
             raise RuntimeError("紫鸟控制器缺少资金全局锁，已停止自动建档")
-        adapter = AmazonPaymentsPage()
-        async with financial_session(selector, store_key=str(store_id)) as handle:
+        adapter = AmazonStoreSetupPage(policy)
+        async with self._setup_session(probe_id, selector, store_id) as handle:
             for code in marketplace_codes:
                 domain, currency = ALLOWED_MARKETPLACES[code]
                 marketplace = MarketplaceRef(
@@ -1734,27 +1939,21 @@ class AutomationService:
                     currency=currency,
                     enabled=True,
                 )
-                run = WorkflowRun(
-                    id=f"marketplace-setup:{probe_id}",
-                    workflow="amazon_disbursement",
-                    mode=RunMode.DRY_RUN,
-                    store=store_ref,
-                    marketplaces=(marketplace,),
-                    requested_by="account-setup",
-                )
                 await self._set_marketplace_setup_site(
                     probe_id, code, status="CHECKING", message="正在核验域名与卖家身份"
                 )
                 while True:
                     try:
-                        await adapter.preflight(handle.page, run, marketplace)
+                        site_result = await adapter.check_site(handle.page, store_ref, marketplace)
+                        if not isinstance(site_result, SiteSetupResult):
+                            raise RuntimeError("建档适配器返回了无效核验结果")
                         handle.page = adapter.resolved_page_for(handle.page)
                         break
                     except HumanAuthRequired as exc:
                         if exc.kind == "marketplace_switch":
-                            await self._set_marketplace_setup_site(
-                                probe_id, code, status="FAILED", message=str(exc)
-                            )
+                            await self._record_setup_site_failure(probe_id, code, exc.diagnostic)
+                            if exc.diagnostic.reason_code in {"DOMAIN_MISMATCH", "IDENTITY_MISMATCH"}:
+                                raise RuntimeError(exc.diagnostic.message) from None
                             break
                         resolved_page = adapter.resolved_page_for(handle.page)
                         if resolved_page is not handle.page:
@@ -1768,10 +1967,11 @@ class AutomationService:
                                 0.001,
                                 probe.expires_at - asyncio.get_running_loop().time(),
                             ),
-                            on_waiting=lambda c=code: self._publish_marketplace_setup_auth_wait(
+                            on_waiting=lambda c=code, d=exc.diagnostic: self._publish_marketplace_setup_auth_wait(
                                 probe_id,
                                 c,
-                                _ASSISTED_LOGIN_WAIT_MESSAGE,
+                                self._setup_auth_wait_message(d),
+                                diagnostic=d,
                             ),
                         )
                         await self._set_marketplace_setup_site(
@@ -1780,6 +1980,12 @@ class AutomationService:
                             status="CHECKING",
                             message="正在复用原紫鸟窗口继续核验",
                         )
+                    except SetupRejected as exc:
+                        await self._record_setup_site_failure(probe_id, code, exc.diagnostic)
+                        await self._set_marketplace_setup_site(probe_id, code, **exc.checks_payload())
+                        if exc.stop_store:
+                            raise
+                        break
                     except PreflightRejected as exc:
                         await self._set_marketplace_setup_site(
                             probe_id, code, status="FAILED", message=str(exc)
@@ -1792,7 +1998,9 @@ class AutomationService:
                     probe_id,
                     code,
                     status="SUCCEEDED",
-                    message="域名与卖家身份核验通过",
+                    message=("域名与卖家身份核验通过；付款页面结构待适配"
+                             if site_result.payment_capability == "UNKNOWN" else "域名与卖家身份核验通过"),
+                    **site_result.to_payload(),
                 )
 
         async with self._marketplace_setup_guard:
@@ -1818,6 +2026,7 @@ class AutomationService:
                 "message": message,
             }
 
+
     def _persist_store_setup_identity(
         self,
         *,
@@ -1825,6 +2034,7 @@ class AutomationService:
         seller_id: str,
         selector: ProfileSelector,
         marketplace_code: str,
+        probe_id: str | None = None,
     ) -> tuple[str, str, bool, bool]:
         """Bind an identity proven by the unified live Ziniao probe.
 
@@ -1836,6 +2046,8 @@ class AutomationService:
         being attributed to a different Ziniao environment.
         """
 
+        if probe_id is not None:
+            return self.setup_records.bind_identity(probe_id, seller_id, selector, marketplace_code)
         normalized = " ".join(str(seller_id or "").split())
         if not normalized or len(normalized) > 120:
             raise RuntimeError("卖家身份检测结果为空或长度异常，结果未保存")
@@ -1879,6 +2091,7 @@ class AutomationService:
             session.commit()
             return "CREATED", normalized, True, True
 
+
     async def _set_store_setup_identity(
         self, probe_id: str, **changes: Any
     ) -> None:
@@ -1886,7 +2099,11 @@ class AutomationService:
             probe = self._marketplace_setup_probes.get(probe_id)
             if probe is None or not probe.unified or probe.identity is None:
                 raise RuntimeError("店铺统一建档身份记录已释放")
+            if changes.get("status") in {"CHECKING", "SUCCEEDED"}:
+                probe.identity.pop("reason_code", None)
+                probe.identity.pop("diagnostics", None)
             probe.identity.update(changes)
+        self._persist_setup_progress(probe_id)
 
     async def _store_setup_identity_snapshot(
         self, probe_id: str
@@ -1903,7 +2120,8 @@ class AutomationService:
             return [dict(item) for item in (probe.marketplaces or ())]
 
     async def _publish_store_setup_identity_auth_wait(
-        self, probe_id: str, code: str, message: str
+        self, probe_id: str, code: str, message: str, *,
+        diagnostic: SetupDiagnostic | None = None,
     ) -> None:
         async with self._marketplace_setup_guard:
             probe = self._marketplace_setup_probes.get(probe_id)
@@ -1911,11 +2129,19 @@ class AutomationService:
                 raise RuntimeError("店铺统一建档身份记录已释放")
             probe.state = "WAITING_AUTH"
             probe.message = message
+            if diagnostic is not None:
+                probe.last_diagnostic = diagnostic
+                self._log_setup_diagnostic(probe_id, diagnostic)
             probe.identity.update(
                 status="WAITING_AUTH",
                 marketplace_code=code,
                 message=message,
             )
+
+            if diagnostic is not None:
+                probe.identity["diagnostics"] = diagnostic.to_payload()
+                probe.identity["reason_code"] = diagnostic.reason_code
+        self._persist_setup_progress(probe_id)
 
     async def _set_marketplace_setup_site(
         self, probe_id: str, code: str, **changes: Any
@@ -1926,7 +2152,11 @@ class AutomationService:
                 raise RuntimeError("付款账户自动建档记录已释放")
             for site in probe.marketplaces or ():
                 if site.get("code") == code:
+                    if changes.get("status") in {"CHECKING", "SUCCEEDED"}:
+                        site.pop("reason_code", None)
+                        site.pop("diagnostics", None)
                     site.update(changes)
+                    self._persist_setup_progress(probe_id)
                     return
             raise RuntimeError(f"付款账户自动建档不包含站点 {code}")
 
@@ -1940,7 +2170,8 @@ class AutomationService:
             )
 
     async def _publish_marketplace_setup_auth_wait(
-        self, probe_id: str, code: str, message: str
+        self, probe_id: str, code: str, message: str, *,
+        diagnostic: SetupDiagnostic | None = None,
     ) -> None:
         async with self._marketplace_setup_guard:
             probe = self._marketplace_setup_probes.get(probe_id)
@@ -1948,10 +2179,17 @@ class AutomationService:
                 raise RuntimeError("付款账户自动建档记录已释放")
             probe.state = "WAITING_AUTH"
             probe.message = message
+            if diagnostic is not None:
+                probe.last_diagnostic = diagnostic
+                self._log_setup_diagnostic(probe_id, diagnostic)
             for site in probe.marketplaces or ():
                 if site.get("code") == code:
                     site.update(status="WAITING_AUTH", message=message)
+                    if diagnostic is not None:
+                        site["diagnostics"] = diagnostic.to_payload()
+                        site["reason_code"] = diagnostic.reason_code
                     break
+        self._persist_setup_progress(probe_id)
 
     async def _finish_marketplace_setup_probe(
         self, probe_id: str, task: asyncio.Task[dict[str, Any]]
@@ -1961,6 +2199,13 @@ class AutomationService:
             if probe is None:
                 return
             self._finalize_marketplace_setup_probe_locked(probe, task)
+            saved = self.setup_records.get(probe.store_id, probe.id)
+            if saved["lifecycle"] != "FINISHED":
+                # create_task may be cancelled before its coroutine executes.
+                cleanup = "CONFIRMED" if saved["phase"] == "ACQUIRE_SESSION" and saved["lifecycle"] == "QUEUED" else "UNCONFIRMED"
+                self.setup_records.finish(probe.id, outcome=probe.state if probe.state in {"CANCELLED", "FAILED"} else "FAILED",
+                    cleanup=cleanup, reason="SETUP_CANCELLED" if task.cancelled() else "SETUP_FAILED")
+
 
     def _finalize_marketplace_setup_probe_locked(
         self,
@@ -2019,6 +2264,12 @@ class AutomationService:
             probe.result = None
             probe.state = "FAILED"
             probe.message = self._marketplace_setup_failure_message(exc)
+            if isinstance(exc, SetupRejected):
+                probe.last_diagnostic = exc.diagnostic
+                self._log_setup_diagnostic(probe.id, exc.diagnostic)
+                if probe.identity is not None and probe.identity.get("status") != "SUCCEEDED":
+                    probe.identity.update(reason_code=exc.diagnostic.reason_code,
+                                          diagnostics=exc.diagnostic.to_payload())
             terminal_site_message = probe.message
 
         for site in probe.marketplaces or ():
@@ -2062,22 +2313,11 @@ class AutomationService:
             return "对应紫鸟店铺页面连接已中断；本次检测已结束，请重新发起检测"
         return detail or "付款账户自动建档失败"
 
-    async def get_marketplace_setup_probe(
-        self, store_id: int, probe_id: str
-    ) -> dict[str, Any]:
-        async with self._marketplace_setup_guard:
-            probe = self._marketplace_setup_probes.get(str(probe_id))
-            if probe is None or probe.store_id != int(store_id):
-                raise LookupError("付款账户自动建档记录不存在或不属于该店铺")
-            if probe.task.done():
-                self._finalize_marketplace_setup_probe_locked(probe, probe.task)
-            return self._marketplace_setup_payload_locked(probe)
+    async def get_marketplace_setup_probe(self, store_id: int, probe_id: str) -> dict[str, Any]:
+        return self.setup_records.get(store_id, probe_id, None)
 
-    async def get_store_setup_probe(
-        self, store_id: int, probe_id: str
-    ) -> dict[str, Any]:
-        await self._require_unified_store_setup_probe(store_id, probe_id)
-        return await self.get_marketplace_setup_probe(store_id, probe_id)
+    async def get_store_setup_probe(self, store_id: int, probe_id: str) -> dict[str, Any]:
+        return self.setup_records.get(store_id, probe_id, 'unified')
 
     async def get_active_store_setup_probe(
         self, store_id: int
@@ -2106,28 +2346,15 @@ class AutomationService:
                 return None
             return self._marketplace_setup_payload_locked(probe)
 
-    def _marketplace_setup_payload_locked(
-        self, probe: _MarketplaceSetupProbe
-    ) -> dict[str, Any]:
-        if probe.result is not None and probe.state in _MARKETPLACE_SETUP_TERMINAL_STATES:
-            return dict(probe.result)
-        remaining = max(0, int(probe.expires_at - asyncio.get_running_loop().time()))
-        payload = {
-            "status": probe.state,
-            "probe_id": probe.id,
-            "store_id": probe.store_id,
-            "seller_id": probe.seller_id,
-            "expires_in_seconds": remaining,
-            "marketplaces": [dict(item) for item in (probe.marketplaces or ())],
-            "message": probe.message,
-        }
-        if probe.identity is not None:
-            payload["identity"] = dict(probe.identity)
-        return payload
+    def _marketplace_setup_payload_locked(self, probe: _MarketplaceSetupProbe) -> dict[str, Any]:
+        return self.setup_records.get(probe.store_id, probe.id)
 
     async def continue_marketplace_setup_probe(
         self, store_id: int, probe_id: str
     ) -> dict[str, Any]:
+        saved = self.setup_records.get(store_id, probe_id)
+        if saved["lifecycle"] == "FINISHED":
+            return saved
         async with self._marketplace_setup_guard:
             probe = self._marketplace_setup_probes.get(str(probe_id))
             if probe is None or probe.store_id != int(store_id):
@@ -2141,6 +2368,7 @@ class AutomationService:
                 raise RuntimeError(f"当前自动建档状态为 {probe.state}，无需继续")
             probe.state = "CHECKING"
             probe.message = "正在使用原紫鸟店铺窗口尝试自动登录并继续检测"
+            self._persist_setup_progress(probe_id)
         signal = getattr(self.ziniao_controller, "continue_auth", None)
         if not callable(signal) or not await signal(
             self._marketplace_setup_auth_key(probe_id)
@@ -2160,6 +2388,7 @@ class AutomationService:
             return await self.get_marketplace_setup_probe(store_id, probe_id)
         return await self.get_marketplace_setup_probe(store_id, probe_id)
 
+
     async def continue_store_setup_probe(
         self, store_id: int, probe_id: str
     ) -> dict[str, Any]:
@@ -2169,6 +2398,9 @@ class AutomationService:
     async def cancel_marketplace_setup_probe(
         self, store_id: int, probe_id: str
     ) -> dict[str, Any]:
+        saved = self.setup_records.get(store_id, probe_id)
+        if saved["lifecycle"] == "FINISHED":
+            return saved
         async with self._marketplace_setup_guard:
             probe = self._marketplace_setup_probes.get(str(probe_id))
             if probe is None or probe.store_id != int(store_id):
@@ -2193,23 +2425,15 @@ class AutomationService:
         await asyncio.sleep(0)
         return await self.get_marketplace_setup_probe(store_id, probe_id)
 
+
     async def cancel_store_setup_probe(
         self, store_id: int, probe_id: str
     ) -> dict[str, Any]:
         await self._require_unified_store_setup_probe(store_id, probe_id)
         return await self.cancel_marketplace_setup_probe(store_id, probe_id)
 
-    async def _require_unified_store_setup_probe(
-        self, store_id: int, probe_id: str
-    ) -> None:
-        async with self._marketplace_setup_guard:
-            probe = self._marketplace_setup_probes.get(str(probe_id))
-            if (
-                probe is None
-                or probe.store_id != int(store_id)
-                or not probe.unified
-            ):
-                raise LookupError("店铺统一建档记录不存在或不属于该店铺")
+    async def _require_unified_store_setup_probe(self, store_id: int, probe_id: str) -> None:
+        self.setup_records.get(store_id, probe_id, "unified")
 
     @staticmethod
     def _marketplace_setup_auth_key(probe_id: str) -> str:

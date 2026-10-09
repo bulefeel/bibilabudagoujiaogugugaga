@@ -420,6 +420,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录前无法建立可信标签页快照，已停止自动点击",
                 kind="sign_in",
+                reason_code="AUTH_SNAPSHOT_UNAVAILABLE",
+                stage='session_snapshot',
+                page_category="LOGIN",
             )
         business_page = self.resolve_business_page(
             page,
@@ -457,6 +460,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 原登录标签页已关闭且未找到唯一业务标签页，已停止自动点击",
                     kind="sign_in",
+                    reason_code="AUTH_PAGE_CLOSED",
+                    stage='classify',
+                    page_category="CLOSED_PAGE",
                 )
         pending_action: _LoginAction | None = None
         validation_rounds = 0
@@ -504,6 +510,9 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 原登录标签页已关闭且未找到唯一业务标签页，已停止自动点击",
                         kind="sign_in",
+                        reason_code="AUTH_PAGE_CLOSED",
+                        stage='classify',
+                        page_category="CLOSED_PAGE",
                     )
             if pending_action is None:
                 action = await self._classify(page, expected_host=expected_host)
@@ -534,6 +543,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录页面不属于可自动推进的受支持步骤",
                     kind="sign_in",
+                    reason_code="AUTH_PAGE_UNSUPPORTED",
+                    stage='classify',
+                    page_category="LOGIN",
                 )
 
             if action in {
@@ -547,6 +559,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录验证已达到最多三轮，请人工检查当前页面",
                     kind="challenge",
+                    reason_code="AUTH_RETRY_EXHAUSTED",
+                    stage='classify',
+                    page_category="LOGIN",
                 )
 
             (
@@ -587,6 +602,9 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 登录后进入了未列入白名单的页面，已停止自动接管",
                         kind="sign_in",
+                        reason_code="AUTH_HANDOFF_UNTRUSTED",
+                        stage='classify',
+                        page_category="BUSINESS_HANDOFF",
                     )
                 return self._advanced_result(
                     page,
@@ -600,6 +618,9 @@ class AmazonLoginAdvancer:
         raise HumanAuthRequired(
             "Amazon 登录自动推进已达到有限轮次，请人工检查当前页面",
             kind="sign_in",
+            reason_code="AUTH_RETRY_EXHAUSTED",
+            stage='classify',
+            page_category="LOGIN",
         )
 
     def _business_baseline_for(
@@ -691,6 +712,11 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon OTP 在首次提交前发生变化、过期或尚未稳定",
                 kind="challenge",
+                reason_code="AUTH_INPUT_NOT_READY",
+                stage=action,
+                page_category="LOGIN",
+                action=action,
+                attempts=0,
             )
 
         dispatched_any = False
@@ -718,6 +744,11 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录按钮已完成有限自动重试，页面仍未进入下一步",
                     kind="challenge" if action == "otp_signin" else "sign_in",
+                    reason_code="AUTH_RETRY_EXHAUSTED",
+                    stage=action,
+                    page_category="LOGIN",
+                    action=action,
+                    attempts=self._max_action_attempts,
                 ) from exc
 
             if outcome in {"dispatched", "uncertain"}:
@@ -770,6 +801,11 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 原登录标签页已关闭且未找到唯一业务标签页，已停止自动点击",
                         kind="sign_in",
+                        reason_code="AUTH_PAGE_CLOSED",
+                        stage=action,
+                        page_category="CLOSED_PAGE",
+                        action=action,
+                        attempts=local_attempt,
                     )
             current_url = self._safe_page_url(page)
             if not self.is_supported_login_url(
@@ -784,6 +820,11 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 登录后进入了未列入白名单的页面，已停止自动接管",
                         kind="sign_in",
+                        reason_code="AUTH_HANDOFF_UNTRUSTED",
+                        stage=action,
+                        page_category="BUSINESS_HANDOFF",
+                        action=action,
+                        attempts=local_attempt,
                     )
                 _logger.info(
                     "Amazon assisted login page transition: from=%s to=business",
@@ -822,6 +863,11 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon OTP 已变化、过期或更换输入框，本次不自动重试",
                     kind="challenge",
+                    reason_code="AUTH_PAGE_CHANGED",
+                    stage=action,
+                    page_category="LOGIN",
+                    action=action,
+                    attempts=local_attempt,
                 )
             next_action = await self._classify(
                 page,
@@ -881,6 +927,11 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 原登录标签页已关闭且未找到唯一业务标签页，已停止自动点击",
                         kind="sign_in",
+                        reason_code="AUTH_PAGE_CLOSED",
+                        stage=action,
+                        page_category="CLOSED_PAGE",
+                        action=action,
+                        attempts=local_attempt,
                     )
             current_url = self._safe_page_url(page)
             if not self.is_supported_login_url(
@@ -895,6 +946,11 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 登录后进入了未列入白名单的页面，已停止自动接管",
                         kind="sign_in",
+                        reason_code="AUTH_HANDOFF_UNTRUSTED",
+                        stage=action,
+                        page_category="BUSINESS_HANDOFF",
+                        action=action,
+                        attempts=local_attempt,
                     )
                 _logger.info(
                     "Amazon assisted login page transition: from=%s to=business",
@@ -932,6 +988,11 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon OTP 已变化、过期或更换输入框，本次不自动重试",
                     kind="challenge",
+                    reason_code="AUTH_PAGE_CHANGED",
+                    stage=action,
+                    page_category="LOGIN",
+                    action=action,
+                    attempts=local_attempt,
                 )
             next_action, left_login_flow = await self._settled_classification(
                 page,
@@ -947,6 +1008,11 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 登录后进入了未列入白名单的页面，已停止自动接管",
                         kind="sign_in",
+                        reason_code="AUTH_HANDOFF_UNTRUSTED",
+                        stage=action,
+                        page_category="BUSINESS_HANDOFF",
+                        action=action,
+                        attempts=local_attempt,
                     )
                 _logger.info(
                     "Amazon assisted login page transition: from=%s to=business",
@@ -968,6 +1034,11 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录点击后页面处于无法确认的过渡状态，请人工检查",
                     kind="challenge" if action == "otp_signin" else "sign_in",
+                    reason_code="AUTH_PAGE_CHANGED",
+                    stage=action,
+                    page_category="LOGIN",
+                    action=action,
+                    attempts=local_attempt,
                 )
 
             if local_attempt < self._max_action_attempts:
@@ -992,6 +1063,11 @@ class AmazonLoginAdvancer:
             failure = HumanAuthRequired(
                 f"Amazon {label}自动重试后页面仍未进入下一步，请人工检查",
                 kind="challenge" if action == "otp_signin" else "sign_in",
+                reason_code="AUTH_RETRY_EXHAUSTED",
+                stage=action,
+                page_category="LOGIN",
+                action=action,
+                attempts=local_attempt,
             )
             if last_error is not None:
                 raise failure from last_error
@@ -1185,11 +1261,19 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录页面在点击前已切换，已停止本次自动点击",
                 kind="challenge" if action == "otp_signin" else "sign_in",
+                reason_code="AUTH_PAGE_CHANGED",
+                stage=action,
+                page_category="LOGIN",
+                action=action,
             )
         if await self._visible_unsupported_auth_content(page):
             raise HumanAuthRequired(
                 "Amazon 登录页面在点击前出现其他验证、账户选择或明确错误",
                 kind="challenge" if action == "otp_signin" else "sign_in",
+                reason_code="AUTH_CHALLENGE",
+                stage=action,
+                page_category="LOGIN",
+                action=action,
             )
 
         if action == "otp_signin":
@@ -1197,6 +1281,10 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon OTP 在点击前发生变化、过期或更换输入框",
                     kind="challenge",
+                    reason_code="AUTH_PAGE_CHANGED",
+                    stage=action,
+                    page_category="LOGIN",
+                    action=action,
                 )
             return
 
@@ -1217,6 +1305,10 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 密码登录页在点击前已变化，已停止本次自动点击",
                     kind="sign_in",
+                    reason_code="AUTH_PAGE_CHANGED",
+                    stage=action,
+                    page_category="LOGIN",
+                    action=action,
                 )
             # ⚠️ 这一条**必须和上面四条分开**。上面四条说的是「页面坏了/说不清」，
             # 只能转人工；而托管 Passkey 出现说的是「该走的路变了」，旁边就有一条
@@ -1256,6 +1348,10 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 邮箱登录页在点击前已变化，已停止本次自动点击",
                 kind="sign_in",
+                reason_code="AUTH_PAGE_CHANGED",
+                stage=action,
+                page_category="LOGIN",
+                action=action,
             )
 
     async def advance_or_raise(
@@ -1324,6 +1420,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录标签页列表暂时不可读取，已停止自动点击",
                 kind="sign_in",
+                reason_code="AUTH_SNAPSHOT_UNAVAILABLE",
+                stage='business_handoff',
+                page_category="LOGIN",
             ) from exc
 
         candidates: list[Any] = []
@@ -1388,6 +1487,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录后新标签页的站点或页面不属于当前白名单，已停止自动接管",
                 kind="sign_in",
+                reason_code="AUTH_HANDOFF_UNTRUSTED",
+                stage='business_handoff',
+                page_category="BUSINESS_HANDOFF",
             )
 
         if (
@@ -1398,6 +1500,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "同一紫鸟环境出现多个可用的 Seller Central 业务标签页，已停止自动接管",
                 kind="sign_in",
+                reason_code="AUTH_HANDOFF_AMBIGUOUS",
+                stage='business_handoff',
+                page_category="BUSINESS_HANDOFF",
             )
         return candidates[0] if candidates else None
 
@@ -1430,6 +1535,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录标签页列表暂时不可读取，已停止自动点击",
                 kind="sign_in",
+                reason_code="AUTH_SNAPSHOT_UNAVAILABLE",
+                stage='business_handoff',
+                page_category="LOGIN",
             ) from exc
         pending = 0
         for candidate in pages:
@@ -1457,6 +1565,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "同一紫鸟环境出现多个尚未完成跳转的新标签页，已停止自动接管",
                 kind="sign_in",
+                reason_code="AUTH_HANDOFF_AMBIGUOUS",
+                stage='business_handoff',
+                page_category="BUSINESS_HANDOFF",
             )
         return pending == 1
 
@@ -1609,6 +1720,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录后同时出现同标签页和新标签页业务入口，已停止自动接管",
                     kind="sign_in",
+                    reason_code="AUTH_HANDOFF_AMBIGUOUS",
+                    stage='business_handoff',
+                    page_category="BUSINESS_HANDOFF",
                 )
             if source_is_business:
                 return source_page
@@ -1619,6 +1733,9 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon 新标签页在限定时间内仍未完成跳转，已停止重复点击",
                         kind="sign_in",
+                        reason_code="AUTH_HANDOFF_TIMEOUT",
+                        stage='business_handoff',
+                        page_category="BUSINESS_HANDOFF",
                     )
                 return None
             pause_ms = min(250, timeout_ms - elapsed_ms)
@@ -1664,6 +1781,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录页包含密码以外的验证、账户选择或异常内容",
                 kind=auth_kind,
+                reason_code="AUTH_CHALLENGE",
+                stage='classify',
+                page_category="LOGIN",
             )
 
         # Ziniao renders its managed-account Passkey chooser in a *closed*
@@ -1723,6 +1843,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 密码登录页包含验证码、账户选择或明确错误",
                     kind="sign_in",
+                    reason_code="AUTH_CHALLENGE",
+                    stage='password_signin',
+                    page_category="LOGIN",
                 )
             identifiers = await self._visible_elements(
                 page.locator(self._identifier_selector)
@@ -1732,6 +1855,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 密码登录页输入框数量或类型存在歧义",
                     kind="sign_in",
+                    reason_code="AUTH_ACTION_AMBIGUOUS",
+                    stage='password_signin',
+                    page_category="LOGIN",
                 )
             if not await self._wait_for_prefill(
                 page,
@@ -1742,6 +1868,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "紫鸟尚未填好 Amazon 登录密码",
                     kind="sign_in",
+                    reason_code="AUTH_INPUT_NOT_READY",
+                    stage='password_signin',
+                    page_category="LOGIN",
                 )
             # 这里**刻意不再**探一次托管 Passkey。分类与点击之间还隔着 2–3 秒的
             # pacing，逐个等待点补判断是打地鼠；真正的保证在点击前的复查里：
@@ -1756,6 +1885,9 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 登录页包含不支持的人工处理内容",
                 kind=auth_kind,
+                reason_code="AUTH_CHALLENGE",
+                stage='classify',
+                page_category="LOGIN",
             )
 
         # Anything outside the explicitly modelled screens returns to a
@@ -1770,6 +1902,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录页包含密码、验证、账户选择或异常内容",
                     kind="sign_in",
+                    reason_code="AUTH_CHALLENGE",
+                    stage='classify',
+                    page_category="LOGIN",
                 )
         # Amazon commonly retains hidden inputs and alert containers from a
         # previous auth stage.  Only controls actually presented to the user
@@ -1792,21 +1927,37 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "紫鸟尚未填好邮箱或手机号",
                     kind="sign_in",
+                    reason_code="AUTH_INPUT_NOT_READY",
+                    stage='continue',
+                    page_category="LOGIN",
                 )
             return "continue"
         if path == "/ap/mfa" and otp_count == 1 and identifier_count == 0:
             if not await self._wait_for_stable_otp(
                 page, expected_host=expected_host
             ):
+                if self.is_supported_business_url(
+                    str(getattr(page, "url", "") or ""),
+                    expected_host=self._business_host(page, expected_host),
+                ):
+                    # The page advanced while waiting; never classify a
+                    # successful business landing as an empty-code failure.
+                    return None
                 raise HumanAuthRequired(
                     "紫鸟尚未填好并稳定保持一次性验证码",
                     kind="challenge",
+                    reason_code="AUTH_INPUT_NOT_READY",
+                    stage='otp_signin',
+                    page_category="LOGIN",
                 )
             return "otp_signin"
         if identifier_count or otp_count:
             raise HumanAuthRequired(
                 "Amazon 登录输入框数量或类型存在歧义",
                 kind="sign_in",
+                reason_code="AUTH_ACTION_AMBIGUOUS",
+                stage='classify',
+                page_category="LOGIN",
             )
         return None
 
@@ -1864,6 +2015,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon OTP 等待期间出现验证码、账户选择或明确错误",
                     kind="challenge",
+                    reason_code="AUTH_CHALLENGE",
+                    stage='otp_signin',
+                    page_category="LOGIN",
                 )
 
             otp_fields = await self._visible_elements(
@@ -2151,11 +2305,19 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon OTP 页面已变化，请人工检查当前页面",
                         kind="challenge",
+                        reason_code="AUTH_PAGE_CHANGED",
+                        stage=action,
+                        page_category="LOGIN",
+                        action=action,
                     )
                 if await self._visible_unsupported_auth_content(page):
                     raise HumanAuthRequired(
                         "Amazon OTP 提交前出现验证码、账户选择或明确错误",
                         kind="challenge",
+                        reason_code="AUTH_CHALLENGE",
+                        stage=action,
+                        page_category="LOGIN",
+                        action=action,
                     )
                 otp_fields = await self._visible_elements(
                     page.locator(self._otp_selector)
@@ -2166,6 +2328,10 @@ class AmazonLoginAdvancer:
                     raise HumanAuthRequired(
                         "Amazon OTP 在提交前发生变化、过期或尚未稳定",
                         kind="challenge",
+                        reason_code="AUTH_INPUT_NOT_READY",
+                        stage=action,
+                        page_category="LOGIN",
+                        action=action,
                     )
 
             candidates = page.locator(selector)
@@ -2209,6 +2375,10 @@ class AmazonLoginAdvancer:
         raise HumanAuthRequired(
             "Amazon 登录操作按钮缺失、禁用或不唯一",
             kind="challenge" if action == "otp_signin" else "sign_in",
+            reason_code="AUTH_ACTION_UNAVAILABLE",
+            stage=action,
+            page_category="LOGIN",
+            action=action,
         )
 
     async def _unique_structural_otp_signin_control(
@@ -2330,6 +2500,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录等待期间出现其他验证、账户选择或异常内容",
                     kind="sign_in",
+                    reason_code="AUTH_CHALLENGE",
+                    stage='managed_passkey',
+                    page_category="LOGIN",
                 )
 
             pause_ms = min(
@@ -2357,6 +2530,9 @@ class AmazonLoginAdvancer:
                 raise HumanAuthRequired(
                     "Amazon 登录等待期间出现其他验证、账户选择或异常内容",
                     kind="sign_in",
+                    reason_code="AUTH_CHALLENGE",
+                    stage='managed_passkey',
+                    page_category="LOGIN",
                 )
             if await self._managed_passkey_available(
                 page, expected_host=expected_host
@@ -2415,6 +2591,10 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 两步验证方式页面没有读到任何选项",
                 kind="challenge",
+                reason_code="AUTH_ACTION_UNAVAILABLE",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
             )
 
         def _text(option: Any) -> str:
@@ -2433,16 +2613,29 @@ class AmazonLoginAdvancer:
                 "Amazon 两步验证方式页面无法唯一确定「认证器应用」选项，"
                 f"匹配到 {len(wanted)} 项，已停止自动点击",
                 kind="challenge",
+                reason_code="AUTH_ACTION_AMBIGUOUS",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
+                candidate_count=len(wanted),
             )
         target_index = int(wanted[0].get("index", -1))
         if target_index < 0:
             raise HumanAuthRequired(
-                "Amazon 两步验证方式选项缺少可定位的序号", kind="challenge"
+                "Amazon 两步验证方式选项缺少可定位的序号", kind="challenge",
+                reason_code="AUTH_ACTION_UNAVAILABLE",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
             )
 
         if not await page.evaluate(_SELECT_OTP_METHOD, target_index):
             raise HumanAuthRequired(
-                "Amazon 两步验证方式选项无法选中", kind="challenge"
+                "Amazon 两步验证方式选项无法选中", kind="challenge",
+                reason_code="AUTH_ACTION_UNAVAILABLE",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
             )
         await self._paced_pause(page)
 
@@ -2454,6 +2647,10 @@ class AmazonLoginAdvancer:
             raise HumanAuthRequired(
                 "Amazon 两步验证方式选项的选中状态与预期不符，已停止自动点击",
                 kind="challenge",
+                reason_code="AUTH_ACTION_UNAVAILABLE",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
             )
         # ⚠️ The check that actually protects the seller's phone.
         if self._otp_method_delivery.search(_text(checked[0])):
@@ -2461,6 +2658,10 @@ class AmazonLoginAdvancer:
                 "Amazon 两步验证当前选中的是短信/WhatsApp/电话方式，"
                 "自动化不会替卖家发起，请人工处理",
                 kind="challenge",
+                reason_code="AUTH_CHALLENGE",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
             )
 
         candidates = await self._visible_elements(
@@ -2485,6 +2686,11 @@ class AmazonLoginAdvancer:
                 f"可见候选 {len(candidates)} 个、文案命中 {len(submits)} 个，"
                 "已停止自动点击",
                 kind="challenge",
+                reason_code="AUTH_ACTION_UNAVAILABLE",
+                stage='otp_method_choice',
+                page_category="LOGIN",
+                action='otp_method_choice',
+                candidate_count=len(submits),
             )
         await submits[0].click()
         _logger.info("Amazon assisted login selected authenticator and sent OTP request")

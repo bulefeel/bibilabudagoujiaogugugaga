@@ -150,3 +150,35 @@ async def test_api_error_does_not_include_password() -> None:
         await client.get_browser_list()
     await client.close()
     assert "SUPER_SECRET" not in str(caught.value)
+
+
+@pytest.mark.parametrize("payload", [
+    {"statusCode": 0},
+    {"statusCode": 0, "data": {}},
+    {"statusCode": 0, "data": [None]},
+    {"statusCode": 0, "data": [{"browserOauth": {"bad": "type"}}]},
+    {"statusCode": 0, "data": [{"browserId": True}]},
+    {"statusCode": 0, "data": [{"browserName": "missing identifier"}]},
+    {"statusCode": 0, "data": [{"browserId": 1}], "total": 2},
+    {"statusCode": 0, "data": [], "hasMore": True},
+    {"statusCode": 0, "data": [], "total": -1},
+    {"statusCode": 0, "data": [{"browserId": 1},{"browserId": 1}]},
+    {"statusCode": 0, "data": [], "list": [{"browserId": 1}]},
+])
+@pytest.mark.asyncio
+async def test_sync_deletion_requires_an_explicit_complete_valid_list(payload):
+    client=ZiniaoClient(ZiniaoClientConfig(),transport=httpx.MockTransport(lambda _:httpx.Response(200,json=payload)))
+    try:
+        with pytest.raises(ZiniaoApiError,match="INCOMPLETE_LIST"):
+            await client.get_browser_list()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_empty_complete_browser_list_is_not_a_network_failure():
+    client=ZiniaoClient(ZiniaoClientConfig(),transport=httpx.MockTransport(lambda _:httpx.Response(200,json={"statusCode":0,"data":{"list":[],"total":0}})))
+    try:
+        assert await client.get_browser_list()==[]
+    finally:
+        await client.close()

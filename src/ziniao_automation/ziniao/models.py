@@ -99,6 +99,7 @@ class ZiniaoBrowserHandle:
     _closed: bool = field(default=False, repr=False)
     _paused: bool = field(default=False, repr=False)
     _closing: bool = field(default=False, repr=False)
+    cleanup_confirmed: bool = field(default=False, repr=False)
 
     @property
     def browser_oauth(self) -> str | None:

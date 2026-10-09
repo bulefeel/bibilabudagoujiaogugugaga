@@ -308,6 +308,7 @@ def _serve_inner() -> int:
             port=8765,
             access_log=False,
             log_config=None,
+            proxy_headers=False,
         )
     except (KeyboardInterrupt, SystemExit):
         raise

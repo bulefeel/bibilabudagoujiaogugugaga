@@ -25,9 +25,9 @@
   和同一个 class），而页面上唯一的 marketplace id（``A1PA6795UKMFR9``）只出现在
   ``ue_mid`` / ``ObfuscatedMarketplaceId`` 里——那是**当前页面自己**的站点，
   不是逐行的；「德國」那颗按钮往上六层祖先一个 id 都没有。
-  既然只能用文案，就必须 fail-closed：**整串精确相等 + 命中必须唯一**，
-  否则一下都不点。「日本 (待註冊)」因此天然被排除，那正好是「账号根本没开这个
-  站点」和「开了只是没选定」的分界。
+  2026-09-27三家真实页面补充：账号与国家按钮同类，必须先按账号树层级分开。
+  国家按**完整名称 + 白名单状态后缀 + 唯一候选**判断；当前与可用可选，
+  待注册、禁用、未知状态不选。没有匹配只表示入口未匹配，不推断未开通。
 * **确认按钮**用 ``data-test="confirm-selection"``，语言无关，不碰
   ``label="選取帳戶"`` 那套繁/简/英。
 * 两步各有自己的**结果判据**：第一步盯选中态，第二步盯落地路径。
@@ -36,10 +36,17 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 import logging
 from typing import Any, Mapping
 from urllib.parse import parse_qs, urlparse
+
+from .setup_diagnostics import classify_switch_landing
+from .amazon_switcher_contract import (
+    MARKETPLACE_BUTTON_SELECTOR, AccountCandidate, MarketplaceCandidate,
+    SwitcherSnapshot, choose_marketplace, read_switcher_snapshot,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -48,7 +55,7 @@ logger = logging.getLogger(__name__)
 ACCOUNT_SWITCHER_PATH_PREFIX = "/account-switcher"
 
 # 站点按钮的选择器。语义 class，不是构建期哈希（2026-09-18 实地读的）。
-MARKETPLACE_BUTTON_SELECTOR = "button.full-page-account-switcher-account-details"
+# The v1 tree selector separates countries from identically styled account rows.
 
 # 选中之后按钮会拿到这个 class。这是第一步的结果判据。
 SELECTED_CLASS = "full-page-account-switcher-account-selected"
@@ -75,15 +82,8 @@ MARKETPLACE_NAMES: Mapping[str, frozenset[str]] = {
 }
 
 
-# ⚠️ JS 只**抓**不**判**。「整串精确相等 + 命中必须唯一」是整个模块唯一的 fail-closed
-# 闸,放在 JS 里的话测试替身根本不会执行它(2026-09-23 自审抓到:它从来没被测过)。
-# 所以 JS 只回按钮文字,判断在 Python 的 ``pick_marketplace`` 里做。
-
-# ① 全部站点按钮的文字(空白压成单个空格)。
-_LIST_BUTTONS = r"""
-(selector) => [...document.querySelectorAll(selector)]
-  .map(b => (b.innerText || '').split(/\s+/).filter(Boolean).join(' '))
-"""
+# JS only reads hit-testing/selection facts. Account ownership, country names
+# and availability are decided in the pure Python tree contract above.
 
 # ② 第 index 颗按钮此刻的文字、中心坐标,以及那个坐标上最上层的元素是不是它。
 # 只抓事实;「文字还是不是目标」「是不是被挡住」由 Python 判(``_click_target``)。
@@ -101,6 +101,7 @@ _RECT_AT = r"""
     x: x,
     y: y,
     onTop: !!top && (top === button || button.contains(top)),
+    disabled: button.hasAttribute("disabled") || button.getAttribute("aria-disabled") === "true",
   };
 }
 """
@@ -134,21 +135,14 @@ _CONFIRM_RECT = r"""
 
 
 def pick_marketplace(texts: list[str], names: frozenset[str]) -> tuple[int | None, str]:
-    """在按钮文字列表里挑出目标国家:**整串精确相等**,且**恰好一个**。
-
-    返回 ``(下标, "")``;挑不出就返回 ``(None, 原因)``,调用方一下都不点。
-
-    * 「日本 (待註冊)」带后缀,整串精确匹配天然排除 —— 那正是「账号没开这个站点」
-      和「开了只是没选定」的分界。
-    * 多账号卖家的切换页里同一个国家会出现两次 → ``ambiguous``,点哪个都可能错。
-    """
-
-    hits = [index for index, text in enumerate(texts) if text in names]
-    if not hits:
+    """Compatibility pure API: exact country name plus a recognized state."""
+    snapshot = SwitcherSnapshot(
+        (AccountCandidate("fixture (current)"),),
+        tuple(MarketplaceCandidate(i, 0, text) for i, text in enumerate(texts)), True,
+    )
+    if not texts:
         return None, "not_offered"
-    if len(hits) > 1:
-        return None, "ambiguous"
-    return hits[0], ""
+    return choose_marketplace(snapshot, names)
 
 
 def _click_target(rect: Mapping[str, Any], target_text: str) -> tuple[bool, str]:
@@ -160,6 +154,8 @@ def _click_target(rect: Mapping[str, Any], target_text: str) -> tuple[bool, str]
 
     if rect.get("text") != target_text:
         return False, "list_changed"
+    if rect.get("disabled"):
+        return False, "unavailable"
     if not rect.get("onTop"):
         return False, "obstructed"
     return True, ""
@@ -173,6 +169,7 @@ class SwitchOutcome:
     reason: str = ""
     offered: int = 0
     landed_url: str = ""
+    page_category: str = "UNKNOWN_PAGE"
 
 
 class AmazonAccountSwitcher:
@@ -182,10 +179,26 @@ class AmazonAccountSwitcher:
         settle_seconds: float = 2.0,
         timeout_seconds: float = 45.0,
         names: Mapping[str, frozenset[str]] | None = None,
+        candidate_limit: int | None = None,
+        readiness_timeout_seconds: float | None = None,
+        readiness_interval_seconds: float | None = None,
+        stable_sample_count: int = 2,
     ) -> None:
         self.settle_seconds = settle_seconds
         self.timeout_seconds = timeout_seconds
         self._names = names or MARKETPLACE_NAMES
+        if stable_sample_count < 2:
+            raise ValueError("stable_sample_count must be at least two")
+        if candidate_limit is not None and candidate_limit < 1:
+            raise ValueError("candidate_limit must be positive")
+        if readiness_timeout_seconds is not None and readiness_timeout_seconds <= 0:
+            raise ValueError("readiness_timeout_seconds must be positive")
+        if readiness_interval_seconds is not None and readiness_interval_seconds <= 0:
+            raise ValueError("readiness_interval_seconds must be positive")
+        self.candidate_limit = candidate_limit
+        self.readiness_timeout_seconds = readiness_timeout_seconds
+        self.readiness_interval_seconds = readiness_interval_seconds
+        self.stable_sample_count = stable_sample_count
 
     @staticmethod
     def is_switcher_url(url: str) -> bool:
@@ -208,6 +221,11 @@ class AmazonAccountSwitcher:
         if target.scheme or target.netloc or not target.path.startswith("/"):
             return None
         return target.path
+
+    @staticmethod
+    def _route_refusal(category: str) -> str:
+        return {"LOGIN": "auth_required", "DOMAIN_MISMATCH": "domain_mismatch",
+                "INACTIVE_ACCOUNT": "inactive_account"}.get(category, "list_changed")
 
     async def select_marketplace(
         self, page: Any, domain: str, *, expected_path: str
@@ -232,39 +250,74 @@ class AmazonAccountSwitcher:
         names = self._names.get(str(domain).lower())
         if not names:
             return SwitchOutcome(ok=False, reason="unknown_marketplace")
+        initial = classify_switch_landing(
+            str(getattr(page, "url", "") or ""),
+            domain=domain, expected_path=expected_path,
+        )
+        if initial != "SITE_SWITCHER":
+            return self._refused(page, domain, self._route_refusal(initial), 0)
 
-        # ⚠️ 等列表加载完再判。登录之后落到这一页时,账户列表是异步到达的 ——
-        # 只读一次会读到空表,于是判成「列表里没有这个国家」,而那是一句假话
-        # (09-23 自审复核)。判据:连续两次读到**同一份非空**列表。
-        texts: list[str] = []
+        snapshot = SwitcherSnapshot((), (), False)
+        previous = None
+        stable = 0
+        read_pending = False
+        interruption = None
 
         async def listed() -> bool:
-            nonlocal texts
-            current = list(
-                await page.evaluate(_LIST_BUTTONS, MARKETPLACE_BUTTON_SELECTOR)
-            )
-            settled = bool(current) and current == texts
-            texts = current
-            return settled
+            nonlocal snapshot, previous, stable, read_pending, interruption
+            category = classify_switch_landing(str(page.url), domain=domain, expected_path=expected_path)
+            if category != "SITE_SWITCHER":
+                interruption = category
+                return True
+            read_pending = True
+            snapshot = await read_switcher_snapshot(page, candidate_limit=self.candidate_limit)
+            read_pending = False
+            if snapshot.truncated:
+                return True
+            ready = snapshot.ready
+            stable = stable + 1 if ready and snapshot.fingerprint == previous else int(ready)
+            previous = snapshot.fingerprint if ready else None
+            return stable >= self.stable_sample_count
 
-        if not await self._poll(listed, page):
-            return self._refused(page, domain, "list_not_loaded", len(texts))
-        offered = len(texts)
-        index, refusal = pick_marketplace(texts, names)
+        ready = await self._poll(
+            listed, page, timeout_seconds=self.readiness_timeout_seconds,
+            interval_seconds=self.readiness_interval_seconds,
+        )
+        offered = len(snapshot.marketplaces)
+        if interruption is not None:
+            return self._refused(page, domain, self._route_refusal(interruption), offered)
+        if not ready:
+            reason = ("list_not_loaded" if read_pending or snapshot.loading else
+                      "candidate_limit" if snapshot.truncated else
+                      "layout_unknown" if not snapshot.layout_known else "list_not_loaded")
+            return self._refused(page, domain, reason, offered)
+        index, refusal = choose_marketplace(snapshot, names)
         if index is None:
             return self._refused(page, domain, refusal, offered)
-        target_text = texts[index]
-
-        rect = await page.evaluate(
-            _RECT_AT, {"selector": MARKETPLACE_BUTTON_SELECTOR, "index": index}
+        target_text = snapshot.marketplaces[index].text
+        fresh = await asyncio.wait_for(
+            read_switcher_snapshot(page, candidate_limit=self.candidate_limit),
+            timeout=self.readiness_timeout_seconds or self.timeout_seconds,
         )
+        if fresh.fingerprint != snapshot.fingerprint:
+            return self._refused(page, domain, "list_changed", offered)
+        category = classify_switch_landing(str(page.url), domain=domain, expected_path=expected_path)
+        if category != "SITE_SWITCHER":
+            return self._refused(page, domain, self._route_refusal(category), offered)
+
+        rect = await asyncio.wait_for(page.evaluate(
+            _RECT_AT, {"selector": MARKETPLACE_BUTTON_SELECTOR, "index": index}
+        ), timeout=self.timeout_seconds)
         clickable, refusal = _click_target(rect, target_text)
         if not clickable:
             return self._refused(page, domain, refusal, offered)
         located = rect
+        category = classify_switch_landing(str(page.url), domain=domain, expected_path=expected_path)
+        if category != "SITE_SWITCHER":
+            return self._refused(page, domain, self._route_refusal(category), offered)
 
         # 第一步：点国家。它只是选中，页面不会导航。
-        await page.mouse.click(located["x"], located["y"])
+        await asyncio.wait_for(page.mouse.click(located["x"], located["y"]), timeout=self.timeout_seconds)
         selection = {"selector": MARKETPLACE_BUTTON_SELECTOR, "selectedClass": SELECTED_CLASS}
 
         async def only_target_selected() -> bool:
@@ -273,20 +326,34 @@ class AmazonAccountSwitcher:
         if not await self._poll(only_target_selected, page):
             return self._refused(page, domain, "selection_not_registered", offered)
 
+        confirmed_snapshot = await asyncio.wait_for(
+            read_switcher_snapshot(page, candidate_limit=self.candidate_limit),
+            timeout=self.readiness_timeout_seconds or self.timeout_seconds,
+        )
+        if confirmed_snapshot.fingerprint != snapshot.fingerprint:
+            return self._refused(page, domain, "list_changed", offered)
+        category = classify_switch_landing(str(page.url), domain=domain, expected_path=expected_path)
+        if category != "SITE_SWITCHER":
+            return self._refused(page, domain, self._route_refusal(category), offered)
+
         # 第二步：点确认，这一下才真的切站。
-        confirm = await page.evaluate(_CONFIRM_RECT, CONFIRM_BUTTON_SELECTOR)
+        confirm = await asyncio.wait_for(page.evaluate(_CONFIRM_RECT, CONFIRM_BUTTON_SELECTOR), timeout=self.timeout_seconds)
         if not confirm.get("ok"):
             return self._refused(
                 page, domain, str(confirm.get("reason") or "confirm_not_unique"), offered
             )
-        await page.mouse.click(confirm["x"], confirm["y"])
+        category = classify_switch_landing(str(page.url), domain=domain, expected_path=expected_path)
+        if category != "SITE_SWITCHER":
+            return self._refused(page, domain, self._route_refusal(category), offered)
+        await asyncio.wait_for(page.mouse.click(confirm["x"], confirm["y"]), timeout=self.timeout_seconds)
 
-        landed, reason = await self._wait_for_path(page, expected_path)
+        landed, reason = await self._wait_for_path(page, expected_path, domain=domain)
         if landed is None:
             return self._refused(page, domain, reason, offered)
         logger.info("account_switcher: domain=%s 已选定并落地", domain)
         return SwitchOutcome(
-            ok=True, reason="selected", offered=offered, landed_url=landed
+            ok=True, reason="selected", offered=offered, landed_url=landed,
+            page_category="TARGET_PAGE"
         )
 
     def _refused(
@@ -295,54 +362,73 @@ class AmazonAccountSwitcher:
         logger.info(
             "account_switcher: domain=%s outcome=%s offered=%d", domain, reason, offered
         )
+        current = str(getattr(page, "url", "") or "")
+        category = {
+            "inactive_account": "INACTIVE_ACCOUNT",
+            "domain_mismatch": "DOMAIN_MISMATCH",
+            "auth_required": "LOGIN",
+        }.get(reason, "UNKNOWN_PAGE")
+        if category == "UNKNOWN_PAGE":
+            try:
+                if self.is_switcher_url(current):
+                    category = "SITE_SWITCHER"
+            except ValueError:
+                category = "DOMAIN_MISMATCH"
         return SwitchOutcome(
-            ok=False,
-            reason=reason,
-            offered=offered,
-            landed_url=str(getattr(page, "url", "") or ""),
+            ok=False, reason=reason, offered=offered,
+            landed_url=current, page_category=category,
         )
 
-    async def _poll(self, check: Any, page: Any) -> bool:
-        """轮询等一个布尔判据成立。⚠️ 不用固定 sleep 赌它好了。
-
-        下限不能去掉：``settle_seconds=0`` 时 ``waited += step`` 永远加 0，
-        这个循环就再也出不来了。
-        """
-
-        step = max(self.settle_seconds, 0.05)
+    async def _poll(self, check: Any, page: Any, *,
+                    timeout_seconds: float | None = None,
+                    interval_seconds: float | None = None) -> bool:
+        """Bound both real awaits and logical polling time, including stalled CDP."""
+        budget = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        interval = self.settle_seconds if interval_seconds is None else interval_seconds
+        step = max(interval, 0.05)
         waited = 0.0
-        while True:
-            if await check():
-                return True
-            if waited >= self.timeout_seconds:
-                return False
-            await page.wait_for_timeout(int(step * 1000))
-            waited += step
+        try:
+            async with asyncio.timeout(budget + step):
+                while True:
+                    if await check():
+                        return True
+                    if waited >= budget:
+                        return False
+                    await page.wait_for_timeout(int(step * 1000))
+                    waited += step
+        except TimeoutError:
+            return False
 
     async def _wait_for_path(
-        self, page: Any, expected_path: str
+        self, page: Any, expected_path: str, *, domain: str
     ) -> tuple[str | None, str]:
-        """等页面落到 ``expected_path``。被弹去登录页就立刻停,不白等。"""
+        """Observe both origin and route; known blocking pages finish promptly."""
 
-        target = expected_path.rstrip("/")
-        bounced = False
+        def classify() -> str:
+            return classify_switch_landing(
+                str(getattr(page, "url", "") or ""),
+                domain=domain, expected_path=expected_path,
+            )
 
         async def settled() -> bool:
-            nonlocal bounced
-            path = urlparse(str(getattr(page, "url", "") or "")).path.rstrip("/")
-            if path.startswith("/ap/") or path == "/ap":
-                bounced = True
-                return True
-            return path == target
+            return classify() in {
+                "TARGET_PAGE", "LOGIN", "INACTIVE_ACCOUNT", "DOMAIN_MISMATCH",
+            }
 
         await self._poll(settled, page)
-        current = str(getattr(page, "url", "") or "")
-        if bounced:
-            return None, "auth_required"
-        if urlparse(current).path.rstrip("/") == target:
-            return current, ""
+        category = classify()
+        if category == "TARGET_PAGE":
+            return str(page.url), ""
+        if category in {"LOGIN", "INACTIVE_ACCOUNT", "DOMAIN_MISMATCH"}:
+            return None, {
+                "LOGIN": "auth_required", "INACTIVE_ACCOUNT": "inactive_account",
+                "DOMAIN_MISMATCH": "domain_mismatch",
+            }[category]
+        # Never log URL query strings or an unrecognized path (either may
+        # contain sign-in tokens, seller identifiers or arbitrary page data).
         logger.warning(
-            "account_switcher: 确认后未落地到 %s，仍在 %s", expected_path, current[:80]
+            "account_switcher: target not reached domain=%s page_category=%s",
+            domain, category,
         )
         return None, "timeout"
 

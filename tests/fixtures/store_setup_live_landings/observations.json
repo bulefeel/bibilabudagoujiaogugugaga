@@ -1,0 +1,54 @@
+{
+  "captured_date": "2026-09-27",
+  "source_kind": "actual_ziniao_url_and_diagnostic_observation",
+  "contains_page_html": false,
+  "description": "Observed URLs and fixed diagnostic fields only; no page content, account data, authentication values or query strings. Test navigation is simulated; these records alone do not prove full onboarding succeeds.",
+  "observations": [
+    {
+      "sample": "S04",
+      "method": "detect_identity",
+      "code": "CA",
+      "result": "HumanAuthRequired",
+      "diagnostic": {
+        "reason_code": "AUTH_INPUT_NOT_READY",
+        "stage": "otp_signin",
+        "action": null,
+        "attempts": null,
+        "candidate_count": null,
+        "page_category": "LOGIN"
+      },
+      "page": {
+        "host": "sellercentral.amazon.ca",
+        "path": "/ap/mfa"
+      }
+    },
+    {
+      "sample": "S06",
+      "method": "check_site",
+      "code": "UK",
+      "result": "HumanAuthRequired",
+      "diagnostic": {
+        "reason_code": "AUTH_PAGE_CHANGED",
+        "stage": "otp_signin",
+        "action": "otp_signin",
+        "attempts": 1,
+        "candidate_count": null,
+        "page_category": "LOGIN"
+      },
+      "page": {
+        "host": "sellercentral.amazon.co.uk",
+        "path": "/inactiveAccount"
+      }
+    },
+    {
+      "sample": "S09",
+      "method": "detect_identity",
+      "code": "CA",
+      "result": "TargetClosedError",
+      "page": {
+        "host": null,
+        "path": "blank"
+      }
+    }
+  ]
+}
