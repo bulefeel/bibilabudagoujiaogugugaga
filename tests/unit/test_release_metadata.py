@@ -84,6 +84,11 @@ def test_release_builder_emits_traceability_files_and_uses_the_lock() -> None:
         assert required in builder
     assert builder.count("Remove-StageGeneratedCaches $StageDir") == 2
     assert builder.count("Assert-StageSafe $StageDir") == 2
+    assert "'release-system-tmp'" in builder
+    assert "$env:TEMP = $releaseSystemTemp" in builder
+    assert "$env:TMP = $releaseSystemTemp" in builder
+    assert "$env:TEMP = $releaseTestTemp" not in builder
+    assert "@($releaseTestTemp, $releaseSystemTemp, $releaseTestCache)" in builder
     assert "暂存源码测试在 stage\\data 中生成了运行数据" in builder
     assert builder_path.read_bytes().startswith(b"\xef\xbb\xbf")
     assert (ROOT / "uv.lock").is_file()

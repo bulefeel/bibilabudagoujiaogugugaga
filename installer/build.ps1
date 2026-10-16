@@ -317,11 +317,12 @@ Write-Host ("      共 {0:N0} 个文件，{1:N1} MB" -f `
 Write-Host '[3/7] 使用暂存源码运行完整测试...'
 $releaseTestVenv = Assert-ChildPath (Join-Path $BuildDir 'release-test-venv') $BuildDir
 $releaseTestTemp = Assert-ChildPath (Join-Path $BuildDir 'release-test-tmp') $BuildDir
+$releaseSystemTemp = Assert-ChildPath (Join-Path $BuildDir 'release-system-tmp') $BuildDir
 $releaseTestCache = Assert-ChildPath (Join-Path $BuildDir 'release-test-cache') $BuildDir
 if (Test-Path -LiteralPath $releaseTestVenv) {
     Remove-Item -LiteralPath $releaseTestVenv -Recurse -Force
 }
-foreach ($testDirectory in @($releaseTestTemp, $releaseTestCache)) {
+foreach ($testDirectory in @($releaseTestTemp, $releaseSystemTemp, $releaseTestCache)) {
     if (Test-Path -LiteralPath $testDirectory) {
         Remove-Item -LiteralPath $testDirectory -Recurse -Force
     }
@@ -339,8 +340,10 @@ $env:UV_PROJECT_ENVIRONMENT = $releaseTestVenv
 $env:UV_PYTHON_INSTALL_DIR = Join-Path $ProjectRoot '.uv-python'
 $env:UV_PYTHON_PREFERENCE = 'only-managed'
 $env:UV_CACHE_DIR = Join-Path $ProjectRoot '.uv-cache'
-$env:TEMP = $releaseTestTemp
-$env:TMP = $releaseTestTemp
+# pytest deletes --basetemp when tmp_path is first requested. Browser fixtures
+# may already be running, so their OS temporary profiles must live elsewhere.
+$env:TEMP = $releaseSystemTemp
+$env:TMP = $releaseSystemTemp
 Push-Location $ProjectRoot
 try {
     & $uv python install ([string]$Toolchain.python_version)
