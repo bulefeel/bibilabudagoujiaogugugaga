@@ -204,7 +204,7 @@ class StoreMarketplace(TimestampMixin, Base):
         # CHECK 只能整表重建，今天加和以后加成本一样，但「以后再说」的结果通常是
         # 永远没有约束。白名单本身在 repositories.V1_MARKETPLACES，两处必须同步。
         CheckConstraint(
-            "code IN ('CA', 'UK', 'AU', 'DE')", name="ck_v1_marketplace_code"
+            "code IN ('CA', 'UK', 'AU', 'DE', 'IT', 'FR', 'ES', 'PL')", name="ck_v1_marketplace_code"
         ),
         CheckConstraint("length(currency) = 3", name="ck_marketplace_currency"),
         {"sqlite_autoincrement": True},
@@ -723,6 +723,88 @@ class AdminSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class InventoryGpsrItem(TimestampMixin, Base):
+    """Durable inventory candidate and submission intent, outside financial guards.
+
+    Keep submission history after a run is pruned, or deleting old reports would
+    silently make the same product eligible for another declaration.
+    """
+
+    __tablename__ = "inventory_gpsr_items"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"))
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_history.id", ondelete="RESTRICT"), nullable=False)
+    marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    sku: Mapped[str] = mapped_column(String(255), nullable=False)
+    asin: Mapped[str] = mapped_column(String(10), nullable=False)
+    title: Mapped[str] = mapped_column(String(500), nullable=False, default="")
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    reason: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    intent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "marketplace_code", "sku", name="uq_inventory_gpsr_run_sku"),
+        Index("ix_inventory_gpsr_run_order", "run_id", "marketplace_code", "page_number", "position"),
+        Index("ix_inventory_gpsr_history", "store_id", "marketplace_code", "sku", "asin"),
+        Index(
+            "uq_inventory_gpsr_submission", "run_id", "store_id", "marketplace_code", "sku", "asin",
+            unique=True, sqlite_where=text("state IN ('SUBMITTING','UNCERTAIN','CONFIRMED')"),
+        ),
+        CheckConstraint("marketplace_code IN ('DE','IT','FR','ES','PL')", name="ck_inventory_gpsr_marketplace"),
+        CheckConstraint("page_number >= 1 AND position >= 0", name="ck_inventory_gpsr_position"),
+        CheckConstraint(
+            "state IN ('PENDING','ELIGIBLE','NO_VIOLATION_ENTRY','NO_ATTESTATION',"
+            "'ALREADY_SUBMITTED','MISSING','FAILED','SUBMITTING','CONFIRMED','UNCERTAIN','BLOCKED')",
+            name="ck_inventory_gpsr_state",
+        ),
+        CheckConstraint(
+            "state NOT IN ('SUBMITTING','UNCERTAIN','CONFIRMED') OR intent_at IS NOT NULL",
+            name="ck_inventory_gpsr_intent",
+        ),
+    )
+
+
+class InventoryGpsrRequirement(TimestampMixin, Base):
+    """One durable attempt per run/product/requirement; retain earlier attempts."""
+
+    __tablename__ = "inventory_gpsr_requirements"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    item_id: Mapped[str] = mapped_column(ForeignKey("inventory_gpsr_items.id", ondelete="RESTRICT"), nullable=False)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.id", ondelete="SET NULL"))
+    store_id: Mapped[int] = mapped_column(ForeignKey("store_history.id", ondelete="RESTRICT"), nullable=False)
+    marketplace_code: Mapped[str] = mapped_column(String(2), nullable=False)
+    sku: Mapped[str] = mapped_column(String(255), nullable=False)
+    asin: Mapped[str] = mapped_column(String(10), nullable=False)
+    requirement_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    state: Mapped[str] = mapped_column(String(32), nullable=False, default="PENDING")
+    reason: Mapped[str] = mapped_column(String(120), nullable=False, default="")
+    eligible: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    initial_selected: Mapped[bool | None] = mapped_column(Boolean)
+    intent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    item: Mapped[InventoryGpsrItem] = relationship(lazy="joined")
+    __table_args__ = (
+        UniqueConstraint("item_id", "requirement_type", name="uq_inventory_requirement_item_type"),
+        CheckConstraint("marketplace_code IN ('DE','IT','FR','ES','PL')", name="ck_inventory_requirement_marketplace"),
+        CheckConstraint("requirement_type IN ('safety_attestation','responsible_person','manufacturer')", name="ck_inventory_requirement_type"),
+        CheckConstraint("state IN ('PENDING','ELIGIBLE','NO_VIOLATION_ENTRY','NO_ATTESTATION',"
+                        "'ALREADY_SUBMITTED','ALREADY_LINKED','MULTIPLE_RECORDS','NO_RECORDS','INVALID_RECORD',"
+                        "'NOT_APPLICABLE','MISSING','FAILED','SUBMITTING','CONFIRMED','UNCERTAIN','BLOCKED')",
+                        name="ck_inventory_requirement_state"),
+        CheckConstraint("state NOT IN ('SUBMITTING','UNCERTAIN','CONFIRMED') OR intent_at IS NOT NULL",
+                        name="ck_inventory_requirement_intent"),
+        Index("ix_inventory_requirement_run", "run_id", "marketplace_code"),
+        Index("uq_inventory_requirement_submission", "run_id", "store_id", "marketplace_code", "sku", "asin", "requirement_type",
+              unique=True, sqlite_where=text("state IN ('SUBMITTING','UNCERTAIN','CONFIRMED')")),
+    )
+
+
 class FeedbackReview(TimestampMixin, Base):
     """One seller-feedback entry considered for removal.
 
@@ -881,7 +963,7 @@ class StoreSetupSiteResult(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("probe_id", "marketplace_code", name="uq_setup_site"),
-        CheckConstraint("marketplace_code IN ('CA','UK','AU')"),
+        CheckConstraint("marketplace_code IN ('CA','UK','AU','DE','IT','FR','ES','PL')"),
         CheckConstraint("outcome IS NULL OR outcome IN ('PASSED','BLOCKED','FAILED','NOT_RUN','CANCELLED')"),
     )
 

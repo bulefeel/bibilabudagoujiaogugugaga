@@ -15,6 +15,7 @@ E = TypeVar("E", bound=StrEnum)
 RUN_TRANSITIONS: Mapping[RunStatus, Set[RunStatus]] = {
     RunStatus.QUEUED: {RunStatus.RUNNING, RunStatus.CANCELLED, RunStatus.SKIPPED},
     RunStatus.RUNNING: {
+        RunStatus.PAUSED,
         RunStatus.WAITING_APPROVAL,
         RunStatus.WAITING_AUTH,
         RunStatus.RECONCILING,
@@ -40,6 +41,7 @@ RUN_TRANSITIONS: Mapping[RunStatus, Set[RunStatus]] = {
         RunStatus.CANCELLED,
         RunStatus.WAITING_AUTH,
     },
+    RunStatus.PAUSED: {RunStatus.QUEUED, RunStatus.CANCELLED},
     RunStatus.WAITING_AUTH: {
         RunStatus.QUEUED,
         RunStatus.RUNNING,
@@ -87,12 +89,14 @@ SITE_TRANSITIONS: Mapping[SiteStatus, Set[SiteStatus]] = {
         SiteStatus.CANCELLED,
     },
     SiteStatus.PREFLIGHT: {
+        SiteStatus.PAUSED,
         SiteStatus.PLANNED,
         SiteStatus.WAITING_AUTH,
         SiteStatus.FAILED,
         SiteStatus.SKIPPED,
     },
     SiteStatus.PLANNED: {
+        SiteStatus.PAUSED,
         SiteStatus.WAITING_APPROVAL,
         SiteStatus.ARMED,
         SiteStatus.DRY_RUN_COMPLETE,
@@ -103,6 +107,7 @@ SITE_TRANSITIONS: Mapping[SiteStatus, Set[SiteStatus]] = {
         SiteStatus.PREFLIGHT,
         SiteStatus.CANCELLED,
     },
+    SiteStatus.PAUSED: {SiteStatus.PREFLIGHT, SiteStatus.CANCELLED},
     SiteStatus.WAITING_AUTH: {
         SiteStatus.PREFLIGHT,
         SiteStatus.NEEDS_HUMAN_AUTH,

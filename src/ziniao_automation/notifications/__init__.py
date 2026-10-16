@@ -7,7 +7,7 @@ from .database import (
     NotificationDeliveryService,
     notification_dedupe_key,
 )
-from .dto import NotificationKind, SafeRunNotice, SafeSiteNotice
+from .dto import NotificationKind, SafeInventoryGpsrCounts, SafeRunNotice, SafeSiteNotice
 from .feishu import DatabaseFeishuCredentialProvider, FeishuNotifier
 
 __all__ = [
@@ -22,6 +22,7 @@ __all__ = [
     "NotificationDeliveryService",
     "NullNotifier",
     "SafeRunNotice",
+    "SafeInventoryGpsrCounts",
     "SafeSiteNotice",
     "notification_dedupe_key",
 ]

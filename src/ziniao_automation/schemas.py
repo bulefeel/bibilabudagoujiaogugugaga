@@ -10,7 +10,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-MarketplaceCode = Literal["CA", "UK", "AU", "DE"]
+MarketplaceCode = Literal["CA", "UK", "AU", "DE", "IT", "FR", "ES", "PL"]
 RunMode = Literal["dry_run", "approval", "auto"]
 Weekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
@@ -55,18 +55,12 @@ class StoreSetupInput(MarketplaceSetupInput):
     scope: Literal["full", "retry_unverified"] = "full"
     expected_setup_revision: int | None = Field(None, ge=0)
 
-    @field_validator("marketplace_codes")
-    @classmethod
-    def supported_setup_codes(cls, value):
-        if set(value) - {"CA", "UK", "AU"}:
-            raise ValueError("统一核验仅支持CA/UK/AU，DE配置单独保存")
-        return value
 
 
 class StoreSetupBatchPreview(StrictApiModel):
     store_ids: list[int] = Field(min_length=1, max_length=500)
     mode: Literal["fill_missing", "retry_unverified", "recheck"] = "fill_missing"
-    selections: dict[int, list[Literal["CA", "UK", "AU"]]] = Field(default_factory=dict)
+    selections: dict[int, list[MarketplaceCode]] = Field(default_factory=dict)
 
     @field_validator("store_ids")
     @classmethod

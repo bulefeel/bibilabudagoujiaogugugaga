@@ -57,7 +57,7 @@ def test_the_cancel_control_is_reachable_for_every_live_probe_state() -> None:
     assert "6 位 OTP" in template
     assert "每个页面动作最多自动点击 3 次" in template
     assert "每个站点最多进行 3 轮完整验证" in template
-    assert "CA、UK、AU 分别计数" in template
+    assert "每个站点分别计数" in template
     assert "只有次数用尽" in template
     assert "未填内容、候选不唯一、CAPTCHA、非托管 Passkey" in template
     assert "不会换到普通 Chrome" in template

@@ -9,6 +9,32 @@ class WorkflowError(RuntimeError):
     code = "workflow_error"
 
 
+class PageRecoveryRequired(WorkflowError):
+    """Inventory UI is unavailable; retain progress until an explicit resume."""
+
+    code = "page_recovery_required"
+
+    def __init__(self, message: str, *, http_status: int | None = None,
+                 reason_code: str = "inventory_page_unavailable") -> None:
+        if reason_code == "inventory_page_unavailable":
+            if type(http_status) is not int or (http_status not in {403, 429} and not 500 <= http_status <= 599):
+                raise ValueError("Unsupported recoverable inventory HTTP status")
+        elif reason_code not in {"inventory_scan_unstable", "inventory_no_progress"} or http_status is not None:
+            raise ValueError("Unsupported inventory recovery reason")
+        super().__init__(message)
+        self.http_status = http_status
+        self.reason_code = reason_code
+
+    @property
+    def public_reason(self) -> str:
+        """Fixed diagnostic text, never raw exception/response contents."""
+        if self.reason_code == "inventory_scan_unstable":
+            return "库存扫描数量持续变化，有限重建清单未完成"
+        if self.reason_code == "inventory_no_progress":
+            return "库存连续读取失败或长时间无有效进展"
+        return f"库存页面返回 HTTP {self.http_status}"
+
+
 class InvalidTransition(WorkflowError):
     code = "invalid_transition"
 

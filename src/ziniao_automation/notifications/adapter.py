@@ -22,7 +22,8 @@ class DatabaseNotificationAdapter:
     CONFIRMED guard), otherwise a neutral task-completed/read-only card.  A run in which every site was skipped gets
     its own neutral card naming each site's reason — staying silent there made
     Amazon's 24-hour disbursement cap indistinguishable from a crash.  Only
-    cancellation remains silent, because the operator caused it.
+    ordinary cancellation remains silent. Inventory cancellation with an
+    unsettled saved intent gets a separate notice rebuilt from its ledger.
     """
 
     def __init__(self, deliveries: NotificationDeliveryService) -> None:
@@ -40,6 +41,13 @@ class DatabaseNotificationAdapter:
 
         if not isinstance(report, WorkflowReport):
             raise TypeError("DatabaseNotificationAdapter accepts WorkflowReport")
+        if report.status.value == "CANCELLED":
+            # Ordinary cancellations stay silent. The database builder permits
+            # this notice only for inventory runs with persisted unsettled intent.
+            await self.deliveries.deliver(
+                report.run_id, NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN
+            )
+            return
         if report.status.value == "SUCCEEDED":
             # Both calls are intentional.  The database fact checks are
             # mutually exclusive, so exactly one notice can be reserved and
@@ -59,6 +67,7 @@ class DatabaseNotificationAdapter:
 
 
 _ENGINE_STATUS_KINDS: dict[str, NotificationKind] = {
+    "PAUSED": NotificationKind.INVENTORY_PAGE_PAUSED,
     "WAITING_APPROVAL": NotificationKind.WAITING_APPROVAL,
     "WAITING_AUTH": NotificationKind.WAITING_AUTH,
     "NEEDS_HUMAN_AUTH": NotificationKind.AUTH_TIMEOUT,

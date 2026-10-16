@@ -34,11 +34,12 @@ V1_MARKETPLACES: dict[str, tuple[str, str]] = {
     "CA": ("sellercentral.amazon.ca", "CAD"),
     "UK": ("sellercentral.amazon.co.uk", "GBP"),
     "AU": ("sellercentral.amazon.com.au", "AUD"),
-    # DE 是为 GPSR 安全证明流程加的，提现流程不覆盖它。它**刻意不在**
-    # ``amazon_disbursement.config.ALLOWED_MARKETPLACES`` 里：统一建档要读付款页
-    # 才能核验，德国站没有那条链路。所以 DE 只能在店铺弹窗里勾选保存，不会被
-    # 统一建档探测——store_marketplaces 里它就是一行普通数据。
+    # 欧洲合规站点通过库存页建档，不进入提现 ALLOWED_MARKETPLACES。
     "DE": ("sellercentral.amazon.de", "EUR"),
+    "IT": ("sellercentral.amazon.it", "EUR"),
+    "FR": ("sellercentral.amazon.fr", "EUR"),
+    "ES": ("sellercentral.amazon.es", "EUR"),
+    "PL": ("sellercentral.amazon.pl", "PLN"),
 }
 
 
@@ -332,7 +333,7 @@ class StoreRepository:
         now = utc_now()
         schedule_ids = list(self.session.scalars(select(Schedule.id).where(Schedule.store_id.in_(ids))))
         runs = list(self.session.scalars(select(Run).where(Run.store_id.in_(ids))))
-        unfinished = [run for run in runs if run.status in ACTIVE_RUN_STATUSES]
+        unfinished = [run for run in runs if run.status in (*ACTIVE_RUN_STATUSES, "PAUSED")]
         for run in runs:
             run.result_summary = {**(run.result_summary or {}), "store_removed": True}
         for run in unfinished:
@@ -357,7 +358,7 @@ class StoreRepository:
             ).values(status="CANCELLED", cancelled_at=now, invalid_reason="店铺已从本地账册删除"))
             self.session.execute(update(SiteRun).where(
                 SiteRun.run_id.in_([run.id for run in unfinished]),
-                SiteRun.status.in_(("PENDING", "QUEUED", "WAITING_APPROVAL", "WAITING_AUTH", "PLANNED")),
+                SiteRun.status.in_(("PENDING", "QUEUED", "WAITING_APPROVAL", "WAITING_AUTH", "PLANNED", "PAUSED")),
                 ~SiteRun.guards.any(),
             ).values(status="CANCELLED", finished_at=now))
         self.session.flush()
@@ -992,6 +993,13 @@ class WorkflowRepository:
             raise ValueError("未绑定并确认卖家身份，禁止创建该流程任务")
         if not store.enabled:
             raise ValueError("店铺尚未启用")
+        if workflow == "amazon_inventory_gpsr_attestation":
+            unfinished_inventory = self.session.scalar(select(Run.id).where(
+                Run.store_id == store_id, Run.workflow == workflow,
+                Run.status.in_((*ACTIVE_RUN_STATUSES, "PAUSED")),
+            ).limit(1))
+            if unfinished_inventory is not None:
+                raise ConflictError("同店库存流程已有未完成任务，请继续或取消原任务")
         # An ``auto`` run no longer requires two prior approval-mode successes;
         # that prerequisite was removed on the operator's instruction.  The
         # identity/enable checks above and every per-run financial guard below
@@ -1005,7 +1013,7 @@ class WorkflowRepository:
                 select(Run.id).where(
                     Run.schedule_id == schedule_id,
                     Run.status.in_(
-                        ACTIVE_RUN_STATUSES
+                        (*ACTIVE_RUN_STATUSES, "PAUSED")
                     ),
                 ).limit(1)
             )

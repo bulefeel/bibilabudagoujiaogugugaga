@@ -30,7 +30,8 @@ function setup(cards, search="", state={}) {
     URLSearchParams, location:{search,pathname:"/stores",hash:""},
     history:{replaceState(_state,_title,url){context.location.search=url.slice(url.indexOf("?"));}},
     $: selector=>nodes[selector]||null, $$: selector=>selector==="select"?selects:cards,
-    setupOperationMode:()=>"fill_missing",
+    setupOperationMode:()=>"fill_missing", selectedBatchSetupCodes:()=>[],
+    setupMarketplaceCodes:["CA","UK","AU","DE","IT","FR","ES","PL"],
     validPositiveId:value=>Number.isSafeInteger(Number(value))&&Number(value)>0, bulkStoreSetup,
   });
   vm.runInContext(helpers + "\n" + filter,context);
@@ -64,16 +65,17 @@ test("encoded search and hash-unrelated query survive URL serialization",()=>{
   assert.equal(x.visible().length,1);const p=new URLSearchParams(x.context.location.search);
   assert.equal(p.get("q"),"A & 一店");assert.equal(p.get("other"),"value");
 });
-test("DE-only pending store is skipped explicitly, never called complete or defaulted",()=>{
+test("DE-only pending store is eligible without widening to payout sites",()=>{
   const x=setup([card(1,{storeSetupMarketplaces:'["DE"]'})]);
-  assert.equal(x.selection().eligible.length,0);assert.equal(x.selection().unsupported.length,1);
-  assert.equal(x.start.disabled,true);assert.match(x.note.textContent,/DE/);assert.doesNotMatch(x.note.textContent,/已配置|已完成/);
+  assert.equal(x.selection().eligible.length,1);assert.equal(x.selection().unsupported.length,0);
+  assert.equal(x.start.disabled,false);assert.equal(x.selection().eligible[0].defaulted,false);
+  assert.deepEqual(Array.from(x.selection().eligible[0].marketplaceCodes),["DE"]);
 });
 test("only genuinely empty site selection defaults to CA UK AU",()=>{
   const x=setup([card(1,{storeSetupMarketplaces:'[]'}),card(2,{storeSetupMarketplaces:'["DE","CA"]'}),card(3,{storeSetupMarketplaces:'["DE"]'})]);
   const selected=JSON.parse(JSON.stringify(x.selection().eligible));
-  assert.deepEqual(selected.map(s=>s.marketplaceCodes),[["CA","UK","AU"],["CA"]]);
-  assert.deepEqual(selected.map(s=>s.defaulted),[true,false]);
+  assert.deepEqual(selected.map(s=>s.marketplaceCodes),[["CA","UK","AU"],["DE","CA"],["DE"]]);
+  assert.deepEqual(selected.map(s=>s.defaulted),[true,false,false]);
 });
 test("configured cards stay visible but do not enter a new setup queue",()=>{
   const x=setup([card(1,{setupState:"done",storeSetupNeeded:"false",identityState:"CONFIRMED"}),card(2)]);
@@ -88,10 +90,10 @@ test("filters never replace the saved queue or its resume button",()=>{
 test("the exact confirmed visible selection is queued, not all cards",async()=>{
   const x=setup([card(1),card(2,{storeName:"Hidden"}),card(3,{storeName:"Store 3",storeSetupMarketplaces:'["DE"]'})],"?q=Store");
   let message="",started=0;
-  Object.assign(x.context,{previewSetupSelection:async()=>{message="Store 1; DE excluded";return JSON.parse(JSON.stringify(x.selection().eligible));},toast:()=>assert.fail("unexpected toast"),sessionStorage:{removeItem(){}},bulkSetupSummaryStorageKey:"summary",persistBulkStoreSetup(){},bulkSetupUi:()=>({panel:element(),actions:element(),dismiss:element()}),updateBulkSetupCounts(){},runNextBulkStoreSetup:async()=>{started++;}});
+  Object.assign(x.context,{previewSetupSelection:async()=>{message="Store 1; DE included";return JSON.parse(JSON.stringify(x.selection().eligible));},toast:()=>assert.fail("unexpected toast"),sessionStorage:{removeItem(){}},bulkSetupSummaryStorageKey:"summary",persistBulkStoreSetup(){},bulkSetupUi:()=>({panel:element(),actions:element(),dismiss:element()}),updateBulkSetupCounts(){},runNextBulkStoreSetup:async()=>{started++;}});
   const invoke=vm.runInContext("(async function(action,target){"+action+"})",x.context);
   await invoke("detect-all-store-setups",x.start);
-  assert.equal(started,1);assert.deepEqual(Array.from(x.state.queue,s=>s.id),[1]);assert.match(message,/Store 1/);assert.doesNotMatch(message,/Hidden/);assert.match(message,/DE/);
+  assert.equal(started,1);assert.deepEqual(Array.from(x.state.queue,s=>s.id),[1,3]);assert.match(message,/Store 1/);assert.doesNotMatch(message,/Hidden/);assert.match(message,/DE/);
 });
 test("canceling the confirmation never changes the queue or launches work",async()=>{
   const x=setup([card(1)]);Object.assign(x.context,{previewSetupSelection:async()=>null,toast:()=>{},sessionStorage:{removeItem(){assert.fail("must not write");}}});
@@ -100,4 +102,27 @@ test("canceling the confirmation never changes the queue or launches work",async
 });
 test("filter initialization is a no-op on other pages",()=>{
   assert.doesNotThrow(()=>vm.runInNewContext(filter,{$:()=>null}));
+});
+
+test("explicit EU batch selection allows extending an already configured store",()=>{
+  const x=setup([card(1,{setupState:"done",storeSetupNeeded:"false",identityState:"CONFIRMED"})]);
+  x.context.selectedBatchSetupCodes=()=>["IT","FR","ES","PL"];
+  x.context.refreshBulkStoreScope();
+  assert.equal(x.start.disabled,false);
+  assert.match(x.start.textContent,/所选站点/);
+});
+
+test("restored queue keeps the exact EU site snapshot and request identity",()=>{
+  const saved={queue:[{id:1,name:"Fixture",marketplaceCodes:["IT","FR","ES","PL"],requestId:"request-1",scope:"full",setupRevision:5}],index:0};
+  const ui=Object.fromEntries(["panel","actions","resume","skip","title","message","start","dismiss"].map(k=>[k,element()]));
+  const state={};
+  const context=vm.createContext({sessionStorage:{getItem:()=>JSON.stringify(saved),removeItem:()=>assert.fail("must preserve queue")},
+    bulkSetupStorageKey:"fixture",setupMarketplaceCodes:["CA","UK","AU","DE","IT","FR","ES","PL"],
+    validPositiveId:n=>Number.isSafeInteger(Number(n))&&Number(n)>0,bulkQueueArchiveIsStale:()=>false,
+    bulkStoreSetup:state,bulkSetupUi:()=>ui,ziniaoCredentialErrorCode:"CREDENTIAL",updateBulkSetupCounts(){}});
+  const restore=script.slice(script.indexOf("function restoreBulkStoreSetup()"),script.indexOf("function bulkSetupUi()"));
+  vm.runInContext(restore+";restoreBulkStoreSetup();",context);
+  assert.deepEqual(Array.from(state.queue[0].marketplaceCodes),["IT","FR","ES","PL"]);
+  assert.equal(state.queue[0].requestId,"request-1");assert.equal(state.queue[0].setupRevision,5);
+  assert.equal(state.active,false);assert.equal(state.resumeAvailable,true);
 });

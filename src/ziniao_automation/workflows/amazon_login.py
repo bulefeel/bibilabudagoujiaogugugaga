@@ -41,6 +41,10 @@ _SELLER_CENTRAL_HOSTS = frozenset(
         # 德国站（GPSR 安全证明流程）。它有自己的 ``assoc_handle``
         # （``sc_de_amazon_v2``），所以别站登录过不算数，必须单独走一遍。
         "sellercentral.amazon.de",
+        "sellercentral.amazon.it",
+        "sellercentral.amazon.fr",
+        "sellercentral.amazon.es",
+        "sellercentral.amazon.pl",
     }
 )
 # ``/ap/mfa/new-otp`` is the two-step-verification METHOD CHOOSER Amazon started
@@ -87,6 +91,7 @@ _BUSINESS_EXACT_PATHS = frozenset(
     }
 )
 _PAYMENT_DETAILS_EXACT_PATH = "/payments/disburse/details"
+_INVENTORY_EXACT_PATH = "/myinventory/inventory"
 # 亚马逊自己的账户/站点切换页。**同一个坑第四次。**
 #
 # 落到这里意味着登录**成功了** —— 是 Seller Central 在问「开哪个站点」，不是
@@ -1678,6 +1683,14 @@ class AmazonLoginAdvancer:
             and raw_path == _PAYMENT_DETAILS_EXACT_PATH
             and not parsed.params
         )
+        # 库存流程只接管准确路径，不套用旧列表路径的尾斜杠归一化。
+        inventory_allowed = (
+            parsed.path in {_INVENTORY_EXACT_PATH, "/amazonsell/business"}
+            and not parsed.params
+            and ":" not in parsed.netloc
+            and not parsed.username
+            and not parsed.password
+        )
         # 前缀必须整段匹配：``/account-switcherX`` 不算，``/account-switcher/…`` 才算。
         switcher_allowed = any(
             path == prefix or path.startswith(f"{prefix}/")
@@ -1689,6 +1702,7 @@ class AmazonLoginAdvancer:
             and host == normalized_expected
             and (
                 path in _BUSINESS_EXACT_PATHS
+                or inventory_allowed
                 or payment_details_allowed
                 or switcher_allowed
             )

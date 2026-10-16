@@ -49,8 +49,8 @@
     if (!node) return;
     const id = node.dataset.runId;
     const last = node.dataset.runStatus || "";
-    // 打开时就已经是终态，一次请求都不要发。
-    if (!id || RUN_TERMINAL_STATUSES.has(last)) return;
+    // 终态或等待人工恢复的暂停任务，都不需要自动轮询；点击继续后才重新入队。
+    if (!id || RUN_TERMINAL_STATUSES.has(last) || last === "PAUSED") return;
     const timer = setInterval(async () => {
       try {
         const current = await api(`/api/runs/${encodeURIComponent(id)}`);
@@ -228,7 +228,7 @@
             : status === "SKIPPED"
               ? (message || "因卖家身份未通过校验，本次站点核验已跳过")
               : (message || (status === "CHECKING" ? "正在核验该站点" : "待核验"));
-      setMarketplaceRowStatus(row, status, `${detail}${site.payment_capability ? " · 付款页面：" + (setupPaymentLabels[site.payment_capability] || "未检查") : ""}`);
+      setMarketplaceRowStatus(row, status, `${detail}${["CA","UK","AU"].includes(site.code) ? " · 付款页面：" + (setupPaymentLabels[site.payment_capability] || "未检查") : " · 库存访问：" + (site.access_check==="PASSED"?"已核验":"未核验")}`);
     }
     if (["CHECKING", "WAITING_AUTH"].includes(String(data.status || "").toUpperCase())) {
       $$('[data-store-marketplace]:not([data-no-probe]) [data-marketplace-enabled]:checked', form).forEach(input => {
@@ -581,6 +581,8 @@
       yes.addEventListener("click",accept);no.addEventListener("click",finish);dialog.addEventListener("cancel",finish);
     }); } finally { batchSetupResetBusy=false;refreshSetupResetSelection(); }
   }
+  const setupMarketplaceCodes = ["CA", "UK", "AU", "DE", "IT", "FR", "ES", "PL"];
+  function selectedBatchSetupCodes() { return $$("[data-setup-batch-site]:checked").map(input=>input.value); }
   function setupOperationMode() { return $("[data-setup-batch-mode]")?.value || "fill_missing"; }
   async function previewSetupSelection() {
     const visible = $$("[data-store-card]").filter(card => !card.hidden);
@@ -589,12 +591,14 @@
     if (mode === "recheck" && !selected.length) throw new Error("复核前请勾选店铺，或点击选择当前可见亚马逊店铺。");
     const cards = selected.length ? selected : visible;
     if (!cards.length) throw new Error("当前范围没有店铺。");
-    const preview = await api("/api/stores/setup-batch/preview", {method:"POST",body:JSON.stringify({store_ids:cards.map(c=>Number(c.dataset.storeId)),mode})});
+    const codes=selectedBatchSetupCodes();
+    const selections=codes.length ? Object.fromEntries(cards.map(c=>[Number(c.dataset.storeId),codes])) : {};
+    const preview = await api("/api/stores/setup-batch/preview", {method:"POST",body:JSON.stringify({store_ids:cards.map(c=>Number(c.dataset.storeId)),mode,selections})});
     const dialog = $("#setup-batch-preview"), body = $("[data-setup-preview-rows]",dialog);
     body.replaceChildren();
     preview.targets.forEach((target,index)=>{
       const tr=document.createElement("tr"); if(!target.eligible)tr.className="setup-preview-excluded";
-      [String(index+1),target.name||`店铺 ${target.store_id}`,(target.marketplace_codes||[]).join(" / ")||"—",target.reason||(target.defaulted?"将明确新增 CA/UK/AU 配置":"符合条件")].forEach(value=>{const td=document.createElement("td");td.textContent=value;tr.append(td);});body.append(tr);
+      [String(index+1),target.name||`店铺 ${target.store_id}`,(target.marketplace_codes||[]).join(" / ")||"—",target.reason||(target.defaulted?"将明确新增 CA/UK/AU 配置":codes.length?"核验所选站点；缺少的配置将启用，其他站点保持不变":"符合条件")].forEach(value=>{const td=document.createElement("td");td.textContent=value;tr.append(td);});body.append(tr);
     });
     $("[data-setup-preview-count]",dialog).textContent=`共 ${preview.targets.length} 家；可执行 ${preview.eligible_count} 家，其余保留排除原因。`;
     const yes=$("[data-setup-preview-confirm]",dialog), no=$("[data-setup-preview-cancel]",dialog);yes.disabled=!preview.eligible_count;
@@ -664,9 +668,8 @@
         const title=document.createElement("b");title.textContent=`最近核验：${setupOutcomeLabels[summary.verification_outcome]||"未核验"}${summary.stale?"（配置或适配规则已变化）":""}`;holder.append(title);
         (summary.selected_marketplace_codes||[]).forEach(code=>{
           const line=document.createElement("p"),site=summary.marketplaces[code];
-          if(code==="DE"){line.textContent="DE · 本流程不核验";holder.append(line);return;}
           const state=site?.outcome?setupSiteLabels[site.outcome]:(site?.attempted?"检查中":"未核验");
-          line.textContent=`${code} · ${state||"未核验"} · 付款页面：${setupPaymentLabels[site?.payment_capability]||"未检查"}`;
+          line.textContent=`${code} · ${state||"未核验"} · ${["CA","UK","AU"].includes(code) ? "付款页面："+(setupPaymentLabels[site?.payment_capability]||"未检查") : "库存访问："+(site?.access_check==="PASSED"?"已核验":"未核验")}`;
           if(site?.outcome!=="PASSED"){line.className="setup-incomplete";if(site?.message)line.textContent+=` · ${site.message}`;}
           holder.append(line);
         });
@@ -692,12 +695,8 @@
       let enabled = [];
       try { enabled = JSON.parse(card.dataset.storeSetupMarketplaces || "[]"); } catch (_) {}
       enabled = [...new Set(enabled.map(code => String(code).toUpperCase()))];
-      // 建档只核验提现支持的这三个站点。
-      let marketplaceCodes = enabled.filter(code => ["CA", "UK", "AU"].includes(code));
-      // ⚠️ 只在店铺**一个站点都没启用**时才退到 CA/UK/AU。原来是过滤之后再判空:
-      // 只开了 DE 的 GPSR 店过滤完是空表 → 被当成「没选站点」→ 确认框说要默认按
-      // CA/UK/AU 建档 → 建档成功后把这三个站点一起开了,运营从没要过
-      // (2026-09-26 自审)。这种店应该整个跳过。
+      let marketplaceCodes = enabled.filter(code => setupMarketplaceCodes.includes(code));
+      // 未明确选择任何站点时保留旧默认；不会自动扩大到全部欧洲站。
       const defaulted = enabled.length === 0;
       if (defaulted) marketplaceCodes = ["CA", "UK", "AU"];
       return {
@@ -720,7 +719,7 @@
     const parts = [
       `当前显示 ${allCards.length} 家，可批量补全 ${eligible.length} 家。`,
       alreadyComplete ? `${alreadyComplete} 家已配置，不重复建档。` : "",
-      unsupported.length ? `${unsupported.length} 家仅选择了统一建档不支持的站点（如 DE），本次跳过；请编辑站点选择。` : "",
+      unsupported.length ? `${unsupported.length} 家仅选择了统一建档不支持的站点，本次跳过；请编辑站点选择。` : "",
       otherPlatform.length ? `${otherPlatform.length} 家其他平台不参与。` : "",
     ];
     return parts.filter(Boolean).join(" ");
@@ -734,9 +733,9 @@
       if (note) note.textContent = "已有未完成队列：继续时仍按原店铺清单执行，当前筛选不会改动队列。";
       return;
     }
-    if(setupOperationMode()!=="fill_missing"){
+    if(setupOperationMode()!=="fill_missing" || selectedBatchSetupCodes().length){
       start.disabled=!$$("[data-store-card]").some(c=>!c.hidden&&c.dataset.platformAmazon==="true");
-      start.textContent=setupOperationMode()==="recheck"?"预览复核所选店铺":"预览重试未通过站点";
+      start.textContent=setupOperationMode()==="recheck"?"预览复核所选店铺":setupOperationMode()==="retry_unverified"?"预览重试未通过站点":"预览批量建档所选站点";
       if(note)note.textContent="范围以服务端预览为准；已配置或部分通过的店铺也可补测。";return;
     }
     const selection = collectBulkStoreCandidates();
@@ -767,7 +766,7 @@
       id: Number(store.id),
       name: String(store.name || `店铺 #${store.id}`),
       marketplaceCodes: Array.isArray(store.marketplaceCodes)
-        ? [...new Set(store.marketplaceCodes.map(code => String(code).toUpperCase()).filter(code => ["CA", "UK", "AU"].includes(code)))]
+        ? [...new Set(store.marketplaceCodes.map(code => String(code).toUpperCase()).filter(code => setupMarketplaceCodes.includes(code)))]
         : ["CA", "UK", "AU"],
       defaulted: !!store.defaulted,
       scope: store.scope, setupRevision:store.setupRevision, requestId:store.requestId,
@@ -1209,13 +1208,13 @@
     if(!Object.keys(properties).length){container.hidden=true;return;}container.hidden=false;
     const required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);
     Object.entries(properties).forEach(([rawKey,rawSchema])=>{
-      const key=safeWorkflowKey(rawKey);if(!key)return;const schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),provided=Object.prototype.hasOwnProperty.call(values,key),initial=provided?values[key]:schema.default;
+      const key=safeWorkflowKey(rawKey);if(!key)return;const schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),provided=Object.prototype.hasOwnProperty.call(values,key),initial=provided?values[key]:(form.dataset.scheduleEditing!=="true"&&schema["x-create-default"]!==undefined?schema["x-create-default"]:schema.default);
       const holder=document.createElement(type==="array"?"fieldset":"label");holder.dataset.configField=key;holder.dataset.configRequired=required.has(rawKey)?"true":"false";
       if(type==="array"){
         const legend=document.createElement("legend");legend.textContent=fieldLabel(key,schema)+(Number(schema.minItems||0)>0?"（至少选择 "+schema.minItems+" 个）":"");holder.append(legend);
         const itemSchema=resolveWorkflowFieldSchema(meta,schema.items||{}),enumValues=Array.isArray(itemSchema.enum)?itemSchema.enum:[],supportedEnum=!schema.__uiUnsupported&&!schema.__uiNullable&&!itemSchema.__uiUnsupported&&!itemSchema.__uiNullable&&enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value)),current=new Set(Array.isArray(initial)?initial.map(value=>JSON.stringify(value)):[]);
         if(!supportedEnum)holder.dataset.configUnsupported="true";
-        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚",DE:"DE 德国"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
+        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚",DE:"DE 德国",IT:"IT 意大利",FR:"FR 法国",ES:"ES 西班牙",PL:"PL 波兰",safety_attestation:"安全证明声明",responsible_person:"负责人信息关联",manufacturer:"制造商信息关联"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
       }else{
         const title=document.createElement("span");title.textContent=fieldLabel(key,schema)+(required.has(rawKey)?" *":"");holder.append(title);const scalarType=["string","number","integer","boolean"].includes(type),enumValues=Array.isArray(schema.enum)?schema.enum:null,enumSupported=!enumValues||(enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value))),nullableSupported=!schema.__uiNullable||Boolean(enumValues)||type==="boolean";
         if(schema.__uiUnsupported||!scalarType||!enumSupported||!nullableSupported){holder.dataset.configUnsupported="true";}
@@ -1230,7 +1229,7 @@
   }
   function collectWorkflowConfig(form){
     const meta=workflowMeta(form),config={},required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);let properties=workflowProperties(meta);if(!Object.keys(properties).length&&meta?.key==="amazon_disbursement")properties={marketplace_codes:{type:"array"}};
-    Object.entries(properties).forEach(([rawKey,rawSchema])=>{const key=safeWorkflowKey(rawKey);if(!key)return;const schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),fields=$$('[data-config-key="'+key+'"]',form);if(type==="array"){const selected=fields.filter(input=>input.checked).map(input=>{try{return input.dataset.configValue!==undefined?JSON.parse(input.dataset.configValue):input.value;}catch(_){return input.value;}});if(selected.length||required.has(rawKey)||(key==="marketplace_codes"&&meta?.requires_marketplace_targets!==false))config[key]=selected;return;}const field=fields[0];if(!field)return;const selectedOption=field.tagName==="SELECT"?field.selectedOptions?.[0]:null;if(selectedOption?.dataset.configValue!==undefined){try{config[key]=JSON.parse(selectedOption.dataset.configValue);return;}catch(_){/* fall through to normal parsing */}}if(type==="boolean"){if(field.tagName==="SELECT"&&!String(field.value||"").trim()&&!required.has(rawKey))return;config[key]=Boolean(field.checked);return;}const raw=String(field.value??"").trim();if(!raw&&!required.has(rawKey))return;if(type==="number"||type==="integer"){const numeric=Number(raw);config[key]=raw!==""&&Number.isFinite(numeric)?numeric:raw;}else config[key]=raw;});return config;
+    Object.entries(properties).forEach(([rawKey,rawSchema])=>{const key=safeWorkflowKey(rawKey);if(!key)return;const schema=resolveWorkflowFieldSchema(meta,rawSchema),type=schema.type||(Array.isArray(schema.enum)?"string":"string"),fields=$$('[data-config-key="'+key+'"]',form);if(type==="array"){const selected=fields.filter(input=>input.checked).map(input=>{try{return input.dataset.configValue!==undefined?JSON.parse(input.dataset.configValue):input.value;}catch(_){return input.value;}});if(selected.length||Number(schema.minItems||0)>0||required.has(rawKey)||(key==="marketplace_codes"&&meta?.requires_marketplace_targets!==false))config[key]=selected;return;}const field=fields[0];if(!field)return;const selectedOption=field.tagName==="SELECT"?field.selectedOptions?.[0]:null;if(selectedOption?.dataset.configValue!==undefined){try{config[key]=JSON.parse(selectedOption.dataset.configValue);return;}catch(_){/* fall through to normal parsing */}}if(type==="boolean"){if(field.tagName==="SELECT"&&!String(field.value||"").trim()&&!required.has(rawKey))return;config[key]=Boolean(field.checked);return;}const raw=String(field.value??"").trim();if(!raw&&!required.has(rawKey))return;if(type==="number"||type==="integer"){const numeric=Number(raw);config[key]=raw!==""&&Number.isFinite(numeric)?numeric:raw;}else config[key]=raw;});return config;
   }
   function workflowConfigError(form,config=collectWorkflowConfig(form)){
     const meta=workflowMeta(form),properties=workflowProperties(meta),required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);const unsupported=$("[data-config-unsupported=true]",form);if(unsupported)return"当前版本暂不支持该流程的配置字段，请更新程序。";
@@ -1793,7 +1792,7 @@
       return;
     }
     if (runAction) {
-      const map = {approve:"approve", cancel:"cancel", "continue-auth":"continue-auth", settle:"settle"};
+      const map = {approve:"approve", cancel:"cancel", "continue-auth":"continue-auth", "resume-inventory":"resume-inventory", settle:"settle"};
       const message = target.dataset.confirm || (runAction === "cancel" ? "确认取消这个任务？已进入资金保护阶段的任务不能取消。" : "确认执行此操作？");
       if (!(await confirmAction(message))) return;
       target.disabled = true;
@@ -2099,6 +2098,7 @@
     });
   })();
   $("[data-setup-batch-mode]")?.addEventListener("change", refreshBulkStoreScope);
+  $$("[data-setup-batch-site]").forEach(input=>input.addEventListener("change",refreshBulkStoreScope));
   // Registered after storeFilter, so counts use the freshly applied visibility.
   $("[data-store-filter]")?.addEventListener("change", refreshSetupResetSelection);
   $("[data-store-filter] input[name=q]")?.addEventListener("input", refreshSetupResetSelection);

@@ -294,6 +294,20 @@ def _message(notice: SafeRunNotice) -> str:
         lines.append(f"**处理截止：** {_md(_format_datetime(notice.deadline_at))}")
     if notice.summary:
         lines.extend(("", f"**说明：** {_md(notice.summary)}"))
+    if notice.inventory_gpsr_counts is not None:
+        counts = notice.inventory_gpsr_counts
+        if counts.requirements:
+            lines.extend(("", "**库存合规分项汇总**",
+                f"- 候选商品 {counts.scanned} 件 ｜ 处理要求 {counts.requirements} 项",
+                f"- 安全证明已提交、审核中 {counts.safety_confirmed} 项 ｜ 负责人已提交、审核中 {counts.responsible_confirmed} 项 ｜ 制造商已提交、审核中 {counts.manufacturer_confirmed} 项",
+                f"- 已有关联 {counts.already_linked} 项 ｜ 多记录待确认 {counts.multiple_records} 项",
+                f"- 无关联记录 {counts.no_records} 项 ｜ 记录失效 {counts.invalid_record} 项 ｜ 非本项要求 {counts.not_applicable} 项",
+                f"- 可处理 {counts.eligible} 项 ｜ 尚未检查 {counts.pending} 项 ｜ 此前审核中 {counts.already_submitted} 项",
+                f"- 无违规入口 {counts.no_violation_entry} 项 ｜ 无安全证明 {counts.no_attestation} 项 ｜ 未找到 {counts.missing} 项",
+                f"- 失败 {counts.failed} 项 ｜ 历史待核对 {counts.blocked} 项 ｜ 结果不明 {counts.uncertain} 项",
+                "已有选中项不计为本次提交成功；本次提交确认表示已提交、审核中。"))
+        else:
+            lines.extend(_legacy_inventory_lines(counts))
     if notice.sites:
         lines.extend(("", "**站点明细**"))
         lines.extend(_site_line(site, notice.workflow) for site in notice.sites)
@@ -315,6 +329,18 @@ def _message(notice: SafeRunNotice) -> str:
     return "\n".join(lines)
 
 
+def _legacy_inventory_lines(counts):
+    return (
+        "", "**库存安全证明汇总**",
+        f"- 候选扫描 {counts.scanned} 件 ｜ 尚未检查 {counts.pending} 件",
+        f"- 历史记录待核对 {counts.blocked} 件 ｜ 已核验可处理 {counts.eligible} 件",
+        f"- 本轮提交确认 {counts.confirmed} 件 ｜ 此前审核中 {counts.already_submitted} 件",
+        f"- 无违规入口 {counts.no_violation_entry} 件 ｜ 无安全证明 {counts.no_attestation} 件",
+        f"- 清单商品未找到 {counts.missing} 件 ｜ 失败 {counts.failed} 件 ｜ 本次提交结果不明 {counts.uncertain} 件",
+        "候选扫描仅建立列表清单，不代表已打开侧栏逐件检查；本轮提交确认表示已提交、审核中。",
+    )
+
+
 # Guard states mean a payout was actually requested for that site, so the
 # figure alongside them is the amount Amazon was asked to transfer — the
 # database builder already prefers ``guard.amount`` over the planned balance.
@@ -326,7 +352,8 @@ _LOCKED_OUTCOMES = frozenset({"ARMED", "UNCERTAIN"})
 
 def _site_line(site: SafeSiteNotice, workflow: str = "") -> str:
     parts = [f"**{_md(site.code.upper() or '未知')}**"]
-    if site.payable is not None:
+    is_inventory_gpsr = workflow == _INVENTORY_GPSR_WORKFLOW_KEY
+    if site.payable is not None and not is_inventory_gpsr:
         # "可提现" is the dashboard balance and keeps moving as orders settle.
         # Once a payout has been requested, report what was requested instead —
         # that is the number the operator actually cares about.
@@ -338,12 +365,12 @@ def _site_line(site: SafeSiteNotice, workflow: str = "") -> str:
         else:
             label = "可提现"
         parts.append(f"{label} {_money(site.currency, site.payable)}")
-    if site.delayed is not None:
+    if site.delayed is not None and not is_inventory_gpsr:
         parts.append(f"延迟资金 {_money(site.currency, site.delayed)}")
-    if site.account_tail:
+    if site.account_tail and not is_inventory_gpsr:
         changed = "（与上次不同）" if site.account_changed else ""
         parts.append(f"账户 `{_account_mask(site.account_tail)}`{changed}")
-    if site.reference_suffix:
+    if site.reference_suffix and not is_inventory_gpsr:
         parts.append(f"参考号 `••••{_last_four(site.reference_suffix)}`")
     if site.outcome:
         outcome = _outcome_label(site.outcome, workflow)
@@ -419,13 +446,14 @@ def _feedback_line(item: SafeFeedbackNotice) -> str:
 def _card_colour(kind: NotificationKind) -> str:
     if kind is NotificationKind.PAYMENT_SUBMITTED:
         return "green"
-    if kind in (NotificationKind.WAITING_APPROVAL, NotificationKind.WAITING_AUTH):
+    if kind in (NotificationKind.WAITING_APPROVAL, NotificationKind.WAITING_AUTH, NotificationKind.INVENTORY_PAGE_PAUSED):
         return "orange"
     if kind in (
         NotificationKind.AUTH_TIMEOUT,
         NotificationKind.RUN_FAILED,
         NotificationKind.RUN_PARTIAL,
         NotificationKind.UNCERTAIN_FINANCIAL,
+        NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN,
     ):
         return "red"
     # RUN_SKIPPED stays blue on purpose.  Nothing went wrong: every site was
@@ -446,6 +474,8 @@ def _default_title(kind: NotificationKind) -> str:
         NotificationKind.RUN_PARTIAL: "提现任务部分失败",
         NotificationKind.RUN_SKIPPED: "本次没有发起提现",
         NotificationKind.UNCERTAIN_FINANCIAL: "资金结果待人工核对",
+        NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN: "安全证明提交结果待核对",
+        NotificationKind.INVENTORY_PAGE_PAUSED: "库存安全证明已暂停，等待页面恢复",
         NotificationKind.CROSS_DAY_STARTED: "排队任务跨日开始",
     }[kind]
 
@@ -475,6 +505,25 @@ _FEEDBACK_NEXT_ACTIONS: dict[NotificationKind, str] = {
 
 # GPSR 同样一分钱都不碰，下面的提现措辞对它也是假话。
 _GPSR_WORKFLOW_KEY = "amazon_gpsr_attestation"
+_INVENTORY_GPSR_WORKFLOW_KEY = "amazon_inventory_gpsr_attestation"
+
+_INVENTORY_GPSR_KIND_LABELS: dict[NotificationKind, str] = {
+    NotificationKind.INVENTORY_PAGE_PAUSED: "已暂停，等待页面恢复",
+    NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN: "任务已取消，合规信息提交结果待核对",
+    NotificationKind.RUN_COMPLETED: "库存合规信息处理完成",
+    NotificationKind.RUN_FAILED: "库存合规信息处理未完成",
+    NotificationKind.RUN_PARTIAL: "库存合规信息部分处理未完成",
+    NotificationKind.RUN_SKIPPED: "本次未提交库存合规信息",
+}
+
+_INVENTORY_GPSR_NEXT_ACTIONS: dict[NotificationKind, str] = {
+    NotificationKind.INVENTORY_PAGE_PAUSED: "在对应紫鸟店铺确认页面恢复后，到本地原运行详情点击「页面已恢复，继续剩余商品」；不会自动重试或重做已完成项。",
+    NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN: "请在对应紫鸟店铺核对审核中状态，并查看本地运行详情；未决记录保留，后续任务只回读，不重复保存。",
+    NotificationKind.RUN_COMPLETED: "逐商品结果在本地运行详情；已提交的内容正在等待亚马逊审核。",
+    NotificationKind.RUN_FAILED: "请查看本地运行详情；结果不明的商品只回读核查，不重复保存。",
+    NotificationKind.RUN_PARTIAL: "请查看本地运行详情中的未完成商品；已提交或结果不明的商品不重复保存。",
+    NotificationKind.RUN_SKIPPED: "本次没有新提交；跳过原因和商品清单见本地运行详情。",
+}
 
 _GPSR_KIND_LABELS: dict[NotificationKind, str] = {
     NotificationKind.RUN_COMPLETED: "安全证明已完成",
@@ -495,6 +544,7 @@ _GPSR_NEXT_ACTIONS: dict[NotificationKind, str] = {
 
 # 空跑只读取与判定,什么都没提交:状态不能写「已完成」,下一步要指向「核对后再切自动」。
 _DRY_RUN_WORKFLOWS = {
+    _INVENTORY_GPSR_WORKFLOW_KEY: "空跑未勾选或保存安全证明。核对运行详情中的候选商品与跳过原因，再切到自动提交。",
     _GPSR_WORKFLOW_KEY: "空跑只读取与判定，没有提交任何安全证明。核对候选条目无误后，再把排期切成自动提交。",
     _FEEDBACK_WORKFLOW_KEY: "空跑只读取与判定，没有向亚马逊提交任何请求。核对反馈处理台里的判定无误后，再切到自动提交。",
 }
@@ -511,6 +561,10 @@ def _is_dry_run_completion(kind: NotificationKind, workflow: str, mode: str) -> 
 def _kind_label(kind: NotificationKind, workflow: str = "", mode: str = "") -> str:
     if _is_dry_run_completion(kind, workflow, mode):
         return "空跑完成（未提交）"
+    if workflow == _INVENTORY_GPSR_WORKFLOW_KEY:
+        label = _INVENTORY_GPSR_KIND_LABELS.get(kind)
+        if label is not None:
+            return label
     if workflow == _GPSR_WORKFLOW_KEY:
         label = _GPSR_KIND_LABELS.get(kind)
         if label is not None:
@@ -527,6 +581,10 @@ def _default_next_action(
 ) -> str:
     if _is_dry_run_completion(kind, workflow, mode):
         return _DRY_RUN_WORKFLOWS[workflow]
+    if workflow == _INVENTORY_GPSR_WORKFLOW_KEY:
+        action = _INVENTORY_GPSR_NEXT_ACTIONS.get(kind)
+        if action is not None:
+            return action
     if workflow == _GPSR_WORKFLOW_KEY:
         action = _GPSR_NEXT_ACTIONS.get(kind)
         if action is not None:
@@ -553,6 +611,7 @@ def _default_next_action(
             "请到亚马逊卖家后台核对这笔是否已发出，再回本地后台运行详情页选择"
             "「我已在亚马逊核对，结案」或「确认未发出，释放」。切勿手动重新提交。"
         ),
+        NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN: "请在对应紫鸟店铺核对安全证明状态，只回读、不重复保存。",
         NotificationKind.CROSS_DAY_STARTED: "任务已按原队列顺序开始，无需重新创建。",
     }[kind]
 
@@ -633,6 +692,19 @@ _GPSR_OUTCOME_LABELS = {
 
 def _outcome_label(value: str, workflow: str = "") -> str:
     key = value.upper()
+    if workflow == _INVENTORY_GPSR_WORKFLOW_KEY:
+        label = {
+            "PAUSED": "已暂停，等待页面恢复",
+            "SUCCEEDED": "处理完成",
+            "CONFIRMED": "已提交，审核中",
+            "SUBMITTED": "等待页面确认",
+            "SUBMITTING": "保存结果待核查",
+            "UNCERTAIN": "提交结果不明",
+            "PLANNED": "检查完成，待处理",
+            "PREFLIGHT": "读取中",
+        }.get(key)
+        if label is not None:
+            return label
     if workflow == _GPSR_WORKFLOW_KEY and key in _GPSR_OUTCOME_LABELS:
         return _GPSR_OUTCOME_LABELS[key]
     if workflow == _FEEDBACK_WORKFLOW_KEY and key in _FEEDBACK_OUTCOME_LABELS:

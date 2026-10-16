@@ -1,0 +1,97 @@
+<!doctype html><meta charset="utf-8">
+<style>kat-panel,kat-checkbox,kat-button,kat-link,kat-pagination,kat-dropdown,kat-option{display:block;padding:8px} [hidden]{display:none!important}</style>
+<div id="dropdown-account-switcher-container">
+ <div class="dropdown-account-switcher-header-label-global">fixture seller</div>
+ <div class="dropdown-account-switcher-header-label-regional">德国</div>
+</div>
+<kat-dropdown value="ApprovalRequired">需要批准 (3)</kat-dropdown>
+<kat-input-group>
+ <kat-dropdown value="ALL"></kat-dropdown>
+ <kat-input type="text" maxlength="1000"></kat-input>
+</kat-input-group>
+<div id="rows">
+ <div data-sku="SKU-GPSR"><a href="https://www.amazon.de/dp/B000000001">Fixture GPSR</a><kat-link label="解决商品信息问题">解决商品信息问题</kat-link></div>
+ <div data-sku="SKU-EPR"><a href="https://www.amazon.de/dp/B000000002">Fixture EPR</a><kat-link label="解决商品信息问题">解决商品信息问题</kat-link></div>
+ <div data-sku="SKU-NONE"><a href="https://www.amazon.de/dp/B000000003">Fixture Other</a><kat-link label="解决商品信息问题">解决商品信息问题</kat-link></div>
+</div>
+<kat-pagination page="1" items-per-page="100" total-items="3"></kat-pagination>
+<kat-panel data-testid="kat-panel-ActionPanelContent" hidden></kat-panel>
+<!-- Hidden persistent controls must never be used by the production adapter. -->
+<div hidden><kat-checkbox name="value" label="other"></kat-checkbox><kat-button data-testid="primary-button" label="保存"></kat-button></div>
+<script>
+(() => {
+window.fixtureClicks=[];
+window.__ziniaoInventoryGpsrConsumed=new Set();
+window.fixtureDelay=0;
+window.fixtureSplitReceipt=false;
+window.fixtureNoActionSkus=[];
+window.fixtureKeepPanel=false;
+window.fixtureItem=null;
+const group=document.querySelector('kat-input-group');
+const searchDropdown=group.querySelector('kat-dropdown');
+const searchHost=group.querySelector('kat-input');
+searchDropdown.attachShadow({mode:'open'}).innerHTML='<kat-option value="SKU">SKUS</kat-option>';
+searchHost.attachShadow({mode:'open'}).innerHTML='<input type="text" placeholder="搜索 SKU、商品名称/关键词、FNSKU、ASIN、UPC/EAN">';
+const searchInput=searchHost.shadowRoot.querySelector('input');
+searchDropdown.shadowRoot.querySelector('kat-option').onclick=()=>{
+ searchDropdown.setAttribute('value','SKU');
+ searchInput.placeholder='SKU1, SKU2';
+};
+searchInput.onkeydown=e=>{
+ if(e.key!=='Enter')return;
+ let total=0;
+ for(const row of document.querySelectorAll('[data-sku]')){
+  row.hidden=!!e.target.value && row.dataset.sku!==e.target.value;
+  if(!row.hidden)total++;
+ }
+ document.querySelector('kat-pagination').setAttribute('total-items',total);
+};
+const panel=document.querySelector('kat-panel');
+// Real KAT exposes the default content slot but leaves slot="header" unassigned.
+panel.attachShadow({mode:'open'}).innerHTML='<button type="button" part="panel-close-button" aria-label="close">关闭</button><slot></slot>';
+panel.shadowRoot.querySelector('button').onclick=()=>{
+ window.fixtureClicks.push('close:'+(window.fixtureItem?.sku||''));panel.hidden=true;
+};
+const declaration='如果您的产品没有任何警告和安全信息，请勾选“是”，因为即使没有此类信息，也可以安全地按预期使用。';
+const ident=(item,asin=true)=>`<div>${asin?'ASIN：'+item.asin:''}</div><div>SKU：${item.sku}</div>`;
+const show=content=>{panel.hidden=false;panel.innerHTML=
+ '<div data-f1-component="myp_actions_website/ActionPanelContent"><div id="ActionPanelView">'+content+'</div></div>'+
+ '<span slot="header"><div data-f1-component="myp_actions_website/ActionPanelHeader"><h4 id="actionPanelHeader">解决商品信息问题</h4></div></span>';};
+for(const row of document.querySelectorAll('[data-sku]')) row.querySelector('kat-link').onclick=()=>{
+ const item={sku:row.dataset.sku,asin:row.querySelector('a').href.split('/dp/')[1]};
+ window.fixtureItem=item;window.fixtureClicks.push('open:'+item.sku);
+ if(window.fixtureKeepPanel)return;
+ if(window.fixtureNoActionSkus.includes(item.sku)){
+  show('<kat-alert description="如果您之前已提交更改，则这些更改当前正在处理中。" persistent="true" variant="info" size="large"><span slot="header">无需采取任何操作</span></kat-alert>');
+  return;
+ }
+ show(ident(item)+`<div data-testid="action-panel-body">商品状态：非在售 ${item.sku==='SKU-NONE'?'无需操作':'<div id="violation">解决商品信息违规问题</div>'}</div>`);
+ const violation=document.querySelector('#violation');
+ if(violation) violation.onclick=()=>{
+  window.fixtureClicks.push('violation:'+item.sku);
+  if(item.sku==='SKU-EPR') {show('<div>德国 WEEE-小型设备</div>'+ident(item,false)+'<div>ERN 信息</div>');return;}
+  show(ident(item)+'<h2>警告和安全信息</h2><div>商品文件</div><div>警告和安全图片</div><div role="button" aria-label="安全证明" id="card">安全证明 未开始</div>');
+  document.querySelector('#card').onclick=()=>{
+   window.fixtureClicks.push('card:'+item.sku);
+   show(ident(item)+'<div>安全证明 已过期</div>');
+   setTimeout(()=>{
+    show(ident(item)+`<h2>GPSR 安全认证</h2><form data-testid="form"><kat-checkbox name="value" value="false" label="${declaration}"></kat-checkbox></form><kat-button data-testid="primary-button" label="保存" disabled="true">保存</kat-button>`);
+    const box=panel.querySelector('kat-checkbox');
+    box.attachShadow({mode:'open'}).innerHTML=`<label><input type="checkbox">${declaration}</label>`;
+    box.shadowRoot.querySelector('input').onchange=e=>{
+      window.fixtureClicks.push('checkbox:'+item.sku);
+      box.setAttribute('value',String(e.target.checked));
+      panel.querySelector('kat-button').toggleAttribute('disabled',!e.target.checked);
+    };
+    panel.querySelector('kat-button').onclick=()=>{
+      window.fixtureClicks.push('save:'+item.sku);
+      show(ident(item)+(window.fixtureSplitReceipt
+        ? '<h2>您提交的内容正在审核中。</h2><p>将在七天内做出决定</p>'
+        : '<div>您提交的内容正在审核中。将在七天内做出决定</div>'));
+    };
+   },window.fixtureDelay);
+  };
+ };
+};
+})();
+</script>

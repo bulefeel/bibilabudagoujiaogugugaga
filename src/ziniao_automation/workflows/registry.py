@@ -37,6 +37,7 @@ _SAFE_SCHEMA_KEYS = frozenset(
         "anyOf",
         "const",
         "default",
+        "x-create-default",
         "description",
         "enum",
         "exclusiveMaximum",
@@ -334,6 +335,12 @@ def _safe_json_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
         if key in {"required", "enum"}:
             if isinstance(value, list):
                 result[key] = [_safe_scalar(item) for item in value if _is_safe_scalar(item)]
+            continue
+        if key in {"default", "x-create-default"} and isinstance(value, list):
+            # Fixed checkbox defaults only; never expose object-valued runtime
+            # configuration or silently turn a mixed value into a partial list.
+            if all(_is_safe_scalar(item) for item in value):
+                result[key] = [_safe_scalar(item) for item in value]
             continue
         if _is_safe_scalar(value):
             result[key] = _safe_scalar(value)

@@ -256,6 +256,7 @@ $Include = @(
     'uv.lock',
     'alembic.ini',
     'onboarding-policy.toml',
+    'inventory-gpsr-policy.toml',
     'uv.exe',
     'Install.bat',
     'Start.bat',

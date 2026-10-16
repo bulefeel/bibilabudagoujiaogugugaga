@@ -38,12 +38,16 @@ def legacy(tmp_path):
 
 def existing_rows(engine):
     with engine.connect() as db:
-        tables = [row[0] for row in db.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('alembic_version','store_history','marketplace_history','store_setup_probes','store_setup_site_results')")]
+        # Compare the frozen 0010 graph. Later feature tables have their own
+        # migration/data-preservation tests and do not exist in that fixture.
+        tables = [row[0] for row in db.exec_driver_sql("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT IN ('alembic_version','store_history','marketplace_history','store_setup_probes','store_setup_site_results','inventory_gpsr_items','inventory_gpsr_requirements')")]
         result = {}
         for table in tables:
             columns = [r[1] for r in db.exec_driver_sql(f'PRAGMA table_info("{table}")') if r[1] != "setup_revision"]
             names = ",".join('"' + name + '"' for name in columns)
-            result[table] = db.exec_driver_sql(f'SELECT {names} FROM "{table}" ORDER BY rowid').all()
+            # 0014 adds disabled site enrollment options, not legacy business data.
+            where = " WHERE code NOT IN ('IT','FR','ES','PL')" if table == "store_marketplaces" else ""
+            result[table] = db.exec_driver_sql(f'SELECT {names} FROM "{table}"{where} ORDER BY rowid').all()
         return result
 
 

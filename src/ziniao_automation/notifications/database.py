@@ -1,8 +1,9 @@
 """Build and deliver safe Feishu notices from explicit SQLite facts.
 
 This module is the persistence boundary for notifications.  It deliberately
-does not inspect ``result_summary``, ``SiteRun.details``, event ``details``,
-guard metadata or approval plan JSON.  The objects it returns therefore cannot
+does not forward ``result_summary``, ``SiteRun.details``, event ``details``,
+guard metadata or approval plan JSON. Inventory summaries select only bounded
+integer counters from the item ledger or one known event type. The objects it returns cannot
 accidentally transport a browser/session payload to Feishu.
 """
 
@@ -23,6 +24,8 @@ from ..db import utc_now
 from ..models import (
     ApprovalRequest,
     FeedbackReview,
+    InventoryGpsrItem,
+    InventoryGpsrRequirement,
     NotificationDelivery,
     OperationGuard,
     Run,
@@ -36,6 +39,7 @@ from ..models import (
 from .dto import (
     NotificationKind,
     SafeFeedbackNotice,
+    SafeInventoryGpsrCounts,
     SafeRunNotice,
     SafeSiteNotice,
 )
@@ -48,10 +52,13 @@ _ALLOWED_KINDS = frozenset(NotificationKind)
 # would be a false statement about it.
 FEEDBACK_WORKFLOW_KEY = "amazon_feedback_removal"
 GPSR_WORKFLOW_KEY = "amazon_gpsr_attestation"
+INVENTORY_GPSR_WORKFLOW_KEY = "amazon_inventory_gpsr_attestation"
 
 # 这些流程一分钱都不碰，所以卡片上任何金额字段都会是一句假话：站点行会渲染成
 # 「EUR 0.00 可提现」，读起来像这家店提不出钱。
-NON_FINANCIAL_WORKFLOWS = frozenset({FEEDBACK_WORKFLOW_KEY, GPSR_WORKFLOW_KEY})
+NON_FINANCIAL_WORKFLOWS = frozenset(
+    {FEEDBACK_WORKFLOW_KEY, GPSR_WORKFLOW_KEY, INVENTORY_GPSR_WORKFLOW_KEY}
+)
 FEEDBACK_PENDING = "PENDING"
 # Entries whose submit button was actually clicked.  UNCERTAIN belongs here:
 # the request went out, only the read-back could not confirm it.
@@ -94,6 +101,90 @@ SITE_REASON_EVENTS = (
 
 class SafeNoticeSender(Protocol):
     async def send(self, notice: SafeRunNotice) -> None: ...
+
+
+def read_inventory_gpsr_counts(
+    session: Session, run_id: str
+) -> SafeInventoryGpsrCounts | None:
+    """Read current numeric facts, including runs with legacy summary events.
+
+    A complete list is not a completed inspection. The ledger is authoritative
+    over stale/finally-block events; only its PENDING rows are uninspected and
+    BLOCKED is not an item-loading failure. No item identifiers leave this API.
+    """
+    scan_complete = session.scalar(
+        select(RunEvent.id).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "inventory_gpsr_scan_complete",
+        ).limit(1)
+    ) is not None
+    if not scan_complete:
+        return None
+    requirements = session.scalars(select(InventoryGpsrRequirement).where(InventoryGpsrRequirement.run_id == run_id)).all()
+    if requirements:
+        return SafeInventoryGpsrCounts(
+            scanned=len({r.item_id for r in requirements}), requirements=len(requirements),
+            pending=sum(r.state == 'PENDING' for r in requirements),
+            blocked=sum(r.state == 'BLOCKED' for r in requirements),
+            eligible=sum(r.eligible for r in requirements),
+            confirmed=sum(r.state == 'CONFIRMED' for r in requirements),
+            already_submitted=sum(r.state == 'ALREADY_SUBMITTED' for r in requirements),
+            no_violation_entry=sum(r.state == 'NO_VIOLATION_ENTRY' for r in requirements),
+            no_attestation=sum(r.state == 'NO_ATTESTATION' for r in requirements),
+            missing=sum(r.state == 'MISSING' for r in requirements),
+            failed=sum(r.state == 'FAILED' for r in requirements),
+            uncertain=sum(r.state in {'SUBMITTING', 'UNCERTAIN'} for r in requirements),
+            safety_confirmed=sum(r.state == 'CONFIRMED' and r.requirement_type == 'safety_attestation' for r in requirements),
+            manufacturer_confirmed=sum(r.state == 'CONFIRMED' and r.requirement_type == 'manufacturer' for r in requirements),
+            responsible_confirmed=sum(r.state == 'CONFIRMED' and r.requirement_type == 'responsible_person' for r in requirements),
+            already_linked=sum(r.state == 'ALREADY_LINKED' for r in requirements),
+            multiple_records=sum(r.state == 'MULTIPLE_RECORDS' for r in requirements),
+            no_records=sum(r.state == 'NO_RECORDS' for r in requirements),
+            invalid_record=sum(r.state == 'INVALID_RECORD' for r in requirements),
+            not_applicable=sum(r.state == 'NOT_APPLICABLE' for r in requirements),
+        )
+    rows = session.execute(
+        select(InventoryGpsrItem.state, InventoryGpsrItem.eligible)
+        .where(InventoryGpsrItem.run_id == run_id)
+    ).all()
+    if rows:
+        return SafeInventoryGpsrCounts(
+            scanned=len(rows),
+            pending=sum(row.state == "PENDING" for row in rows),
+            blocked=sum(row.state == "BLOCKED" for row in rows),
+            eligible=sum(bool(row.eligible) for row in rows),
+            confirmed=sum(row.state == "CONFIRMED" for row in rows),
+            already_submitted=sum(row.state == "ALREADY_SUBMITTED" for row in rows),
+            no_violation_entry=sum(row.state == "NO_VIOLATION_ENTRY" for row in rows),
+            no_attestation=sum(row.state == "NO_ATTESTATION" for row in rows),
+            missing=sum(row.state == "MISSING" for row in rows),
+            failed=sum(row.state == "FAILED" for row in rows),
+            uncertain=sum(row.state in {"SUBMITTING", "UNCERTAIN"} for row in rows),
+        )
+    details = session.scalar(
+        select(RunEvent.details).where(
+            RunEvent.run_id == run_id,
+            RunEvent.event_type == "inventory_gpsr_summary",
+        ).order_by(RunEvent.id.desc()).limit(1)
+    )
+    # Event-only historical exports must explicitly include pending/blocked.
+    # Their absence is not evidence that every candidate was checked.
+    counts = SafeInventoryGpsrCounts.from_event(details)
+    if counts is not None:
+        return counts
+    if details is None or (
+        isinstance(details, dict)
+        and type(details.get("scanned")) is int
+        and details["scanned"] == 0
+        and all(type(value) is int and value == 0 for value in (
+            details.get(name) for name in (
+                "eligible", "confirmed", "already_submitted", "no_violation_entry",
+                "no_attestation", "missing", "failed", "uncertain",
+            )
+        ))
+    ):
+        return SafeInventoryGpsrCounts()
+    return None
 
 
 class DatabaseNoticeBuilder:
@@ -263,6 +354,58 @@ class DatabaseNoticeBuilder:
                 .order_by(RunEvent.created_at.desc(), RunEvent.id.desc())
                 .limit(1)
             ).one_or_none()
+            inventory_counts = None
+            inventory_history_blocked = False
+            inventory_unsettled_count = 0
+            inventory_pause_http_status = None
+            inventory_pause_reason = None
+            inventory_site_diagnostics = {}
+            if run_row.workflow == INVENTORY_GPSR_WORKFLOW_KEY:
+                pause_details = session.scalar(
+                    select(RunEvent.details).where(
+                        RunEvent.run_id == run_id,
+                        RunEvent.event_type == "inventory_gpsr_paused",
+                    ).order_by(RunEvent.id.desc()).limit(1)
+                )
+                candidate = (pause_details or {}).get("http_status") if isinstance(pause_details, dict) else None
+                if type(candidate) is int and (candidate in {403, 429} or 500 <= candidate <= 599):
+                    inventory_pause_http_status = candidate
+                if isinstance(pause_details, dict):
+                    reason = pause_details.get("reason_code")
+                    if isinstance(reason, str) and reason in {"inventory_scan_unstable", "inventory_no_progress"}:
+                        inventory_pause_reason = reason
+                diagnostics = session.execute(
+                    select(RunEvent.site_run_id, RunEvent.details).where(
+                        RunEvent.run_id == run_id,
+                        RunEvent.event_type.in_(("inventory_gpsr_stopped", "inventory_gpsr_paused")),
+                    ).order_by(RunEvent.created_at.desc(), RunEvent.id.desc())
+                ).all()
+                for diagnostic in diagnostics:
+                    inventory_site_diagnostics.setdefault(diagnostic.site_run_id,
+                                                          _inventory_diagnostic_label(diagnostic.details))
+                inventory_counts = read_inventory_gpsr_counts(session, run_id)
+                inventory_history_blocked = bool(
+                    inventory_counts is not None and inventory_counts.blocked
+                ) or session.scalar(
+                    select(RunEvent.id).where(
+                        RunEvent.run_id == run_id,
+                        RunEvent.event_type == "inventory_gpsr_history_blocked",
+                    ).limit(1)
+                ) is not None
+                if kind is NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN:
+                    # cancel() may notify before the worker's finally block
+                    # refreshes its summary event. Read only current scalar
+                    # ledger facts so a stale summary cannot silence intent.
+                    inventory_rows = session.execute(
+                        select(InventoryGpsrRequirement.state, InventoryGpsrRequirement.eligible)
+                        .where(InventoryGpsrRequirement.run_id == run_id)
+                    ).all()
+                    if not inventory_rows:
+                        inventory_rows = session.execute(select(InventoryGpsrItem.state, InventoryGpsrItem.eligible)
+                            .where(InventoryGpsrItem.run_id == run_id)).all()
+                    inventory_unsettled_count = sum(
+                        row.state in {"SUBMITTING", "UNCERTAIN"} for row in inventory_rows
+                    )
 
         # 「发出去了」= 看到点击返回的(SUBMITTED)或人工结案的(CONFIRMED)。
         dispatched_codes = sorted(
@@ -290,6 +433,8 @@ class DatabaseNoticeBuilder:
             scheduled_for=_as_utc(run_row.scheduled_for_at),
             started_at=_as_utc(run_row.started_at),
             schedule_timezone=run_row.schedule_timezone,
+            workflow=run_row.workflow,
+            inventory_unsettled_count=inventory_unsettled_count,
         ):
             return None
 
@@ -370,7 +515,12 @@ class DatabaseNoticeBuilder:
         summary = _summary_for(
             kind,
             workflow=run_row.workflow,
+            inventory_counts=inventory_counts,
+            inventory_history_blocked=inventory_history_blocked,
+            inventory_unsettled_count=inventory_unsettled_count,
             feedback_counts=feedback_counts,
+            inventory_pause_http_status=inventory_pause_http_status,
+            inventory_pause_reason=inventory_pause_reason,
             feedback_backlog=feedback_backlog,
             run_mode=run_row.mode,
             run_error=run_row.error,
@@ -413,8 +563,12 @@ class DatabaseNoticeBuilder:
                     reference_suffix="",
                     # A recorded error is the precise cause; otherwise the skip
                     # event says why this site was left alone.
-                    reason=_without_exception_prefix(
-                        row.error or skip_reasons.get(row.id, "")
+                    reason=(
+                        inventory_site_diagnostics.get(row.id, "逐商品结果见本地运行详情")
+                        if run_row.workflow == INVENTORY_GPSR_WORKFLOW_KEY
+                        else _without_exception_prefix(
+                            row.error or skip_reasons.get(row.id, "")
+                        )
                     ),
                     account_changed=bool(
                         account and earlier_tail and account != earlier_tail
@@ -445,6 +599,7 @@ class DatabaseNoticeBuilder:
             workflow=run_row.workflow or "",
             feedback_items=tuple(feedback_items),
             feedback_omitted=feedback_omitted,
+            inventory_gpsr_counts=inventory_counts,
             mode=run_row.mode,
             trigger=run_row.trigger,
             schedule_name=run_row.schedule_name or "",
@@ -535,6 +690,7 @@ class NotificationDeliveryService:
         target = {
             NotificationKind.WAITING_AUTH: "WAITING_AUTH",
             NotificationKind.AUTH_TIMEOUT: "NEEDS_HUMAN_AUTH",
+            NotificationKind.INVENTORY_PAGE_PAUSED: "PAUSED",
         }.get(kind)
         if target is None:
             return ""
@@ -825,6 +981,43 @@ def _feedback_summary(
     return f"本次没有提交任何请求审核。{seen}{outstanding}"
 
 
+def _inventory_diagnostic_label(details: object) -> str:
+    """Only fixed enum labels reach cards; never messages, URLs, SKU or traces."""
+    if not isinstance(details, dict):
+        return "逐商品结果见本地运行详情"
+    reasons = {
+        "inventory_scan_unstable": "扫描数量持续变化，有限重扫后暂停",
+        "inventory_no_progress": "连续读取失败或长时间无进展，已暂停",
+        "inventory_page_unavailable": "库存页面暂未恢复",
+        "read_timeout": "页面加载或读取超时",
+        "target_closed": "页面或紫鸟连接已关闭",
+        "historical_submission_blocked": "历史提交与当前要求待核对",
+        "submission_result_uncertain": "提交结果未确认，仅回读",
+        "page_contract_error": "页面结构或身份核验未通过",
+        "inventory_processing_error": "执行异常，详见本地诊断",
+    }
+    stages = {
+        "plan": "候选扫描", "execute": "商品执行", "inventory_list": "库存列表读取",
+        "search_or_location": "商品定位或 SKU 搜索", "sidebar_read": "商品侧栏读取",
+        "identity_check": "卖家身份核验", "history_reconciliation": "历史提交回读",
+        "marketplace_switch": "商城切换", "submission": "提交派发",
+        "attestation_form": "安全证明表单", "responsible_person_form": "关联信息表单",
+        "prepare_submission": "提交前核验",
+    }
+    code, stage = details.get("reason_code"), details.get("stage")
+    reason = reasons.get(code) if isinstance(code, str) else None
+    if reason is None:
+        return "逐商品结果见本地运行详情"
+    label = stages.get(stage, "") if isinstance(stage, str) else ""
+    result = (label + "：" if label else "") + reason
+    remaining = details.get("remaining_marketplaces")
+    if isinstance(remaining, list):
+        codes = [c for c in ("DE", "IT", "FR", "ES", "PL") if c in remaining]
+        if codes:
+            result += "，后续 " + "、".join(codes) + " 未执行"
+    return result
+
+
 def _summary_for(
     kind: NotificationKind,
     *,
@@ -835,7 +1028,12 @@ def _summary_for(
     site_skip_reasons: list[str],
     event_message: str | None,
     workflow: str = "",
+    inventory_counts: SafeInventoryGpsrCounts | None = None,
+    inventory_history_blocked: bool = False,
+    inventory_unsettled_count: int = 0,
     feedback_counts: dict[str, int] | None = None,
+    inventory_pause_http_status: int | None = None,
+    inventory_pause_reason: str | None = None,
     feedback_backlog: dict[str, int] | None = None,
     has_sites: bool = False,
     dispatched_codes: list[str] | None = None,
@@ -872,6 +1070,59 @@ def _summary_for(
         return "登录验证在等待期限内未完成。"
     if kind is NotificationKind.CROSS_DAY_STARTED:
         return "该任务排队至次日后开始执行。"
+    if workflow == INVENTORY_GPSR_WORKFLOW_KEY:
+        unit = "项" if inventory_counts is not None and inventory_counts.requirements else "件"
+        if kind is NotificationKind.INVENTORY_PAGE_PAUSED:
+            reason = (
+                f"网页请求返回 HTTP {inventory_pause_http_status}，任务已暂停。"
+                if inventory_pause_http_status is not None
+                else "网页暂未恢复，任务已暂停。"
+            )
+            if inventory_pause_reason == "inventory_scan_unstable":
+                reason = "库存数量持续变化，有限重扫未完成，已暂停；该站候选扫描未完成。"
+            elif inventory_pause_reason == "inventory_no_progress":
+                reason = "连续读取失败或长时间无有效进展，已暂停，避免持续无效点击。"
+            if inventory_counts is None:
+                return reason + "尚未完成全部分页扫描；已记录进度保留，确认页面恢复后继续原任务。"
+            return reason + (
+                f"已取得的候选清单与已完成进度保留；尚未检查 {inventory_counts.pending} {unit}，"
+                f"本轮已确认提交 {inventory_counts.confirmed} {unit}。"
+                "确认页面恢复后继续剩余商品，不重复保存已提交项。"
+            )
+        if kind is NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN:
+            return (
+                f"任务已取消，但仍有 {inventory_unsettled_count} 项合规信息提交结果未确认。"
+                "取消不会撤销已经发生的保存；记录已保留，只回读核查，不重复提交。"
+            )
+        if inventory_history_blocked and kind in (
+            NotificationKind.RUN_FAILED, NotificationKind.RUN_PARTIAL
+        ) and inventory_counts is None:
+            return "该店铺存在历史合规信息提交结果待核对，本轮未进行新的提交；请查看本地运行详情。"
+        if str(run_mode).lower() == "dry_run":
+            head = "空跑：仅检查已配置的合规要求，未勾选或保存任何合规信息。"
+        elif inventory_counts is not None and inventory_counts.confirmed:
+            if inventory_counts.requirements:
+                head = (f"已确认提交 {inventory_counts.confirmed} 项合规要求："
+                        f"安全证明 {inventory_counts.safety_confirmed} 项、"
+                        f"负责人 {inventory_counts.responsible_confirmed} 项、"
+                        f"制造商 {inventory_counts.manufacturer_confirmed} 项，正在等待亚马逊审核。")
+            else:
+                head = f"已确认提交 {inventory_counts.confirmed} 件安全证明，正在等待亚马逊审核。"
+        else:
+            head = "本次没有新确认的合规信息提交。"
+        if inventory_counts is None:
+            return head + "尚未完成全部分页扫描或生成完整汇总；具体进度和原因见本地运行详情。"
+        if inventory_counts.uncertain:
+            return head + "存在提交结果不明的商品，已停止后续提交；只回读核查，不重复保存。"
+        if inventory_counts.blocked or inventory_counts.pending:
+            return head + (
+                f"已取得候选清单；尚未检查 {inventory_counts.pending} {unit}，"
+                f"历史记录待核对 {inventory_counts.blocked} {unit}。"
+                "逐商品核验尚未完成，已核验可处理数不是全部候选的最终结论。"
+            )
+        if kind in (NotificationKind.RUN_FAILED, NotificationKind.RUN_PARTIAL):
+            return head + "部分检查或处理未完成；具体原因见本地运行详情。"
+        return head
     # GPSR 排在提现分支之前：它没有自己的台账表，汇总完全来自站点级事件的正文，
     # 那些正文是本代码库自己拼的，页面上的任何东西都搭不了顺风车。
     if workflow == GPSR_WORKFLOW_KEY:
@@ -951,6 +1202,19 @@ def _title_for(
     # 空跑只读取与判定,什么都没提交。标题写「已完成」会被读成「证明已提交 /
     # 反馈已处理」(09-23 自审复核:空跑卡的标题和正文自相矛盾)。
     dry_run_done = kind is NotificationKind.RUN_COMPLETED and mode == "dry_run"
+    if workflow == INVENTORY_GPSR_WORKFLOW_KEY:
+        label = "空跑完成（未提交）" if dry_run_done else {
+            NotificationKind.WAITING_AUTH: "等待登录验证",
+            NotificationKind.AUTH_TIMEOUT: "登录验证未完成",
+            NotificationKind.RUN_COMPLETED: "处理完成",
+            NotificationKind.RUN_FAILED: "处理未完成",
+            NotificationKind.RUN_PARTIAL: "部分处理未完成",
+            NotificationKind.RUN_SKIPPED: "本次未提交",
+            NotificationKind.CROSS_DAY_STARTED: "跨日任务开始",
+            NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN: "已取消，提交结果待核对",
+            NotificationKind.INVENTORY_PAGE_PAUSED: "已暂停，等待页面恢复",
+        }.get(kind, "需要核查")
+        return f"库存待批准商品合规处理 · {store_name} · {label}"
     if workflow == GPSR_WORKFLOW_KEY and dry_run_done:
         return f"GPSR 安全证明 · {store_name} · 空跑完成（未提交）"
     if workflow == FEEDBACK_WORKFLOW_KEY and dry_run_done:
@@ -1020,7 +1284,17 @@ def _kind_matches_facts(
     scheduled_for: datetime | None,
     started_at: datetime | None,
     schedule_timezone: str | None,
+    workflow: str = "",
+    inventory_unsettled_count: int = 0,
 ) -> bool:
+    if kind is NotificationKind.INVENTORY_PAGE_PAUSED:
+        return workflow == INVENTORY_GPSR_WORKFLOW_KEY and run_status == "PAUSED"
+    if kind is NotificationKind.INVENTORY_SUBMISSION_UNCERTAIN:
+        return (
+            workflow == INVENTORY_GPSR_WORKFLOW_KEY
+            and run_status == "CANCELLED"
+            and inventory_unsettled_count > 0
+        )
     if kind is NotificationKind.WAITING_APPROVAL:
         return run_status == "WAITING_APPROVAL"
     if kind is NotificationKind.WAITING_AUTH:

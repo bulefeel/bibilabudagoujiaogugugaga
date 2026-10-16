@@ -14,7 +14,7 @@ from sqlalchemy import select, text
 
 from .db import utc_now
 from .models import Store, StoreMarketplace, StoreSetupProbe as Probe, StoreSetupSiteResult as Site
-from .workflows.amazon_disbursement.config import ALLOWED_MARKETPLACES
+from .workflows.store_setup.config import SETUP_MARKETPLACES, DEFAULT_SETUP_CODES
 from .workflows.setup_diagnostics import SetupDiagnostic, REASON_MESSAGES
 from .workflows.store_setup.identity import ADAPTER_VERSION
 
@@ -98,8 +98,8 @@ class SetupRepository:
     def begin(self, store_id, codes, *, kind, seconds, policy_version, request_id=None, scope="full", expected_revision=None):
         if scope not in {"full", "retry_unverified"}:
             raise ValueError("未知核验范围")
-        if kind != "identity" and (not codes or len(set(codes)) != len(codes) or set(codes) - set(ALLOWED_MARKETPLACES)):
-            raise ValueError("请选择不重复的 CA/UK/AU 站点")
+        if kind != "identity" and (not codes or len(set(codes)) != len(codes) or set(codes) - set(SETUP_MARKETPLACES)):
+            raise ValueError("请选择不重复的已支持建档站点")
         with self.sessions() as session:
             session.execute(text("BEGIN IMMEDIATE"))
             store = self._store(session, store_id)
@@ -134,7 +134,7 @@ class SetupRepository:
                             "message": "当前范围已通过，无需重复核验"}
             elif kind == "unified":
                 for code in codes:
-                    domain, currency = ALLOWED_MARKETPLACES[code]
+                    domain, currency = SETUP_MARKETPLACES[code]
                     market = session.scalar(select(StoreMarketplace).where(StoreMarketplace.store_id == store_id, StoreMarketplace.code == code))
                     if market is None:
                         session.add(StoreMarketplace(store_id=store_id, code=code, domain=domain, currency=currency, enabled=True))
@@ -153,7 +153,7 @@ class SetupRepository:
                 deadline_at=now + timedelta(seconds=seconds))
             session.add(row); session.flush()
             for code in codes:
-                session.add(Site(probe_id=row.id, marketplace_code=code, domain=ALLOWED_MARKETPLACES[code][0],
+                session.add(Site(probe_id=row.id, marketplace_code=code, domain=SETUP_MARKETPLACES[code][0],
                     adapter_version=ADAPTER_VERSION, message="等待核验"))
             session.commit()
             return self._view(session, row)
@@ -182,7 +182,7 @@ class SetupRepository:
                 return requested
             summary = self._summary(session, store)
             proven = [code for code in summary["selected_marketplace_codes"]
-                      if code in ALLOWED_MARKETPLACES and code not in requested
+                      if code in SETUP_MARKETPLACES and code not in requested
                       and summary["marketplaces"].get(code, {}).get("outcome") == "PASSED"]
             return proven + requested
 
@@ -195,7 +195,7 @@ class SetupRepository:
 
     def bind_identity(self, probe_id, seller, selector, code):
         seller = " ".join(str(seller).split())
-        if not seller or len(seller) > 120 or code not in ALLOWED_MARKETPLACES:
+        if not seller or len(seller) > 120 or code not in SETUP_MARKETPLACES:
             raise SetupConflict("身份结果缺少可信证据")
         with self.sessions() as session:
             session.execute(text("BEGIN IMMEDIATE"))
@@ -356,7 +356,7 @@ class SetupRepository:
 
     def _site_view(self, row):
         status = "SUCCEEDED" if row.outcome == "PASSED" else "CANCELLED" if row.outcome == "CANCELLED" else "FAILED" if row.outcome else "CHECKING" if row.attempted else "PENDING"
-        payload = {"code": row.marketplace_code, "domain": row.domain, "currency": ALLOWED_MARKETPLACES[row.marketplace_code][1],
+        payload = {"code": row.marketplace_code, "domain": row.domain, "currency": SETUP_MARKETPLACES[row.marketplace_code][1],
                 "status": status, "outcome": row.outcome, "attempted": row.attempted,
                 "identity_check": row.identity_check, "access_check": row.access_check,
                 "payment_capability": row.payment_capability, "reason_code": row.reason_code,
@@ -393,7 +393,7 @@ class SetupRepository:
                 if probe.setup_revision == store.setup_revision and probe.adapter_version == ADAPTER_VERSION and item.marketplace_code not in latest:
                     latest[item.marketplace_code] = self._site_view(item)
         enabled = [m[0] for m in snapshot(session, store)["markets"] if m[3]]
-        eligible = [c for c in enabled if c in ALLOWED_MARKETPLACES]
+        eligible = [c for c in enabled if c in SETUP_MARKETPLACES]
         passed = sum(latest.get(c, {}).get("outcome") == "PASSED" for c in eligible)
         active = next((p for p in probes if p.lifecycle in ACTIVE), None)
         state = "UNVERIFIED" if not latest else "SUCCEEDED" if eligible and passed == len(eligible) else "PARTIAL" if passed else "FAILED"
@@ -427,15 +427,17 @@ class SetupRepository:
                 with self.sessions() as session:
                     store=self._store(session,sid); summary=self._summary(session,store)
                     enabled=summary["selected_marketplace_codes"]
-                    codes=list(selections.get(sid, [c for c in enabled if c in ALLOWED_MARKETPLACES]))
-                    defaulted=mode=="fill_missing" and not enabled
-                    if defaulted: codes=list(ALLOWED_MARKETPLACES)
+                    codes=list(selections.get(sid, [c for c in enabled if c in SETUP_MARKETPLACES]))
+                    explicit = sid in selections
+                    defaulted=mode=="fill_missing" and not enabled and not explicit
+                    if defaulted: codes=list(DEFAULT_SETUP_CODES)
                     reason=None
                     if not store.platform.is_amazon: reason="仅核验已确认的亚马逊店铺"
-                    elif mode=="fill_missing" and summary["configured"]: reason="配置已完整，可选择重试未通过站点或复核"
+                    elif mode=="fill_missing" and summary["configured"] and not explicit: reason="配置已完整，可选择重试未通过站点或复核"
                     elif summary["active_probe"]: reason="已有活动核验"
-                    elif not codes: reason="当前站点不适用于CA/UK/AU统一核验"
-                    elif not defaulted and not set(codes)<=set(enabled): reason="请求范围不在当前所选站点中"
+                    elif not codes: reason="请选择要核验的站点"
+                    elif len(set(codes)) != len(codes) or set(codes)-set(SETUP_MARKETPLACES): reason="包含重复或不支持的建档站点"
+                    elif mode=="retry_unverified" and not set(codes)<=set(enabled): reason="请求范围不在当前所选站点中"
                     if mode=="retry_unverified": codes=[c for c in codes if summary["marketplaces"].get(c,{}).get("outcome")!="PASSED"]
                     if not codes and not reason: reason="当前范围已通过，无需补测"
                     targets.append({"store_id":sid,"name":store.name,"setup_revision":store.setup_revision,

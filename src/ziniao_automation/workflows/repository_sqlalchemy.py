@@ -91,6 +91,8 @@ class SqlAlchemyWorkflowRepository:
             site = _get_or_create_site(session, run_id, marketplace_code)
             site.status = status.value
             site.error = error
+            if status is SiteStatus.PAUSED:
+                site.finished_at = None
             if status in (SiteStatus.PREFLIGHT, SiteStatus.RECONCILING):
                 site.started_at = site.started_at or utc_now()
             if status in {

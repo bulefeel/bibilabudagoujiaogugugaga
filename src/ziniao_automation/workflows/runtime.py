@@ -37,6 +37,7 @@ from .engine import WorkflowEngine
 from .setup_diagnostics import SetupDiagnostic
 from ziniao_automation.config import PROJECT_ROOT
 from .store_setup.adapter import AmazonStoreSetupPage, SiteSetupResult
+from .store_setup.config import SETUP_MARKETPLACES
 from .store_setup.identity import SetupRejected
 from .store_setup.policy import OnboardingPolicy
 from .amazon_disbursement.config import ALLOWED_MARKETPLACES
@@ -1335,12 +1336,11 @@ class AutomationService:
         )
         if not normalized:
             raise ValueError("统一建档必须明确选择至少一个站点，禁止自动扩展到其他地区")
-        unknown = set(normalized) - set(ALLOWED_MARKETPLACES)
+        unknown = set(normalized) - set(SETUP_MARKETPLACES)
         if unknown:
             raise ValueError(
-                # 统一建档要读付款页才能核验，所以它的白名单是提现流程的
-                # ALLOWED_MARKETPLACES，**不含 DE**。这和店铺弹窗能勾 DE 并不矛盾。
-                f"统一建档站点只能是 {marketplace_codes_text(ALLOWED_MARKETPLACES)}"
+                # 统一建档包含付款站点及库存合规站点；提现范围保持独立。
+                f"统一建档站点只能是 {marketplace_codes_text(SETUP_MARKETPLACES)}"
                 "；无效站点：" + "、".join(sorted(unknown))
             )
 
@@ -1398,8 +1398,8 @@ class AutomationService:
             initial_sites = [
                 {
                     "code": code,
-                    "domain": ALLOWED_MARKETPLACES[code][0],
-                    "currency": ALLOWED_MARKETPLACES[code][1],
+                    "domain": SETUP_MARKETPLACES[code][0],
+                    "currency": SETUP_MARKETPLACES[code][1],
                     "status": "PENDING",
                     "identity_check": "NOT_CHECKED",
                     "access_check": "NOT_CHECKED",
@@ -1470,7 +1470,8 @@ class AutomationService:
         financial_session = getattr(self.ziniao_controller, "financial_session", None)
         if not callable(financial_session):
             raise RuntimeError("紫鸟控制器缺少资金全局锁，已停止统一建档")
-        adapter = AmazonStoreSetupPage(policy)
+        adapter = AmazonStoreSetupPage(policy,
+            inventory_policy_path=self.setup_policy_path.parent / "inventory-gpsr-policy.toml")
         identity_marketplace_codes = self.setup_records.identity_bootstrap_codes(probe_id)
         async with self._setup_session(probe_id, selector, store_id) as handle:
             seller_id = ""
@@ -1478,7 +1479,7 @@ class AutomationService:
             identity_code = ""
             failures: list[str] = []
             for code in identity_marketplace_codes:
-                domain, currency = ALLOWED_MARKETPLACES[code]
+                domain, currency = SETUP_MARKETPLACES[code]
                 marketplace = MarketplaceRef(
                     id=f"store-setup-identity-{code.lower()}",
                     code=code,
@@ -1683,7 +1684,7 @@ class AutomationService:
         # FAILED, so setup could never report success.
         del selector
         for code in marketplace_codes:
-            domain, currency = ALLOWED_MARKETPLACES[code]
+            domain, currency = SETUP_MARKETPLACES[code]
             marketplace = MarketplaceRef(
                 id=f"store-setup-{code.lower()}",
                 code=code,
@@ -2523,6 +2524,17 @@ class AutomationService:
             )
         else:
             await self._spawn(run_id, lambda run: self.engine.continue_auth(run))
+
+    async def resume_inventory_run(self, run_id: str) -> None:
+        """Resume the same inventory run only after an explicit operator action."""
+        if self._queue is None or self._worker is None:
+            raise RuntimeError("库存继续任务需要持久队列")
+        run = await self.run_loader(run_id)
+        if run.workflow != "amazon_inventory_gpsr_attestation":
+            raise RuntimeError("该任务不是库存安全证明流程")
+        self._queue.resume_inventory_run(run_id)
+        await self._worker.start()
+        self._worker.wake()
 
     async def cancel_run(self, run_id: str) -> None:
         if self.session_factory is not None:

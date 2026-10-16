@@ -206,8 +206,8 @@ def test_de_only_is_not_widened_and_preview_is_readonly(records):
     revision=repo.summary(sid)['setup_revision']
     for mode in ('fill_missing','retry_unverified','recheck'):
         preview=repo.preview([sid],mode,{})
-        assert preview['eligible_count']==0
-        assert preview['targets'][0]['marketplace_codes']==[]
+        assert preview['eligible_count']==1
+        assert preview['targets'][0]['marketplace_codes']==['DE']
     assert repo.summary(sid)['setup_revision']==revision
     with sessions() as db:assert db.scalar(select(func.count()).select_from(StoreSetupProbe))==0
 
@@ -221,7 +221,7 @@ def test_empty_configuration_defaults_are_only_in_preview_until_confirmed(record
 
 
 @pytest.mark.parametrize('payload',[
-    {'marketplace_codes':[]},{'marketplace_codes':['CA','CA']},{'marketplace_codes':['DE']},
+    {'marketplace_codes':[]},{'marketplace_codes':['CA','CA']},{'marketplace_codes':['JP']},
     {'marketplace_codes':['CA'],'scope':'unknown'},{'marketplace_codes':['CA'],'script':'injected'},
     {'marketplace_codes':['CA'],'expected_setup_revision':-1},
 ])
@@ -259,7 +259,7 @@ def test_api_summary_preview_and_validation_without_browser(tmp_path):
         assert response.json()['verification_outcome']=='UNVERIFIED'
         result=client.post('/api/stores/setup-batch/preview',json={'store_ids':[sid],'mode':'fill_missing'},headers=headers)
         assert result.status_code==200 and result.json()['eligible_count']==1
-        assert client.post(f'/api/stores/{sid}/detect-store-setup',json={'marketplace_codes':['DE']},headers=headers).status_code==422
+        assert client.post(f'/api/stores/{sid}/detect-store-setup',json={'marketplace_codes':['JP']},headers=headers).status_code==422
         assert client.post('/api/stores/setup-batch/preview',json={'store_ids':[sid,sid]},headers=headers).status_code==422
         assert client.get(f'/api/stores/{sid}/store-setup-probe').status_code==204
 

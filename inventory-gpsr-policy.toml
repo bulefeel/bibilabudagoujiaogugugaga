@@ -1,0 +1,41 @@
+# 德国站库存「需要批准」流程参数；时间单位为秒，attempts 为次数。
+# 等待依据页面状态结束；间隔仅用于限制连续操作频率。
+[timing]
+list_timeout_seconds = 45
+panel_timeout_seconds = 45
+confirmation_timeout_seconds = 90
+poll_seconds = 1
+stable_seconds = 3
+action_interval_seconds = 3
+evidence_timeout_seconds = 5
+# 单件页面 HTTP 403 / 点击受阻：先读实际内容；未恢复最多重试两次，不重放保存。
+http_retry_attempts = 2
+# 首次重试等 5 秒，第二次等 10 秒；复用同一紫鸟标签页。
+http_retry_delay_seconds = 5
+# 点击可操作性等待上限；内容加载仍用 panel_timeout_seconds。
+click_timeout_seconds = 10
+# 只被动检查明确的 CSRF 403；响应读取有截止时间，不存认证值或原始正文。
+http_diagnostic_timeout_seconds = 2
+# 每次队列执行全局最多刷新原标签一次，所有商品共用；0 表示关闭自动恢复。
+csrf_reload_attempts = 1
+# 刷新、重新登录、身份/筛选核验的总期限；超时保留候选清单和进度。
+csrf_recovery_timeout_seconds = 90
+lazy_no_progress_seconds = 45
+lazy_page_timeout_seconds = 180
+# 公告/推广弹窗：一次处理的总截止时间、识别稳定时间（秒）。
+# 同一页面文档总关闭预算；关闭未确认时不重放点击，不刷新网页。
+announcement_timeout_seconds = 12
+announcement_stable_seconds = 1
+announcement_max_closes = 3
+# 切站菜单独立就绪判据，不复用侧栏 3 秒稳定等待；目标仅点击一次。
+# 意外收起后等待 3 秒，最多重开一次；菜单阶段共用 list_timeout_seconds 总截止时间。
+marketplace_menu_stable_seconds = 1
+marketplace_menu_reopen_delay_seconds = 3
+marketplace_menu_reopen_attempts = 1
+# 扫描阶段总数变化：原标签返回第一页，最多重建一次；不刷新、不合并两轮清单。
+scan_restart_attempts = 1
+scan_restart_delay_seconds = 15
+# 同一站点连续读取失败达到 6 项，或 600 秒无有效检查进展时暂停，保留剩余清单。
+# 成功读到无要求/已关联等也算有效进展，并非必须提交才算。
+consecutive_read_failure_limit = 6
+no_progress_timeout_seconds = 600

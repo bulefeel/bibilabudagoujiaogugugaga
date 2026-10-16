@@ -16,6 +16,7 @@ REASON_MESSAGES = {
     "IDENTITY_CANDIDATE_LIMIT": "身份候选超过读取上限，未按截断结果判断身份",
     "IDENTITY_MISMATCH": "当前卖家身份与建档不一致，已停止该店核验",
     "SITE_ACCESS_UNPROVEN": "缺少独立的站点访问证据，付款页面能力尚待核验",
+    "INVENTORY_ACCESS_UNPROVEN": "卖家身份已读取，但实际商城或库存页面访问尚未核验通过；可重试该站点",
     "UNKNOWN_PAGE": "页面不是已确认的目标业务页面，本次核验未通过",
     "SESSION_CLOSED": "当前店铺页面或会话已关闭，已停止该店核验",
     "AUTH_UNKNOWN": "自动登录已停止，当前没有足够信息确定具体原因",

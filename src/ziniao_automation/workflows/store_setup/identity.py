@@ -24,6 +24,8 @@ class SetupRejected(PreflightRejected):
         reason = self.diagnostic.reason_code
         if reason == "SITE_ACCESS_UNPROVEN":
             identity, access, capability = "PASSED", "FAILED", "UNKNOWN"
+        elif reason == "INVENTORY_ACCESS_UNPROVEN":
+            identity, access, capability = "PASSED", "FAILED", "NOT_CHECKED"
         elif reason.startswith("IDENTITY_"):
             identity, access, capability = "FAILED", "NOT_CHECKED", "NOT_CHECKED"
         else:

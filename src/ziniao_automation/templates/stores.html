@@ -26,7 +26,13 @@
   <button type="button" class="button ghost" data-action="clear-setup-selection">清空勾选</button>
   <button type="button" class="button danger-outline" data-action="batch-reset-store-setups" disabled>批量删除建档（0）</button>
   <span data-setup-reset-count aria-live="polite">仅对当前可见且已勾选的亚马逊店铺操作。</span>
-  <span>只核验 CA / UK / AU；DE 配置保留，不自动扩展站点。</span>
+  <span>付款站点 CA / UK / AU；库存合规站点 DE / IT / FR / ES / PL。仅核验明确选择的站点，不进行业务提交。</span>
+  <fieldset class="store-marketplace-editor"><legend>本批统一站点（可选）</legend>
+    <p class="fieldset-help">不勾选时沿用各店已选站点；无站点的新店保留 CA/UK/AU 默认。勾选后为本批使用相同站点，新增所需配置，不取消其他已选站点；“重试未通过”仅核验已保存的站点。</p>
+    {% for code, label in [('CA','加拿大'),('UK','英国'),('AU','澳大利亚'),('DE','德国'),('IT','意大利'),('FR','法国'),('ES','西班牙'),('PL','波兰')] %}
+    <label class="mini-check"><input type="checkbox" value="{{ code }}" data-setup-batch-site> {{ code }} {{ label }}</label>
+    {% endfor %}
+  </fieldset>
 </section>
 <p class="store-bulk-scope" data-store-bulk-scope aria-live="polite"></p>
 <div class="store-filter-empty" data-store-filter-empty hidden><b>没有匹配的店铺</b><p>调整名称、平台或状态筛选；其他店铺并未被删除。</p></div>
@@ -103,20 +109,21 @@
         <div>
           <span class="marketplace-autofill-kicker">卖家身份 + 站点核验</span>
           <b>一次打开，一次完成核验</b>
-          <p>程序会读取卖家身份，并逐站打开付款控制面板核验域名与身份。<strong>仅处理登录与站点选择，不点击请求付款或最终付款按钮。</strong></p>
+          <p>程序会读取卖家身份；CA/UK/AU 核验付款控制面板，欧洲站通过页头切换实际商城并只读核验库存页。<strong>仅处理登录与站点选择，不点击请求付款或最终付款按钮。</strong></p>
         </div>
         <button class="button dark" type="button" data-action="detect-store-setup">自动获取卖家ID并核验站点</button>
       </aside>
-      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选 CA、UK、AU 中需要的站点，再点击统一建档。卖家身份与各站点核验结果会保存到账册，页面刷新和后台重启后仍可查看；只有卖家身份与原建档冲突才需要人工复核。<b>德国站不参与统一建档</b>——核验要读付款控制面板，德国站没有那条链路，所以勾选后直接保存即可。</p>
+      <p class="marketplace-setup-result" data-store-setup-result aria-live="polite">先勾选需要使用的站点，再点击统一建档。卖家身份与各站点核验结果分别保存，刷新和重启后仍可查看。欧洲站只核验库存访问，不读取付款账户、不扫描商品或提交声明；部分站点失败不会清除已绑定的身份。</p>
       {% for code, label, domain, probeable in [
         ('CA', '加拿大', 'sellercentral.amazon.ca', true),
         ('UK', '英国', 'sellercentral.amazon.co.uk', true),
         ('AU', '澳大利亚', 'sellercentral.amazon.com.au', true),
-        ('DE', '德国', 'sellercentral.amazon.de', false)
+        ('DE', '德国', 'sellercentral.amazon.de', true),
+        ('IT', '意大利', 'sellercentral.amazon.it', true),
+        ('FR', '法国', 'sellercentral.amazon.fr', true),
+        ('ES', '西班牙', 'sellercentral.amazon.es', true),
+        ('PL', '波兰', 'sellercentral.amazon.pl', true)
       ] %}
-      {# DE 只供 GPSR 安全证明流程使用。它带着 data-no-probe，因为这批行有两个
-         消费者：店铺保存（取全部行）和统一建档（只取勾选的行）。不隔开的话，
-         勾了 DE 再点统一建档会收到「无效站点：DE」——在唯一能勾 DE 的界面上。 #}
       <div class="store-marketplace-row" data-store-marketplace="{{ code }}"{% if not probeable %} data-no-probe{% endif %}>
         <label class="mini-check marketplace-enable"><input type="checkbox" data-marketplace-enabled> <span><b>{{ code }} {{ label }}</b><small>{{ domain }}</small></span></label>
         <div class="marketplace-detection-state">
@@ -133,7 +140,7 @@
       <section class="marketplace-setup-auth" data-store-setup-auth-panel hidden aria-live="polite">
         <span class="identity-auth-badge" data-store-setup-auth-badge>自动登录未通过</span>
         <h3 data-store-setup-auth-title>验证仍未完成，可再次自动尝试</h3>
-        <p data-store-setup-auth-message>程序会先等待紫鸟填充，再依次尝试邮箱 Continue、紫鸟托管 Passkey、已填密码登录和已填好的 6 位 OTP。每个页面动作最多自动点击 3 次，每个站点最多进行 3 轮完整验证；CA、UK、AU 分别计数。只有次数用尽，或出现未填内容、候选不唯一、CAPTCHA、非托管 Passkey 等不适合自动点击的情况，才会保留原紫鸟窗口并显示这里；不会换到普通 Chrome。</p>
+        <p data-store-setup-auth-message>程序会先等待紫鸟填充，再依次尝试邮箱 Continue、紫鸟托管 Passkey、已填密码登录和已填好的 6 位 OTP。每个页面动作最多自动点击 3 次，每个站点最多进行 3 轮完整验证；每个站点分别计数。只有次数用尽，或出现未填内容、候选不唯一、CAPTCHA、非托管 Passkey 等不适合自动点击的情况，才会保留原紫鸟窗口并显示这里；不会换到普通 Chrome。</p>
         <div class="identity-auth-actions">
           <button class="button primary" type="button" data-action="continue-store-setup">再次尝试自动登录并继续</button>
           <button class="button ghost" type="button" data-action="cancel-store-setup">取消并关闭该店铺窗口</button>

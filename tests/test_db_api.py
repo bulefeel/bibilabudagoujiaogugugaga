@@ -891,7 +891,7 @@ def test_stores_page_unified_setup_has_canonical_integer_store_id(app_client):
     assert "程序会先等待紫鸟填充" in page.text
     assert "每个页面动作最多自动点击 3 次" in page.text
     assert "每个站点最多进行 3 轮完整验证" in page.text
-    assert "CA、UK、AU 分别计数" in page.text
+    assert "每个站点分别计数" in page.text
     assert "未填内容、候选不唯一、CAPTCHA、非托管 Passkey" in page.text
     assert "取消并关闭该店铺窗口" in page.text
     assert "统一建档成功后自动勾选" in page.text

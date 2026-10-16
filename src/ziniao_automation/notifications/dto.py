@@ -8,7 +8,7 @@ ORM dictionary from being serialised into a Feishu request by accident.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -37,6 +37,8 @@ class NotificationKind(StrEnum):
     # closed, and no card, log line or status ever said why.
     RUN_SKIPPED = "RUN_SKIPPED"
     UNCERTAIN_FINANCIAL = "UNCERTAIN_FINANCIAL"
+    INVENTORY_SUBMISSION_UNCERTAIN = "INVENTORY_SUBMISSION_UNCERTAIN"
+    INVENTORY_PAGE_PAUSED = "INVENTORY_PAGE_PAUSED"
     CROSS_DAY_STARTED = "CROSS_DAY_STARTED"
 
 
@@ -95,6 +97,53 @@ class SafeFeedbackNotice:
 
 
 @dataclass(frozen=True, slots=True)
+class SafeInventoryGpsrCounts:
+    """Only numeric inventory results may cross the notification boundary."""
+
+    scanned: int = 0
+    pending: int = 0
+    blocked: int = 0
+    eligible: int = 0
+    confirmed: int = 0
+    already_submitted: int = 0
+    no_violation_entry: int = 0
+    no_attestation: int = 0
+    missing: int = 0
+    failed: int = 0
+    uncertain: int = 0
+    requirements: int = 0
+    safety_confirmed: int = 0
+    responsible_confirmed: int = 0
+    manufacturer_confirmed: int = 0
+    already_linked: int = 0
+    multiple_records: int = 0
+    no_records: int = 0
+    invalid_record: int = 0
+    not_applicable: int = 0
+
+    def __post_init__(self) -> None:
+        for item in fields(self):
+            value = getattr(self, item.name)
+            if type(value) is not int or not 0 <= value <= 10_000_000:
+                raise ValueError(f"{item.name} must be a bounded non-negative integer")
+
+    @classmethod
+    def from_event(cls, value: object) -> "SafeInventoryGpsrCounts | None":
+        if not isinstance(value, Mapping):
+            return None
+        # Do not coerce arbitrary strings, nested objects, bools or page text.
+        added = {'requirements', 'safety_confirmed', 'responsible_confirmed', 'manufacturer_confirmed', 'already_linked',
+                 'multiple_records', 'no_records', 'invalid_record', 'not_applicable'}
+        picked = {item.name: value.get(item.name, 0 if item.name in added else None) for item in fields(cls)}
+        if any(
+            type(count) is not int or not 0 <= count <= 10_000_000
+            for count in picked.values()
+        ):
+            return None
+        return cls(**picked)
+
+
+@dataclass(frozen=True, slots=True)
 class SafeRunNotice:
     """Whitelist DTO used by all external notification renderers."""
 
@@ -121,6 +170,7 @@ class SafeRunNotice:
     feedback_items: tuple[SafeFeedbackNotice, ...] = field(default_factory=tuple)
     # How many entries were left out of ``feedback_items`` by the card's cap.
     feedback_omitted: int = 0
+    inventory_gpsr_counts: SafeInventoryGpsrCounts | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.kind, NotificationKind):
@@ -129,6 +179,10 @@ class SafeRunNotice:
             object.__setattr__(self, "sites", tuple(self.sites))
         if any(not isinstance(site, SafeSiteNotice) for site in self.sites):
             raise TypeError("sites must contain only SafeSiteNotice values")
+        if self.inventory_gpsr_counts is not None and not isinstance(
+            self.inventory_gpsr_counts, SafeInventoryGpsrCounts
+        ):
+            raise TypeError("inventory_gpsr_counts must be SafeInventoryGpsrCounts or None")
         if not isinstance(self.feedback_items, tuple):
             object.__setattr__(self, "feedback_items", tuple(self.feedback_items))
         if any(

@@ -17,7 +17,7 @@ from typing import (
 )
 
 from .contracts import FinancialSessionProvider, Notifier, WorkflowRepository
-from .errors import HumanAuthRequired
+from .errors import HumanAuthRequired, PageRecoveryRequired
 from .registry import WorkflowRegistry
 from .types import (
     ApprovalStatus,
@@ -87,6 +87,10 @@ class WorkflowEngine:
 
         workflow = self.registry.get(run.workflow)
         try:
+            if run.workflow == "amazon_inventory_gpsr_attestation":
+                begin_attempt = getattr(workflow, "begin_attempt", None)
+                if callable(begin_attempt):
+                    begin_attempt(run.id)
             async with self._financial_session(run) as handle:
                 completed, result = await self._with_auth_wait(
                     run,
@@ -103,6 +107,17 @@ class WorkflowEngine:
                     await self.repository.get_run_status(run.id),
                     saved or WorkflowPlan(run.workflow, run.id, run.store.id, ()),
                 )
+        except PageRecoveryRequired as exc:
+            if run.workflow != "amazon_inventory_gpsr_attestation":
+                await self._record_failure(run, workflow, exc)
+                raise
+            changed = await self.repository.set_run_status(
+                run.id, RunStatus.PAUSED, allowed_from=(RunStatus.RUNNING,),
+                error=f"{exc.public_reason}，进度已保留，等待手动继续",
+            )
+            if changed or await self.repository.get_run_status(run.id) is RunStatus.PAUSED:
+                await self._notify(workflow, run, RunStatus.PAUSED)
+            return ExecutionResult(run.id, await self.repository.get_run_status(run.id))
         except Exception as exc:
             await self._record_failure(run, workflow, exc)
             raise
@@ -387,15 +402,19 @@ class WorkflowEngine:
             return True
         if await self.repository.list_operations(run.id):
             return False
+        allowed = (
+            RunStatus.QUEUED, RunStatus.WAITING_APPROVAL,
+            RunStatus.WAITING_AUTH, RunStatus.NEEDS_HUMAN_AUTH,
+        )
+        # This plugin has per-action cancellation checks and durable per-item
+        # intent. Cancelling stops its next save while retaining uncertain
+        # items for readback. Existing financial cancellation rules stay intact.
+        if run.workflow == "amazon_inventory_gpsr_attestation":
+            allowed += (RunStatus.RUNNING, RunStatus.PAUSED)
         changed = await self.repository.set_run_status(
             run.id,
             RunStatus.CANCELLED,
-            allowed_from=(
-                RunStatus.QUEUED,
-                RunStatus.WAITING_APPROVAL,
-                RunStatus.WAITING_AUTH,
-                RunStatus.NEEDS_HUMAN_AUTH,
-            ),
+            allowed_from=allowed,
         )
         if changed:
             await self.repository.set_approval_status(
@@ -515,6 +534,11 @@ class WorkflowEngine:
                                 RunStatus.CANCELLED,
                                 allowed_from=(RunStatus.WAITING_AUTH,),
                             )
+                            if run.workflow == "amazon_inventory_gpsr_attestation":
+                                # A cancelled auth lease can still own a save
+                                # intent. The notice builder checks the ledger;
+                                # cancellation without intent remains silent.
+                                await self._notify(workflow, run, RunStatus.CANCELLED)
                         return False, None
                     raise
                 changed = await self.repository.set_run_status(
@@ -744,6 +768,7 @@ _PARKED_SITE_STATUSES = frozenset(
         SiteStatus.PLANNED,
         SiteStatus.WAITING_APPROVAL,
         SiteStatus.WAITING_AUTH,
+        SiteStatus.PAUSED,
     }
 )
 _DISPATCHED = frozenset({GuardState.SUBMITTED, GuardState.CONFIRMED})

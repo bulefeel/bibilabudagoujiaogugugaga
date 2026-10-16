@@ -150,6 +150,81 @@ class DurableRunQueue:
             session.commit()
             return entry.id, True
 
+    def resume_inventory_run(self, run_id: str) -> tuple[int, bool]:
+        """Atomically resume only an operator-paused inventory snapshot."""
+        from .workflows.amazon_inventory_gpsr.store import (
+            WORKFLOW_KEY, can_resume_inventory_run, legacy_inventory_resume_items, validate_inventory_run_binding,
+        )
+
+        with self.session_factory() as session:
+            if session.bind is not None and session.bind.dialect.name == "sqlite":
+                session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            run = session.get(Run, run_id)
+            if run is None:
+                raise LookupError("任务不存在")
+            if run.workflow != WORKFLOW_KEY:
+                raise RuntimeError("该任务不是库存安全证明流程")
+            active = session.scalar(select(RunQueueEntry).where(
+                RunQueueEntry.run_id == run_id, RunQueueEntry.state.in_(("READY", "CLAIMED")),
+            ))
+            resumed = session.scalar(select(RunEvent.id).where(
+                RunEvent.run_id == run_id, RunEvent.event_type == "inventory_gpsr_resumed",
+            ).limit(1)) is not None
+            if run.status in {"QUEUED", "RUNNING"} and resumed and active is not None and active.action == "START":
+                return active.id, False
+            if not can_resume_inventory_run(session, run):
+                raise RuntimeError("当前任务没有可继续的库存暂停进度")
+            validate_inventory_run_binding(session, run, require_baseline=run.status == "FAILED")
+            if active is not None and active.state == "CLAIMED":
+                raise RuntimeError("暂停记录仍在收尾，请稍后继续")
+            other = session.scalar(select(Run.id).where(
+                Run.id != run_id, Run.store_id == run.store_id, Run.workflow == WORKFLOW_KEY,
+                Run.status.in_(("QUEUED", "RUNNING", "WAITING_APPROVAL", "WAITING_AUTH", "RECONCILING", "PAUSED")),
+            ).limit(1))
+            if other is not None:
+                raise RuntimeError("同店库存流程已有其他未完成任务")
+            previous = run.status
+            legacy_items = legacy_inventory_resume_items(session, run) if previous == "FAILED" else ()
+            now = utc_now()
+            changed = session.execute(update(Run).where(
+                Run.id == run_id, Run.workflow == WORKFLOW_KEY, Run.status == previous,
+            ).values(status="QUEUED", error=None, finished_at=None))
+            if changed.rowcount != 1:
+                raise RuntimeError("任务状态已变化，请刷新后重试")
+            for item in legacy_items or ():
+                from .models import InventoryGpsrRequirement
+                requirement = session.scalar(select(InventoryGpsrRequirement).where(
+                    InventoryGpsrRequirement.item_id == item.id,
+                    InventoryGpsrRequirement.requirement_type == "safety_attestation",
+                ))
+                if requirement is not None:
+                    if requirement.intent_at is not None:
+                        raise RuntimeError("历史要求已有提交意图，只允许回读")
+                    requirement.state = "PENDING"
+                    requirement.reason = "legacy_http_failure_resumed"
+                item.state = "PENDING"
+                item.reason = "legacy_http_failure_resumed"
+            if active is not None:
+                active.state = "CANCELLED"
+                active.finished_at = now
+                session.flush()
+            entry = RunQueueEntry(
+                run_id=run_id, action="START", priority=PRIORITY_HUMAN,
+                business_priority=self._business_priority(run, None),
+                target_order=self._target_order(run, None), state="READY",
+                enqueued_at=now, available_at=now,
+            )
+            session.add(entry)
+            session.add(RunEvent(
+                run_id=run_id, event_type="inventory_gpsr_resumed", from_status=previous,
+                to_status="QUEUED", message="操作员继续原库存任务；沿用候选快照和已完成进度",
+                details={"reset_legacy_http_items": len(legacy_items or ())},
+            ))
+            session.flush()
+            entry_id = entry.id
+            session.commit()
+            return entry_id, True
+
     def enqueue_many(
         self,
         run_ids: Sequence[str],
@@ -469,9 +544,11 @@ class DurableRunQueue:
                 session.connection().exec_driver_sql("BEGIN IMMEDIATE")
             entry = session.scalar(
                 select(RunQueueEntry)
+                .join(Run, Run.id == RunQueueEntry.run_id)
                 .where(
                     RunQueueEntry.state == "READY",
                     RunQueueEntry.available_at <= now,
+                    Run.status != "PAUSED",
                 )
                 .order_by(
                     RunQueueEntry.priority.asc(),
@@ -595,6 +672,16 @@ class DurableRunQueue:
                 )
             )
             for entry in claimed:
+                run = session.get(Run, entry.run_id)
+                if run is not None and run.status == "PAUSED":
+                    # Crash after persisting PAUSED but before worker.finally.
+                    # That old claim is finished, never automatic resume work.
+                    entry.state = "DONE"
+                    entry.finished_at = now
+                    entry.claim_token = None
+                    entry.claimed_at = None
+                    entry.updated_at = now
+                    continue
                 entry.state = "READY"
                 entry.claim_token = None
                 entry.claimed_at = None

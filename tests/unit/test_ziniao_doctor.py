@@ -26,6 +26,7 @@ async def test_doctor_never_returns_credentials(tmp_path: Path, monkeypatch) -> 
         return DoctorCheck("ziniao_port", True, "ok")
 
     monkeypatch.setattr(doctor, "_port_check", port)
+    monkeypatch.setattr("ziniao_automation.ziniao.doctor.is_ziniao_process_running", lambda: True)
     report = await doctor.run()
     rendered = str(report.as_dict())
     assert "password" not in rendered.lower()

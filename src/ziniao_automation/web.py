@@ -34,6 +34,8 @@ from .models import (
     ApprovalRequest,
     Evidence,
     FeedbackReview,
+    InventoryGpsrItem,
+    InventoryGpsrRequirement,
     OperationGuard,
     Run,
     RunQueueEntry,
@@ -44,6 +46,7 @@ from .models import (
     ZiniaoAccount,
 )
 from .presentation_time import format_display_datetime, to_display_datetime
+from .notifications.database import read_inventory_gpsr_counts
 from .repositories import (
     ACTIVE_RUN_STATUSES,
     ConflictError,
@@ -93,6 +96,7 @@ from .workflows.amazon_feedback.review_store import (
     PENDING as FEEDBACK_PENDING,
     TERMINAL_STATES as FEEDBACK_TERMINAL_STATES,
 )
+from .workflows.amazon_inventory_gpsr.store import can_resume_inventory_run
 from .workflows.errors import WorkflowNotRegistered
 from .workflows.engine import run_status_from_facts
 from .workflows.types import UNSETTLED_GUARD_STATES
@@ -150,6 +154,7 @@ class AutomationService(Protocol):
     async def enqueue_run(self, run_id: str) -> None: ...
     async def approve_run(self, run_id: str, approval_id: str | None = None, *, actor: str = "admin") -> None: ...
     async def continue_auth(self, run_id: str) -> None: ...
+    async def resume_inventory_run(self, run_id: str) -> None: ...
     async def cancel_run(self, run_id: str) -> None: ...
 
 
@@ -243,6 +248,9 @@ class UnconfiguredAutomationService:
     async def continue_auth(self, run_id: str) -> None:
         raise RuntimeError("自动化运行服务尚未配置")
 
+    async def resume_inventory_run(self, run_id: str) -> None:
+        raise RuntimeError("自动化运行服务尚未配置")
+
     async def cancel_run(self, run_id: str) -> None:
         raise RuntimeError("自动化运行服务尚未配置")
 
@@ -260,6 +268,7 @@ def _resolved_classifier_endpoint() -> dict[str, Any] | None:
 STATUS_LABELS = {
     "QUEUED": "排队中", "RUNNING": "执行中", "WAITING_APPROVAL": "待审核",
     "WAITING_AUTH": "等待人工验证", "RECONCILING": "资金收口中",
+    "PAUSED": "已暂停，等待页面恢复",
     "SUCCEEDED": "已完成", "PARTIAL": "部分完成", "FAILED": "失败", "CANCELLED": "已取消",
     "SKIPPED": "已跳过", "NEEDS_HUMAN_AUTH": "需要人工验证",
     # Site-level states that had no label and rendered as raw English.
@@ -283,6 +292,20 @@ FEEDBACK_STATE_LABELS = {
     "SUBMITTED": "已提交",
     "UNCERTAIN": "未确认",
     "FAILED": "失败",
+}
+
+INVENTORY_STATE_LABELS = {
+    "PENDING": "尚未检查",
+    "ELIGIBLE": "已核验可处理",
+    "NO_VIOLATION_ENTRY": "无违规入口",
+    "NO_ATTESTATION": "无安全证明",
+    "ALREADY_SUBMITTED": "此前审核中",
+    "MISSING": "清单商品未找到",
+    "FAILED": "处理失败",
+    "SUBMITTING": "已有提交意图，仅回读",
+    "CONFIRMED": "本轮提交确认（审核中）",
+    "UNCERTAIN": "提交结果不明，仅回读",
+    "BLOCKED": "历史记录待核对",
 }
 
 QUEUE_STATE_LABELS = {
@@ -738,6 +761,31 @@ def create_app(
                 "guards": guards,
                 "workflow_meta": definitions.get(run.workflow),
                 "feedback_reviews": feedback_reviews,
+                "inventory_counts": (
+                    read_inventory_gpsr_counts(db, run_id)
+                    if run.workflow == "amazon_inventory_gpsr_attestation"
+                    else None
+                ),
+                "can_resume_inventory": can_resume_inventory_run(db, run),
+                "inventory_requirements": list(db.scalars(select(InventoryGpsrRequirement)
+                    .join(InventoryGpsrItem, InventoryGpsrRequirement.item_id == InventoryGpsrItem.id)
+                    .where(InventoryGpsrRequirement.run_id == run_id)
+                    .order_by(InventoryGpsrRequirement.marketplace_code, InventoryGpsrItem.page_number.desc(),
+                              InventoryGpsrItem.position.desc(), InventoryGpsrRequirement.requirement_type.desc())))
+                    if run.workflow == "amazon_inventory_gpsr_attestation" else [],
+                "inventory_items": (
+                    list(db.scalars(
+                        select(InventoryGpsrItem)
+                        .where(InventoryGpsrItem.run_id == run_id)
+                        .order_by(
+                            InventoryGpsrItem.page_number.desc(),
+                            InventoryGpsrItem.position.desc(),
+                        )
+                    ))
+                    if run.workflow == "amazon_inventory_gpsr_attestation"
+                    else []
+                ),
+                "inventory_state_labels": INVENTORY_STATE_LABELS,
                 "reason_catalog": REASON_CATALOG,
                 "category_labels": CATEGORY_LABELS,
             },
@@ -2093,6 +2141,24 @@ def create_app(
         _release_before_automation(db)
         try:
             await request.app.state.automation_service.continue_auth(run_id)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        return {"status": "queued"}
+
+    @api.post("/runs/{run_id}/resume-inventory", status_code=202)
+    async def api_resume_inventory_run(
+        run_id: str,
+        request: Request,
+        _: LocalOperator = Depends(verified_operator),
+        db: Session = Depends(get_session),
+    ) -> dict[str, str]:
+        run = WorkflowRepository(db).get_run(run_id)
+        if not can_resume_inventory_run(db, run):
+            raise HTTPException(409, "当前任务不符合库存清单继续条件，请查看任务状态")
+        # The service re-checks under its transaction before queueing this same run.
+        _release_before_automation(db)
+        try:
+            await request.app.state.automation_service.resume_inventory_run(run_id)
         except RuntimeError as exc:
             raise HTTPException(409, str(exc)) from exc
         return {"status": "queued"}

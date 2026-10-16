@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
@@ -14,6 +15,7 @@ from ..amazon_login import AmazonLoginAdvancer
 from ..amazon_account_switcher import AmazonAccountSwitcher, MARKETPLACE_NAMES
 from ..amazon_switcher_contract import VERSION as SWITCHER_CONTRACT_VERSION, read_switcher_snapshot
 from ..amazon_disbursement.config import ALLOWED_MARKETPLACES
+from ..amazon_inventory_gpsr.config import INVENTORY_MARKETPLACES
 from ..amazon_disbursement.page import AmazonPaymentsPage, _identity_normal
 from ..setup_diagnostics import classify_switch_landing
 from ..errors import HumanAuthRequired
@@ -46,8 +48,10 @@ class SiteSetupResult:
 
 
 class AmazonStoreSetupPage:
-    def __init__(self, policy: OnboardingPolicy, *, navigation: AmazonPaymentsPage | None = None) -> None:
+    def __init__(self, policy: OnboardingPolicy, *, navigation: AmazonPaymentsPage | None = None,
+                 inventory_policy_path: Path | None = None) -> None:
         self.policy = policy
+        self._inventory_policy_path = inventory_policy_path
         self._navigation = navigation or AmazonPaymentsPage(
             login_advancer=AmazonLoginAdvancer(otp_prefill_wait_timeout_ms=policy.otp_autofill_timeout_ms),
             account_switcher=AmazonAccountSwitcher(
@@ -57,9 +61,17 @@ class AmazonStoreSetupPage:
             stable_sample_count=policy.stable_sample_count,
         ))
         self.last_identity_evidence: dict[str, str | int] = {}
+        self._inventory_setup = None
+
+    def _inventory_adapter(self):
+        if self._inventory_setup is None:
+            from .inventory_adapter import InventoryStoreSetupPage
+            self._inventory_setup = InventoryStoreSetupPage(self.policy, inventory_policy_path=self._inventory_policy_path)
+        return self._inventory_setup
 
     def resolved_page_for(self, page: Any) -> Any:
-        return self._navigation.resolved_page_for(page)
+        page = self._navigation.resolved_page_for(page)
+        return self._inventory_setup.resolved_page_for(page) if self._inventory_setup else page
 
     def _classify(self, page: Any, marketplace: MarketplaceRef) -> str:
         closed = getattr(page, "is_closed", None)
@@ -218,6 +230,11 @@ class AmazonStoreSetupPage:
 
     async def detect_identity(self, page: Any, marketplace: MarketplaceRef) -> tuple[str, str]:
         try:
+            if marketplace.code in INVENTORY_MARKETPLACES:
+                adapter = self._inventory_adapter()
+                result = await adapter.detect_identity(page, marketplace)
+                self.last_identity_evidence = dict(adapter.last_identity_evidence)
+                return result
             return await self._detect_identity(page, marketplace)
         except Exception:
             # A target may close inside goto/count, not just before a sample.
@@ -299,6 +316,8 @@ class AmazonStoreSetupPage:
     async def check_site(self, page: Any, store: StoreRef,
                          marketplace: MarketplaceRef) -> SiteSetupResult:
         try:
+            if marketplace.code in INVENTORY_MARKETPLACES:
+                return await self._inventory_adapter().check_site(page, store, marketplace)
             return await self._check_site(page, store, marketplace)
         except Exception:
             self._require_open(page)
