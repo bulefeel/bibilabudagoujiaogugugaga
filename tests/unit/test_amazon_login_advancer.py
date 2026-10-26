@@ -984,7 +984,7 @@ async def test_password_three_failures_exhaust_document_and_block_fourth_click()
     ("url", "expected_host"),
     [
         ("http://sellercentral.amazon.co.uk/ap/signin", None),
-        ("https://sellercentral.amazon.com/ap/signin", None),
+        ("https://sellercentral.amazon.co.jp/ap/signin", None),
         ("https://sellercentral.amazon.co.uk/ap/register", None),
         (
             "https://sellercentral.amazon.co.uk/ap/signin",
@@ -2780,7 +2780,7 @@ def test_automatic_login_step_limit_must_be_between_one_and_three(
     [
         "http://sellercentral.amazon.ca/ap/signin",
         "https://evil.amazon.ca/ap/signin",
-        "https://sellercentral.amazon.com/ap/signin",
+        "https://sellercentral.amazon.co.jp/ap/signin",
         "https://sellercentral.amazon.ca/ap/register",
         "https://sellercentral.amazon.ca.evil.test/ap/signin",
     ],

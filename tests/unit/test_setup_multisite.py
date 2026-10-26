@@ -25,7 +25,7 @@ def test_eu_save_setup_and_batch_contracts_are_consistent():
         assert SETUP_MARKETPLACES[code][0] in MARKETPLACE_NAMES
     request = StoreSetupBatchPreview(store_ids=[1], selections={1: EU})
     assert request.selections[1] == EU
-    assert set(ALLOWED_MARKETPLACES) == {'CA', 'UK', 'AU'}
+    assert set(ALLOWED_MARKETPLACES) == {'CA', 'UK', 'AU', 'US', 'DE'}
 
 
 def test_batch_explicit_sites_add_eu_without_defaulting_or_removing_ca(records):

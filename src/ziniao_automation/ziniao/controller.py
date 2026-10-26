@@ -21,6 +21,7 @@ from .errors import (
     ZiniaoConnectionError,
     ZiniaoCredentialError,
     ZiniaoLaunchError,
+    ZiniaoApiError,
 )
 from .locks import ExecutionLocks
 from .webdriver_mode import LAUNCH_ARGUMENTS, launch_environment
@@ -47,10 +48,13 @@ class ZiniaoControllerConfig:
     max_start_attempts: int = 4
     startup_timeout_seconds: float = 60.0
     startup_poll_seconds: float = 2.0
+    # Quiet period after a failed start/stop, multiplied by the attempt number.
+    start_retry_delay_seconds: float = 3.0
     # Cancellation is the exceptional hard-stop path used by setup deadlines.
     # Normal session close remains unbounded so its existing semantics do not
     # change; only cancellation cleanup gets these short best-effort bounds.
     cancel_cleanup_step_timeout_seconds: float = 0.75
+    setup_release_timeout_seconds: float = 12.0
     clear_stale_singleton_files: bool = True
 
     def __post_init__(self) -> None:
@@ -60,6 +64,10 @@ class ZiniaoControllerConfig:
             raise ValueError("startup timeouts must be positive")
         if self.cancel_cleanup_step_timeout_seconds <= 0:
             raise ValueError("cancel cleanup timeout must be positive")
+        if self.setup_release_timeout_seconds <= 0:
+            raise ValueError("setup release timeout must be positive")
+        if not 0 < self.start_retry_delay_seconds <= 30:
+            raise ValueError("start retry delay must be in (0, 30] seconds")
 
 
 class ZiniaoController:
@@ -469,6 +477,25 @@ class ZiniaoController:
             async with self.locks.launch:
                 return await self.client.stop_browser(selector, ignore_errors=True)
 
+    async def release_setup_store(self, selector, store_key, validate) -> bool:
+        """Explicit recovery: stop one idle environment, never queue behind work."""
+        from ..setup_errors import SetupConflict
+        store_lock = await self.locks.store_lock(store_key)
+        locks = (self.locks.funds, store_lock, self.locks.launch)
+        acquired = []
+        try:
+            for lock in locks:
+                if lock.locked():
+                    raise SetupConflict("环境仍被任务使用，请等待任务结束后再释放")
+                await lock.acquire()
+                acquired.append(lock)
+            validate()  # recheck persisted ownership after acquiring the locks
+            async with asyncio.timeout(self.config.setup_release_timeout_seconds):
+                return await self.client.stop_browser(selector, ignore_errors=True)
+        finally:
+            for lock in reversed(acquired):
+                lock.release()
+
     async def _open_store_locked(self, selector: ProfileSelector) -> ZiniaoBrowserHandle:
         last_issue = "unknown launch failure"
         # A startup target replacement is different from a dead CDP port: it
@@ -479,6 +506,8 @@ class ZiniaoController:
         startup_target_recoveries = 0
         launch_attempt = 1
         attempts_used = 0
+        cleanup_confirmed = True  # no start command issued yet
+        reason_code = "ZINIAO_LAUNCH_FAILED"
         while launch_attempt <= self.config.max_start_attempts:
             attempt = launch_attempt
             attempts_used = attempt
@@ -489,6 +518,7 @@ class ZiniaoController:
                     await self.ensure_running()
                     await self._update_core_once()
                     start_attempted = True
+                    cleanup_confirmed = False
                     payload = await self.client.start_browser(selector)
                 port = _debugging_port(payload)
                 host = self.client.config.host
@@ -550,6 +580,14 @@ class ZiniaoController:
                 raise
             except Exception as exc:
                 last_issue = str(exc)
+                reason_code = "ZINIAO_LAUNCH_FAILED"
+                device_unbound = (isinstance(exc, ZiniaoApiError) and exc.action == "startBrowser"
+                                  and "未绑定设备" in exc.api_message)
+                if device_unbound:
+                    reason_code = "ZINIAO_DEVICE_UNBOUND"
+                elif (isinstance(exc, ZiniaoApiError) and exc.action == "startBrowser"
+                      and "网络异常" in exc.api_message):
+                    reason_code = "ZINIAO_NETWORK_ERROR"
                 startup_target_retry = _is_retryable_startup_target_error(exc)
                 logger.warning(
                     "Ziniao store %s launch attempt %s/%s failed: %s",
@@ -563,9 +601,11 @@ class ZiniaoController:
                 # add delay and cannot improve the next attempt.
                 if start_attempted:
                     async with self.locks.launch:
-                        await self.client.stop_browser(selector, ignore_errors=True)
+                        cleanup_confirmed = await self.client.stop_browser(selector, ignore_errors=True) is True
                     if payload and self.config.clear_stale_singleton_files:
                         _clear_singleton_locks(payload.get("userData"))
+                if device_unbound:
+                    break  # a device binding requirement is not a transient launch error
                 if startup_target_retry:
                     if startup_target_recoveries >= 1:
                         logger.warning(
@@ -575,16 +615,20 @@ class ZiniaoController:
                         )
                         break
                     startup_target_recoveries += 1
-                    # Give Ziniao's own profile shutdown a small quiet window
-                    # before requesting a fresh dynamic port.  Do not restart
-                    # the shared desktop client.
-                    await asyncio.sleep(max(0.5, self.config.startup_poll_seconds))
                 if attempt >= self.config.max_start_attempts:
                     break
+                # All retryable starts need a quiet window, not only closed
+                # startup tabs. Fast API failures otherwise exhaust four tries
+                # in milliseconds. No shared-client restart or batch breaker.
+                delay = self.config.start_retry_delay_seconds * attempt
+                logger.info("Ziniao launch retry attempt=%s delay_seconds=%s reason=%s",
+                            attempt + 1, delay, reason_code)
+                await asyncio.sleep(delay)
                 launch_attempt += 1
         raise ZiniaoLaunchError(
             f"店铺 {selector.value} 连续 {attempts_used} 次启动未通过健康检查："
-            f"{last_issue}。其他店铺不受影响。"
+            f"{last_issue}。其他店铺不受影响。",
+            cleanup_confirmed=cleanup_confirmed, reason_code=reason_code,
         )
 
 

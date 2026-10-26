@@ -204,7 +204,7 @@ class StoreMarketplace(TimestampMixin, Base):
         # CHECK 只能整表重建，今天加和以后加成本一样，但「以后再说」的结果通常是
         # 永远没有约束。白名单本身在 repositories.V1_MARKETPLACES，两处必须同步。
         CheckConstraint(
-            "code IN ('CA', 'UK', 'AU', 'DE', 'IT', 'FR', 'ES', 'PL')", name="ck_v1_marketplace_code"
+            "code IN ('CA', 'UK', 'AU', 'US', 'DE', 'IT', 'FR', 'ES', 'PL')", name="ck_v1_marketplace_code"
         ),
         CheckConstraint("length(currency) = 3", name="ck_marketplace_currency"),
         {"sqlite_autoincrement": True},
@@ -953,6 +953,7 @@ class StoreSetupSiteResult(Base):
     identity_check: Mapped[str] = mapped_column(String(16), nullable=False, default="NOT_CHECKED")
     access_check: Mapped[str] = mapped_column(String(16), nullable=False, default="NOT_CHECKED")
     payment_capability: Mapped[str] = mapped_column(String(24), nullable=False, default="NOT_CHECKED")
+    inventory_capability: Mapped[str] = mapped_column(String(24), nullable=False, default="NOT_CHECKED", server_default="NOT_CHECKED")
     reason_code: Mapped[str | None] = mapped_column(String(64))
     message: Mapped[str] = mapped_column(String(400), nullable=False)
     page_category: Mapped[str] = mapped_column(String(32), nullable=False, default="UNKNOWN_PAGE")
@@ -963,7 +964,7 @@ class StoreSetupSiteResult(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("probe_id", "marketplace_code", name="uq_setup_site"),
-        CheckConstraint("marketplace_code IN ('CA','UK','AU','DE','IT','FR','ES','PL')"),
+        CheckConstraint("marketplace_code IN ('CA','UK','AU','US','DE','IT','FR','ES','PL')"),
         CheckConstraint("outcome IS NULL OR outcome IN ('PASSED','BLOCKED','FAILED','NOT_RUN','CANCELLED')"),
     )
 

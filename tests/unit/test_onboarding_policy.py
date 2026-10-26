@@ -12,6 +12,10 @@ def test_policy_has_no_implicit_defaults():
     assert config.stable_sample_count == 2
     assert config.total_deadline_seconds == 1800
     assert config.cleanup_grace_seconds == 15
+    assert config.batch_poll_interval_ms == 2000
+    assert config.batch_poll_request_timeout_ms == 10000
+    assert config.batch_poll_error_retries == 3
+    assert config.batch_poll_finalization_grace_ms >= config.cleanup_grace_seconds * 1000
     with pytest.raises(ValueError):
         OnboardingPolicy.model_validate({})
 
@@ -21,6 +25,9 @@ def test_policy_has_no_implicit_defaults():
     {'schema_version': 2}, {'schema_version': True}, {'candidate_ready_timeout_ms': 400},
     {'total_deadline_seconds': 1}, {'extra_secret': 'SENSITIVE_VALUE'},
     {'diagnostic_candidate_limit': 0}, {'stable_sample_count': '2'},
+    {'batch_poll_interval_ms': 0}, {'batch_poll_request_timeout_ms': 0},
+    {'batch_poll_error_retries': -1}, {'batch_poll_error_retries': 11},
+    {'batch_poll_finalization_grace_ms': 0},
 ])
 def test_invalid_policy_rejected(change):
     data = OnboardingPolicy.load(POLICY).model_dump()

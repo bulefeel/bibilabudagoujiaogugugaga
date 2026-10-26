@@ -1462,13 +1462,8 @@ def test_a_fresh_install_carries_the_widened_check(tmp_path: Path) -> None:
         ) == _head_revision()
 
 
-def test_de_is_schedulable_but_deliberately_not_probeable() -> None:
-    """两个白名单分工不同，不要「顺手统一」。
-
-    ``V1_MARKETPLACES`` 管店铺建档与排期；``ALLOWED_MARKETPLACES`` 管统一建档探针，
-    而探针要读**付款页**才能核验卖家身份——德国站没有那条链路。把 DE 塞进后者，
-    操作员在唯一能勾 DE 的那个界面上会收到「统一建档站点只能是…；无效站点：DE」。
-    """
+def test_disbursement_expansion_keeps_other_eu_sites_inventory_only() -> None:
+    """US/DE support payout; IT/FR/ES/PL retain their existing workflow scope."""
 
     from ziniao_automation.repositories import V1_MARKETPLACES
     from ziniao_automation.workflows.amazon_disbursement.config import (
@@ -1476,6 +1471,8 @@ def test_de_is_schedulable_but_deliberately_not_probeable() -> None:
     )
 
     assert V1_MARKETPLACES["DE"] == ("sellercentral.amazon.de", "EUR")
-    assert "DE" not in ALLOWED_MARKETPLACES
+    assert ALLOWED_MARKETPLACES["DE"] == V1_MARKETPLACES["DE"]
+    assert ALLOWED_MARKETPLACES["US"] == V1_MARKETPLACES["US"]
+    assert not {"IT", "FR", "ES", "PL"} & set(ALLOWED_MARKETPLACES)
     # 探针白名单必须是建档白名单的真子集，不能各自漂移。
     assert set(ALLOWED_MARKETPLACES) < set(V1_MARKETPLACES)

@@ -38,6 +38,7 @@ _SELLER_CENTRAL_HOSTS = frozenset(
         "sellercentral.amazon.ca",
         "sellercentral.amazon.co.uk",
         "sellercentral.amazon.com.au",
+        "sellercentral.amazon.com",
         # 德国站（GPSR 安全证明流程）。它有自己的 ``assoc_handle``
         # （``sc_de_amazon_v2``），所以别站登录过不算数，必须单独走一遍。
         "sellercentral.amazon.de",

@@ -20,6 +20,10 @@ class OnboardingPolicy(BaseModel):
     diagnostic_candidate_limit: int = Field(ge=1, le=1000)
     otp_autofill_timeout_ms: int = Field(ge=3000, le=60000)
     cleanup_grace_seconds: int = Field(gt=0, le=60)
+    batch_poll_interval_ms: int = Field(ge=1000, le=30000)
+    batch_poll_request_timeout_ms: int = Field(ge=1000, le=60000)
+    batch_poll_error_retries: int = Field(ge=0, le=10)
+    batch_poll_finalization_grace_ms: int = Field(ge=1000, le=120000)
 
     @field_validator("schema_version", mode="before")
     @classmethod

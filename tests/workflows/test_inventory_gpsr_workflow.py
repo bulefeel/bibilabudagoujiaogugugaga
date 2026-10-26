@@ -581,6 +581,7 @@ async def test_engine_reports_partial_for_reads_or_prior_confirmed_items(harness
 
 def test_migration_upgrade_downgrade_preserves_existing_runs_and_creates_backup(harness, tmp_path):
     from alembic import command
+    from alembic.script import ScriptDirectory
     from sqlalchemy import inspect
     from ziniao_automation.db import _migration_config, database_revision, init_database
 
@@ -593,7 +594,7 @@ def test_migration_upgrade_downgrade_preserves_existing_runs_and_creates_backup(
     assert "inventory_gpsr_items" not in inspect(harness.engine).get_table_names()
     backup = init_database(harness.engine, backup_dir=tmp_path / "backups")
     assert backup and backup.exists()
-    assert database_revision(harness.engine) == "0017"
+    assert database_revision(harness.engine) == ScriptDirectory.from_config(config).get_current_head()
     assert "inventory_gpsr_items" in inspect(harness.engine).get_table_names()
     with harness.factory() as session:
         assert session.get(Run, run.id).status == "RUNNING"

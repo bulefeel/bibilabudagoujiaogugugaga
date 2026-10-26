@@ -22,6 +22,8 @@ def test_roundtrip_preserves_results_constraints_and_triggers(records):
     passed(repo, row['probe_id'], 'CA')
     repo.finish(row['probe_id'], outcome='SUCCEEDED', cleanup='CONFIRMED')
     engine = sessions.kw['bind']
+    # Compare the columns at this migration's source revision, not at head.
+    migrate(engine, '0015', downgrade=True)
     before = rows(engine)
     with engine.connect() as db:
         triggers = db.exec_driver_sql("SELECT name,sql FROM sqlite_master WHERE type='trigger' ORDER BY name").all()
@@ -42,6 +44,7 @@ def test_used_eu_results_prevent_destructive_downgrade(records):
     row = begin(repo, sid, ['IT'])
     repo.finish(row['probe_id'], outcome='FAILED', cleanup='CONFIRMED')
     engine = sessions.kw['bind']
+    migrate(engine, '0015', downgrade=True)
     before = rows(engine)
     with pytest.raises(RuntimeError, match='欧洲站建档记录'):
         migrate(engine, '0014', downgrade=True)

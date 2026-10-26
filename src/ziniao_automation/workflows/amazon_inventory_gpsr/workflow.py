@@ -16,7 +16,7 @@ from ..types import (
     EvidenceRef, MarketplaceRef, MarketplaceSnapshot, OperationRecord, PlanLine, RunMode,
     RunStatus, SiteStatus, WorkflowPlan, WorkflowReport, WorkflowRun,
 )
-from .page import AmazonInventoryGpsrPage, InventoryContractError, InventoryMarketplaceError, ItemLoadError
+from .page import AmazonInventoryGpsrPage, InventoryContractError, InventoryMarketplaceError, ItemLoadError, ItemEntryError
 from .marketplace_menu import ERRORS as MENU_ERRORS
 from .progress import ReadProgress
 from .config import InventoryGpsrPolicy
@@ -246,7 +246,13 @@ class AmazonInventoryGpsrWorkflow:
                 reason = exc.reason_code
                 await self._mark_item(run, marketplace, record, FAILED, reason)
                 await self._capture_evidence(run, self._resolved(page), marketplace, record, "load-failure")
-                progress.failed()
+                # A verified row with an unsupported/ambiguous entry is a
+                # completed item-local failure, not a stalled page read. Keep
+                # the failure in reports without tripping the loading breaker.
+                if isinstance(exc, ItemEntryError):
+                    progress.completed()
+                else:
+                    progress.failed()
                 await self._check_read_progress(run, marketplace, progress)
             except (HumanAuthRequired, InventoryRunCancelled, InventoryResultUncertain, PageRecoveryRequired):
                 raise
@@ -272,7 +278,13 @@ class AmazonInventoryGpsrWorkflow:
                 reason = exc.reason_code
                 await self._mark_item(run, marketplace, record, FAILED, reason)
                 await self._capture_evidence(run, self._resolved(page), marketplace, record, "load-failure")
-                progress.failed()
+                # A verified row with an unsupported/ambiguous entry is a
+                # completed item-local failure, not a stalled page read. Keep
+                # the failure in reports without tripping the loading breaker.
+                if isinstance(exc, ItemEntryError):
+                    progress.completed()
+                else:
+                    progress.failed()
                 await self._check_read_progress(run, marketplace, progress)
             except (HumanAuthRequired, InventoryRunCancelled, InventoryResultUncertain, PageRecoveryRequired):
                 raise
@@ -471,6 +483,8 @@ class AmazonInventoryGpsrWorkflow:
             descriptions[FAILED] = {
                 "manufacturer_selection_failed": "制造商勾选或按钮启用未完成，尚未送出；继续后续商品",
                 "responsible_person_selection_failed": "负责人勾选或按钮启用未完成，尚未送出；继续后续商品",
+                "item_entry_unrecognized": "商品处理入口未识别，本项未点击或提交；继续后续商品和站点",
+                "item_entry_ambiguous": "商品处理入口不唯一，本项未点击或提交；继续后续商品和站点",
                 "item_click_timeout": "网页点击未完成，已跳过当前商品",
                 "item_sidebar_not_reset": "侧栏未能收起或返回，已跳过当前商品",
                 "item_panel_load_timeout": "侧栏未加载出当前商品的稳定内容，已跳过",

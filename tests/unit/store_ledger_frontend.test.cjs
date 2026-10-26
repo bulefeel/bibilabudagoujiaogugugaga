@@ -29,9 +29,9 @@ function setup(cards, search="", state={}) {
   const context=vm.createContext({
     URLSearchParams, location:{search,pathname:"/stores",hash:""},
     history:{replaceState(_state,_title,url){context.location.search=url.slice(url.indexOf("?"));}},
-    $: selector=>nodes[selector]||null, $$: selector=>selector==="select"?selects:cards,
+    $: (selector,root)=>selector==="[data-setup-select]"?{checked:!!root?.checked}:nodes[selector]||null, $$: selector=>selector==="select"?selects:cards,
     setupOperationMode:()=>"fill_missing", selectedBatchSetupCodes:()=>[],
-    setupMarketplaceCodes:["CA","UK","AU","DE","IT","FR","ES","PL"],
+    setupMarketplaceCodes:["CA","UK","AU","US","DE","IT","FR","ES","PL"],
     validPositiveId:value=>Number.isSafeInteger(Number(value))&&Number(value)>0, bulkStoreSetup,
   });
   vm.runInContext(helpers + "\n" + filter,context);
@@ -41,7 +41,7 @@ function setup(cards, search="", state={}) {
 }
 test("default shows Amazon, keeps other and unknown cards available",()=>{
   const x=setup([card(1),card(2,{platformLabel:"TikTok Shop",platformAmazon:"false",setupState:"n/a"}),card(3,{platformLabel:"平台未知",platformAmazon:""})]);
-  assert.deepEqual(x.visible(),["1"]); assert.equal(x.start.textContent,"批量建档当前筛选（1）");
+  assert.deepEqual(x.visible(),["1"]); assert.equal(x.start.textContent,"预览批量补充建档（1）");
   x.form.elements.platform.value="";x.apply();assert.deepEqual(x.visible(),["1","2","3"]);
   assert.equal(x.selection().eligible.length,2); // 保留老记录无平台字段时的既有处理方式。
   assert.match(x.note.textContent,/1 家其他平台不参与/);
@@ -77,9 +77,52 @@ test("only genuinely empty site selection defaults to CA UK AU",()=>{
   assert.deepEqual(selected.map(s=>s.marketplaceCodes),[["CA","UK","AU"],["DE","CA"],["DE"]]);
   assert.deepEqual(selected.map(s=>s.defaulted),[true,false,false]);
 });
-test("configured cards stay visible but do not enter a new setup queue",()=>{
+test("configured cards can preview additions without resetting their identity",()=>{
   const x=setup([card(1,{setupState:"done",storeSetupNeeded:"false",identityState:"CONFIRMED"}),card(2)]);
-  assert.equal(x.visible().length,2);assert.equal(x.selection().eligible.length,1);assert.match(x.note.textContent,/1 家已配置/);
+  assert.equal(x.visible().length,2);assert.equal(x.selection().eligible.length,2);assert.match(x.note.textContent,/1 家已配置/);
+  assert.match(x.note.textContent,/无需删除/);assert.equal(x.start.disabled,false);
+});
+
+test("a selected configured store adds only the requested sites and excludes hidden selections",()=>{
+  const first=card(1,{setupState:"done",storeSetupNeeded:"false",identityState:"CONFIRMED"});first.checked=true;
+  const hidden=card(3,{storeName:"Hidden"});hidden.checked=true;
+  const x=setup([first,card(2),hidden],"?q=Store");
+  x.context.selectedBatchSetupCodes=()=>["US","DE"];
+  x.context.refreshBulkStoreScope();
+  assert.equal(x.start.disabled,false);
+  assert.deepEqual(Array.from(x.selection().eligible,s=>s.id),[1]);
+  assert.deepEqual(Array.from(x.selection().eligible[0].marketplaceCodes),["US","DE"]);
+  assert.equal(first.dataset.storeSetupMarketplaces,'["CA"]');
+});
+
+test("batch preview sends the selected additions and queues the server's incremental scope",async()=>{
+  const a=card(1,{setupState:"done",storeSetupNeeded:"false"});a.checked=true;
+  const hidden=card(3,{storeName:"Hidden"});hidden.checked=true;
+  const x=setup([a,card(2),hidden],"?q=Store");
+  const rows=element({children:[],replaceChildren(){this.children=[];},append(row){this.children.push(row);}});
+  const yes=element(),no=element(),count=element();
+  for(const node of [yes,no]) node.removeEventListener=()=>{};
+  const dialog=element({removeEventListener(){},close(){},showModal(){queueMicrotask(()=>yes.listeners.click());}});
+  const originalSelect=x.context.$;
+  const nodes={"#setup-batch-preview":dialog,"[data-setup-preview-rows]":rows,"[data-setup-preview-count]":count,"[data-setup-preview-confirm]":yes,"[data-setup-preview-cancel]":no};
+  Object.assign(x.context,{
+    $:(selector,root)=>nodes[selector]||originalSelect(selector,root),
+    selectedBatchSetupCodes:()=>["CA","US","DE"],
+    crypto:{randomUUID:()=>"batch-request"},
+    document:{createElement:()=>({textContent:"",children:[],append(child){this.children.push(child);}})},
+    api:async(url,request)=>{
+      assert.equal(url,"/api/stores/setup-batch/preview");
+      assert.deepEqual(JSON.parse(request.body),{store_ids:[1],mode:"fill_missing",selections:{1:["CA","US","DE"]}});
+      return {eligible_count:1,targets:[{store_id:1,name:"Store 1",eligible:true,marketplace_codes:["US","DE"],scope:"full",setup_revision:7,added_marketplace_codes:["US","DE"],preserved_marketplace_codes:["CA"],already_passed_marketplace_codes:["CA"]}]};
+    },
+  });
+  const preview=script.slice(script.indexOf("async function previewSetupSelection()"),script.indexOf("const setupOutcomeLabels="));
+  vm.runInContext(preview,x.context);
+  const queue=await x.context.previewSetupSelection();
+  assert.deepEqual(Array.from(queue[0].marketplaceCodes),["US","DE"]);
+  assert.equal(queue[0].setupRevision,7);assert.equal(queue[0].requestId,"batch-request");
+  assert.match(rows.children[0].children[3].textContent,/新增或启用：US \/ DE/);
+  assert.match(rows.children[0].children[3].textContent,/保留原站点：CA/);
 });
 test("filters never replace the saved queue or its resume button",()=>{
   const queue=[{id:2,name:"original queue"}];const x=setup([card(1),card(2)],"",{queue,index:0,resumeAvailable:true});

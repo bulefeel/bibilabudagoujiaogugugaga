@@ -80,7 +80,7 @@ class _MarketplaceSetupDeadlineExpired(TimeoutError):
 _ASSISTED_LOGIN_WAIT_MESSAGE = (
     "当前站点的自动登录已停止：程序会先等待紫鸟填充，再依次处理邮箱 Continue、"
     "紫鸟托管 Passkey、已填密码登录和已填好的 6 位 OTP；每个页面动作最多自动点击 3 次，"
-    "每个站点最多进行 3 轮完整验证，CA、UK、AU 分别计数。程序会在次数耗尽，或出现"
+    "每个站点最多进行 3 轮完整验证，各站点分别计数。程序会在次数耗尽，或出现"
     "未填内容、候选不唯一、CAPTCHA、非托管 Passkey 等情况时停止自动点击。"
     "请在原紫鸟窗口处理后点击“再次尝试自动登录并继续”；不会切换到普通 Chrome。"
 )
@@ -858,7 +858,7 @@ class AutomationService:
         policy: OnboardingPolicy,
     ) -> dict[str, Any]:
         adapter = AmazonStoreSetupPage(policy)
-        failures: list[str] = []
+        last_failure: SetupDiagnostic | None = None
         try:
             async with self._setup_session(probe_id, selector, store_id, financial=False) as handle:
                 for code, (domain, currency) in ALLOWED_MARKETPLACES.items():
@@ -912,14 +912,14 @@ class AutomationService:
                                     ),
                                 )
                     except SetupRejected as exc:
+                        last_failure = exc.diagnostic
                         self._identity_probes[probe_id].last_diagnostic = exc.diagnostic
                         self._log_setup_diagnostic(probe_id, exc.diagnostic)
                         if exc.stop_store:
                             raise
-                        failures.append(f"{code}: {exc}")
                         continue
                     except PreflightRejected as exc:
-                        failures.append(f"{code}: {exc}")
+                        last_failure = None
                         continue
                     return {
                         "status": "SUCCEEDED",
@@ -930,7 +930,7 @@ class AutomationService:
                         "marketplace_code": code,
                         **adapter.last_identity_evidence,
                     }
-        except RuntimeError:
+        except (RuntimeError, SetupRejected):
             raise
         except Exception as exc:
             # Playwright's public ``Error`` is not a RuntimeError.  A target
@@ -949,11 +949,8 @@ class AutomationService:
                 "对应紫鸟店铺窗口尚未稳定或页面连接已中断；本次已停止，"
                 "请确认该店铺窗口正常打开后再手动重试（不会连接普通 Chrome）"
             ) from exc
-        detail = "；".join(failures)
-        raise RuntimeError(
-            "未能从 CA/UK/AU Seller Central 页面读取卖家身份"
-            + (f"：{detail}" if detail else "")
-        )
+        raise SetupRejected(last_failure.reason_code if last_failure else "IDENTITY_CURRENT_NOT_FOUND",
+                            stage="identity_read")
 
 
     async def _finish_identity_probe(
@@ -1157,7 +1154,7 @@ class AutomationService:
     def _persist_setup_progress(self, probe_id: str) -> None:
         probe = self._marketplace_setup_probes.get(probe_id)
         if probe is not None:
-            phase = "CHECK_SITE" if any(s.get("status") == "CHECKING" for s in (probe.marketplaces or ())) else "READ_IDENTITY"
+            phase = "CHECK_SITE" if any(s.get("status") in {"CHECKING", "WAITING_AUTH"} for s in (probe.marketplaces or ())) else "READ_IDENTITY"
             self.setup_records.progress(probe_id, identity=probe.identity, sites=probe.marketplaces or (),
                 lifecycle=probe.state if probe.state in {"CHECKING", "WAITING_AUTH"} else None, phase=phase,
                 diagnostic=probe.last_diagnostic.to_payload() if probe.last_diagnostic else None)
@@ -1176,8 +1173,15 @@ class AutomationService:
         handle = None
         error = None
         closed = False
+        acquisition_released = False
         try:
-            handle = await manager.__aenter__()
+            try:
+                handle = await manager.__aenter__()
+            except Exception as exc:
+                from ziniao_automation.ziniao.errors import ZiniaoLaunchError
+                if isinstance(exc, ZiniaoLaunchError):
+                    acquisition_released = exc.cleanup_confirmed is True
+                raise
             try:
                 from ziniao_automation.setup_resources import capture_process
                 self.setup_records.save_resource_proof(probe_id, await capture_process(handle))
@@ -1193,8 +1197,8 @@ class AutomationService:
                 try:
                     done, _ = await asyncio.wait({cleanup_task}, timeout=self.setup_cleanup_grace_seconds)
                     if cleanup_task in done:
-                        cleanup_task.result()
                         closed = True
+                        cleanup_task.result()
                 finally:
                     if not cleanup_task.done():
                         cleanup_task.cancel()
@@ -1202,7 +1206,7 @@ class AutomationService:
         finally:
             if not hasattr(self, "_setup_cleanup"):
                 self._setup_cleanup = {}
-            confirmed = closed and getattr(handle, "cleanup_confirmed", False) is True
+            confirmed = acquisition_released or (closed and getattr(handle, "cleanup_confirmed", False) is True)
             self._setup_cleanup[probe_id] = "CONFIRMED" if confirmed else "UNCONFIRMED"
 
     async def _run_setup_probe_before_deadline(self, *, expires_at, cleanup_grace_seconds, operation, probe_id=None):
@@ -1231,11 +1235,27 @@ class AutomationService:
             reason = exc.diagnostic.reason_code
             if reason == "IDENTITY_MISMATCH": outcome = "NEEDS_REVIEW"
             raise
-        except Exception:
+        except Exception as exc:
+            from ziniao_automation.ziniao.errors import ZiniaoLaunchError
             current = self._marketplace_setup_probes.get(probe_id) or self._identity_probes.get(probe_id)
-            if current and current.last_diagnostic:
-                reason = current.last_diagnostic.reason_code
-                if reason == "IDENTITY_MISMATCH": outcome = "NEEDS_REVIEW"
+            if isinstance(exc, ZiniaoLaunchError):
+                reason = exc.reason_code
+            else:
+                reason = "SETUP_FAILED"
+                # A previous site's refusal is not evidence about a new error.
+                # Keep only a closed error category/phase, never exception text,
+                # Playwright call logs, DOM, URLs or credentials.
+                error_type = type(exc).__name__
+                if error_type not in {"TypeError", "ValueError", "AttributeError", "RuntimeError", "Error", "TimeoutError"}:
+                    error_type = "UnexpectedError"
+                phase = "site_access" if any(s.get("status") == "CHECKING" for s in
+                    (getattr(current, "marketplaces", None) or ())) else (
+                        "finalize" if (getattr(current, "identity", None) or {}).get("status") == "SUCCEEDED"
+                        else "identity_read")
+                logger.error("setup_probe unexpected_failure probe_id=%s phase=%s exception_type=%s",
+                             probe_id, phase, error_type)
+            if current:
+                current.last_diagnostic = None
             raise
         finally:
             cleanup = getattr(self, "_setup_cleanup", {}).pop(probe_id, "UNCONFIRMED")
@@ -1477,7 +1497,7 @@ class AutomationService:
             seller_id = ""
             identity_source = ""
             identity_code = ""
-            failures: list[str] = []
+            last_failure: SetupDiagnostic | None = None
             for code in identity_marketplace_codes:
                 domain, currency = SETUP_MARKETPLACES[code]
                 marketplace = MarketplaceRef(
@@ -1534,6 +1554,7 @@ class AutomationService:
                             message="正在复用原紫鸟窗口继续读取卖家身份",
                         )
                     except SetupRejected as exc:
+                        last_failure = exc.diagnostic
                         probe = self._marketplace_setup_probes[probe_id]
                         probe.last_diagnostic = exc.diagnostic
                         self._log_setup_diagnostic(probe_id, exc.diagnostic)
@@ -1544,19 +1565,15 @@ class AutomationService:
                         )
                         if exc.stop_store:
                             raise
-                        failures.append(f"{code}: {exc}")
                         break
                     except PreflightRejected as exc:
-                        failures.append(f"{code}: {exc}")
+                        last_failure = None
                         break
                 if seller_id:
                     break
             if not seller_id:
-                detail = "；".join(failures)
-                raise RuntimeError(
-                    "未能从所选 Seller Central 站点读取卖家身份"
-                    + (f"：{detail}" if detail else "")
-                )
+                raise SetupRejected(last_failure.reason_code if last_failure else "IDENTITY_CURRENT_NOT_FOUND",
+                                    stage="identity_read")
 
             (
                 identity_result,
@@ -1711,7 +1728,7 @@ class AutomationService:
                         # 资金锁,毫无意义。如实记下原因,接着核下一个站点。
                         await self._record_setup_site_failure(probe_id, code, exc.diagnostic)
                         if exc.diagnostic.reason_code in {"DOMAIN_MISMATCH", "IDENTITY_MISMATCH"}:
-                            raise RuntimeError(exc.diagnostic.message) from None
+                            raise SetupRejected(exc.diagnostic.reason_code, stage="marketplace_switch") from None
                         break
                     resolved_page = adapter.resolved_page_for(handle.page)
                     if resolved_page is not handle.page:
@@ -1954,7 +1971,7 @@ class AutomationService:
                         if exc.kind == "marketplace_switch":
                             await self._record_setup_site_failure(probe_id, code, exc.diagnostic)
                             if exc.diagnostic.reason_code in {"DOMAIN_MISMATCH", "IDENTITY_MISMATCH"}:
-                                raise RuntimeError(exc.diagnostic.message) from None
+                                raise SetupRejected(exc.diagnostic.reason_code, stage="marketplace_switch") from None
                             break
                         resolved_page = adapter.resolved_page_for(handle.page)
                         if resolved_page is not handle.page:

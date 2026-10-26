@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+
 from ..amazon_login import AmazonLoginAdvancer
 from ..amazon_account_switcher import AmazonAccountSwitcher, MARKETPLACE_NAMES
 from ..amazon_switcher_contract import VERSION as SWITCHER_CONTRACT_VERSION, read_switcher_snapshot
@@ -34,16 +36,19 @@ class SiteSetupResult:
     payment_capability: Literal["SUPPORTED", "NO_PAYMENT_DATA", "UNKNOWN", "NOT_CHECKED"]
     identity_source: str
     adapter_version: str = ADAPTER_VERSION
+    inventory_capability: Literal["SUPPORTED", "UNKNOWN", "NOT_CHECKED"] = "NOT_CHECKED"
 
     def __post_init__(self) -> None:
         if self.identity_check != "PASSED" or self.access_check != "PASSED":
             raise ValueError("successful setup result requires both checks to pass")
         if self.payment_capability not in {"SUPPORTED", "NO_PAYMENT_DATA", "UNKNOWN", "NOT_CHECKED"}:
             raise ValueError("invalid payment capability")
+        if self.inventory_capability not in {"SUPPORTED", "UNKNOWN", "NOT_CHECKED"}:
+            raise ValueError("invalid inventory capability")
 
     def to_payload(self) -> dict[str, str]:
         return {"identity_check": self.identity_check, "access_check": self.access_check,
-                "payment_capability": self.payment_capability,
+                "payment_capability": self.payment_capability, "inventory_capability": self.inventory_capability,
                 "identity_source": self.identity_source, "adapter_version": self.adapter_version}
 
 
@@ -230,12 +235,15 @@ class AmazonStoreSetupPage:
 
     async def detect_identity(self, page: Any, marketplace: MarketplaceRef) -> tuple[str, str]:
         try:
-            if marketplace.code in INVENTORY_MARKETPLACES:
+            if marketplace.code in INVENTORY_MARKETPLACES and marketplace.code not in ALLOWED_MARKETPLACES:
                 adapter = self._inventory_adapter()
                 result = await adapter.detect_identity(page, marketplace)
                 self.last_identity_evidence = dict(adapter.last_identity_evidence)
                 return result
             return await self._detect_identity(page, marketplace)
+        except PlaywrightTimeoutError:
+            self._require_open(page)
+            raise SetupRejected("NAVIGATION_TIMEOUT", stage="identity_read") from None
         except Exception:
             # A target may close inside goto/count, not just before a sample.
             # Do not retain its raw protocol error or retry on another store.
@@ -316,9 +324,14 @@ class AmazonStoreSetupPage:
     async def check_site(self, page: Any, store: StoreRef,
                          marketplace: MarketplaceRef) -> SiteSetupResult:
         try:
-            if marketplace.code in INVENTORY_MARKETPLACES:
+            # Overlapping sites (DE) use the payment landing for basic setup.
+            # Inventory readiness is not a prerequisite for payment access.
+            if marketplace.code in INVENTORY_MARKETPLACES and marketplace.code not in ALLOWED_MARKETPLACES:
                 return await self._inventory_adapter().check_site(page, store, marketplace)
             return await self._check_site(page, store, marketplace)
+        except PlaywrightTimeoutError:
+            self._require_open(page)
+            raise SetupRejected("NAVIGATION_TIMEOUT", stage="site_access") from None
         except Exception:
             self._require_open(page)
             raise

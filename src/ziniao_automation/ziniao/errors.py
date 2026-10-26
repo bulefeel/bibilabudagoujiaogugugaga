@@ -31,6 +31,12 @@ class ZiniaoApiError(ZiniaoError):
 class ZiniaoLaunchError(ZiniaoError):
     """A single store environment did not become healthy."""
 
+    def __init__(self, message: str, *, cleanup_confirmed: bool = False,
+                 reason_code: str = "ZINIAO_LAUNCH_FAILED") -> None:
+        super().__init__(message)
+        self.cleanup_confirmed = cleanup_confirmed
+        self.reason_code = reason_code
+
 
 class CdpHealthError(ZiniaoLaunchError):
     """Chrome CDP exists but failed the required health checks."""

@@ -9,6 +9,9 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 REASON_MESSAGES = {
+    "ZINIAO_LAUNCH_FAILED": "紫鸟店铺环境启动未成功，该店建档未执行；请检查紫鸟启动状态后重试",
+    "ZINIAO_NETWORK_ERROR": "紫鸟启动接口连续返回网络异常，该店本轮未打开页面、未核验站点；保留原建档并继续下一家",
+    "ZINIAO_DEVICE_UNBOUND": "紫鸟提示该账号未绑定设备（104），本次未启动店铺窗口；请先在紫鸟绑定设备，再重试该店",
     "IDENTITY_PAGE_NOT_READY": "当前页面的身份候选未在限定时间内稳定就绪，该项核验未通过",
     "IDENTITY_CURRENT_NOT_FOUND": "当前页面未显示可确认的卖家身份，该项核验未通过",
     "IDENTITY_AMBIGUOUS": "页面显示多个不同卖家身份，已停止该店核验",

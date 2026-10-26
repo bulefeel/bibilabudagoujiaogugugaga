@@ -20,6 +20,7 @@ def build_controller(
     credential_ref: str | None = None,
     credential_resolver: Callable[[], Mapping[str, str]] | None = None,
     credential_resolver_authoritative: bool = False,
+    start_retry_delay_seconds: float = 3.0,
     **controller_options: Any,
 ) -> ZiniaoController:
     """Construct the process-wide controller.
@@ -61,7 +62,8 @@ def build_controller(
             credential_resolver=credential_resolver,
             credential_resolver_authoritative=credential_resolver_authoritative,
         )
-    controller_config = ZiniaoControllerConfig(client_path=Path(client_path))
+    controller_config = ZiniaoControllerConfig(client_path=Path(client_path),
+        start_retry_delay_seconds=start_retry_delay_seconds)
     return ZiniaoController(
         client,
         config=controller_config,

@@ -34,7 +34,8 @@ V1_MARKETPLACES: dict[str, tuple[str, str]] = {
     "CA": ("sellercentral.amazon.ca", "CAD"),
     "UK": ("sellercentral.amazon.co.uk", "GBP"),
     "AU": ("sellercentral.amazon.com.au", "AUD"),
-    # 欧洲合规站点通过库存页建档，不进入提现 ALLOWED_MARKETPLACES。
+    "US": ("sellercentral.amazon.com", "USD"),
+    # 欧洲站保留库存只读建档；德国同时支持提现，付款条件由运行现场核对。
     "DE": ("sellercentral.amazon.de", "EUR"),
     "IT": ("sellercentral.amazon.it", "EUR"),
     "FR": ("sellercentral.amazon.fr", "EUR"),

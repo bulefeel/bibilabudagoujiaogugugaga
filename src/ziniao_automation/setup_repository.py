@@ -8,12 +8,13 @@ from __future__ import annotations
 from datetime import timedelta, timezone
 from hashlib import sha256
 import json
+import logging
 from uuid import uuid4
 
 from sqlalchemy import select, text
 
 from .db import utc_now
-from .models import Store, StoreMarketplace, StoreSetupProbe as Probe, StoreSetupSiteResult as Site
+from .models import Store, Run, StoreMarketplace, StoreSetupProbe as Probe, StoreSetupSiteResult as Site
 from .workflows.store_setup.config import SETUP_MARKETPLACES, DEFAULT_SETUP_CODES
 from .workflows.setup_diagnostics import SetupDiagnostic, REASON_MESSAGES
 from .workflows.store_setup.identity import ADAPTER_VERSION
@@ -47,6 +48,32 @@ def snapshot(session, store):
     return {"selector_type": store.selector_type, "selector_value": store.selector_value,
             "expected_seller_id": store.expected_seller_id, "identity_confirmed": store.identity_confirmed,
             "markets": [[m.code, m.domain, m.currency, m.enabled] for m in markets]}
+
+
+def additive_configuration(probe, current, revision):
+    """Accept only uninterrupted additions, never revive a reset or edited identity.
+
+    SQLite increments the generation once per inserted/enabled marketplace. The
+    exact delta matters: equal snapshots alone cannot detect change-then-restore.
+    Historical probes and their timestamps stay immutable.
+    """
+    previous = probe.config_snapshot
+    if any(previous.get(key) != current.get(key) for key in
+           ("selector_type", "selector_value", "expected_seller_id", "identity_confirmed")):
+        return False
+    before = {m[0]: m for m in previous.get("markets", [])}
+    after = {m[0]: m for m in current["markets"]}
+    if not before.keys() <= after.keys():
+        return False
+    changes = len(after.keys() - before.keys())
+    for code, old in before.items():
+        new = after[code]
+        if old == new:
+            continue
+        if old[:3] != new[:3] or old[3] or not new[3]:
+            return False
+        changes += 1
+    return revision - probe.setup_revision == changes
 
 
 def identity_payload(value):
@@ -168,8 +195,8 @@ class SetupRepository:
     def identity_bootstrap_codes(self, probe_id):
         """Reuse a currently proven site for identity only, never as a new pass.
 
-        Failed/unregistered sites may expose no current seller. A retry can use
-        another selected site's same-revision proof to find the existing seller,
+        Failed/unregistered sites may expose no current seller. Both a retry and
+        an incremental full probe can use a compatible previously proven site,
         but the adapter must read and compare that identity again on the live page.
         """
         with self.sessions() as session:
@@ -178,8 +205,6 @@ class SetupRepository:
                 raise SetupConflict("核验记录已删除")
             store = self.check(session, row)
             requested = list(row.requested_marketplace_codes)
-            if row.scope != "retry_unverified":
-                return requested
             summary = self._summary(session, store)
             proven = [code for code in summary["selected_marketplace_codes"]
                       if code in SETUP_MARKETPLACES and code not in requested
@@ -253,7 +278,7 @@ class SetupRepository:
                     item.outcome = ("BLOCKED" if reason in BLOCKED else "FAILED") if item.attempted else "NOT_RUN"
                 elif status == "CANCELLED":
                     item.outcome = "CANCELLED" if item.attempted else "NOT_RUN"
-                for key in ("identity_check", "access_check", "payment_capability"):
+                for key in ("identity_check", "access_check", "payment_capability", "inventory_capability"):
                     val = value.get(key)
                     if val in {"PASSED", "FAILED", "NOT_CHECKED", "UNKNOWN", "SUPPORTED", "NO_PAYMENT_DATA"}:
                         setattr(item, key, val)
@@ -299,7 +324,9 @@ class SetupRepository:
                 row.identity_result = {**row.identity_result, "status": "FAILED", "reason_code": reason if reason in REASONS else "SETUP_FAILED"}
             row.lifecycle = "FINISHED"; row.phase = "DONE"; row.outcome = outcome
             row.cleanup_state = cleanup; row.updated_at = now; row.finished_at = now
-            if reason in REASON_MESSAGES and not row.diagnostics:
+            if reason == "SETUP_FAILED":
+                row.diagnostics = {}  # a stale site refusal must not mask a runtime error
+            elif reason in REASON_MESSAGES and row.diagnostics.get("reason_code") != reason:
                 row.diagnostics = SetupDiagnostic(reason_code=reason).to_payload()
             row.reason_code = None if outcome == "SUCCEEDED" else reason if reason in REASONS else row.reason_code or "SETUP_FAILED"
             row.message = "建档核验通过" if outcome == "SUCCEEDED" else "部分站点通过，请查看分项结果" if outcome == "PARTIAL" else REASONS[row.reason_code]
@@ -336,6 +363,43 @@ class SetupRepository:
                 session.commit()
             return self._view(session, row)
 
+    def _release_target(self, store_id, probe_id):
+        from .ziniao.models import ProfileSelector
+        with self.sessions() as session:
+            row = self._probe(session, store_id, probe_id)
+            store = self._store(session, store_id)
+            if row.lifecycle != "FINISHED":
+                raise SetupConflict("核验仍在执行，请先取消并等待清理", row.id)
+            if (row.config_snapshot.get("selector_type"), row.config_snapshot.get("selector_value")) != (store.selector_type, store.selector_value):
+                raise SetupConflict("该店紫鸟环境已变更，不能释放另一个环境", row.id)
+            if session.scalar(select(Probe.id).where(Probe.store_id == store_id, Probe.lifecycle.in_(ACTIVE)).limit(1)):
+                raise SetupConflict("该店仍有活动核验，请等待结束", row.id)
+            if session.scalar(select(Run.id).where(Run.store_id == store_id,
+                    Run.status.in_(("QUEUED", "RUNNING", "WAITING_AUTH", "RECONCILING"))).limit(1)):
+                raise SetupConflict("该店仍有排队或执行中的业务任务，请先等待任务结束", row.id)
+            return ProfileSelector(store.selector_type, store.selector_value)
+
+    async def release_environment(self, store_id, probe_id, controller):
+        """Explicit operator recovery for terminal probes, including missing PID proof."""
+        current = self.get(store_id, probe_id)
+        if current["cleanup_state"] == "CONFIRMED":
+            return current
+        selector = self._release_target(store_id, probe_id)
+        def validate():
+            if self._release_target(store_id, probe_id) != selector:
+                raise SetupConflict("环境已变化，请刷新后重试", probe_id)
+        acknowledged = await controller.release_setup_store(selector, str(store_id), validate)
+        with self.sessions() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = self._probe(session, store_id, probe_id)
+            if acknowledged is True and row.lifecycle == "FINISHED":
+                row.cleanup_state = "CONFIRMED"
+                row.message = row.message.removesuffix("；窗口释放待确认")
+                row.updated_at = utc_now()
+                session.commit()
+            logging.getLogger(__name__).info("setup_release probe_id=%s acknowledged=%s", probe_id, acknowledged is True)
+            return self._view(session, row)
+
     def recover(self):
         with self.sessions() as session:
             ids = list(session.scalars(select(Probe.id).where(Probe.lifecycle.in_(ACTIVE))))
@@ -359,7 +423,8 @@ class SetupRepository:
         payload = {"code": row.marketplace_code, "domain": row.domain, "currency": SETUP_MARKETPLACES[row.marketplace_code][1],
                 "status": status, "outcome": row.outcome, "attempted": row.attempted,
                 "identity_check": row.identity_check, "access_check": row.access_check,
-                "payment_capability": row.payment_capability, "reason_code": row.reason_code,
+                "payment_capability": row.payment_capability, "inventory_capability": row.inventory_capability,
+                "reason_code": row.reason_code,
                 "message": row.message, "page_category": row.page_category, "adapter_version": row.adapter_version,
                 "evidence_state": row.evidence_state, "started_at": iso(row.started_at), "finished_at": iso(row.finished_at)}
 
@@ -386,18 +451,24 @@ class SetupRepository:
 
     def _summary(self, session, store):
         probes = session.scalars(select(Probe).where(Probe.store_id == store.id).order_by(Probe.created_at.desc(), Probe.id.desc())).all()
+        current = snapshot(session, store)
+        current_markets = {m[0]: m for m in current["markets"]}
         latest = {}; old_pass = {}
         for probe in probes:
+            compatible = probe.adapter_version == ADAPTER_VERSION and additive_configuration(probe, current, store.setup_revision)
+            previous_markets = {m[0]: m for m in probe.config_snapshot.get("markets", [])}
             for item in session.scalars(select(Site).where(Site.probe_id == probe.id)):
                 if item.outcome == "PASSED" and item.marketplace_code not in old_pass: old_pass[item.marketplace_code] = iso(item.finished_at)
-                if probe.setup_revision == store.setup_revision and probe.adapter_version == ADAPTER_VERSION and item.marketplace_code not in latest:
+                if (compatible and item.marketplace_code not in latest
+                        and previous_markets.get(item.marketplace_code) == current_markets.get(item.marketplace_code)):
                     latest[item.marketplace_code] = self._site_view(item)
-        enabled = [m[0] for m in snapshot(session, store)["markets"] if m[3]]
+        enabled = [m[0] for m in current["markets"] if m[3]]
         eligible = [c for c in enabled if c in SETUP_MARKETPLACES]
         passed = sum(latest.get(c, {}).get("outcome") == "PASSED" for c in eligible)
         active = next((p for p in probes if p.lifecycle in ACTIVE), None)
         state = "UNVERIFIED" if not latest else "SUCCEEDED" if eligible and passed == len(eligible) else "PARTIAL" if passed else "FAILED"
-        stale = bool(probes and (probes[0].setup_revision != store.setup_revision or probes[0].adapter_version != ADAPTER_VERSION))
+        stale = bool(probes and (not additive_configuration(probes[0], current, store.setup_revision)
+                                or probes[0].adapter_version != ADAPTER_VERSION))
         if stale: state = "NEEDS_REVIEW"
         if probes and not stale and probes[0].outcome in {"CANCELLED", "TIMED_OUT", "INTERRUPTED", "NEEDS_REVIEW"}:
             state = probes[0].outcome
@@ -433,15 +504,21 @@ class SetupRepository:
                     if defaulted: codes=list(DEFAULT_SETUP_CODES)
                     reason=None
                     if not store.platform.is_amazon: reason="仅核验已确认的亚马逊店铺"
-                    elif mode=="fill_missing" and summary["configured"] and not explicit: reason="配置已完整，可选择重试未通过站点或复核"
                     elif summary["active_probe"]: reason="已有活动核验"
                     elif not codes: reason="请选择要核验的站点"
                     elif len(set(codes)) != len(codes) or set(codes)-set(SETUP_MARKETPLACES): reason="包含重复或不支持的建档站点"
                     elif mode=="retry_unverified" and not set(codes)<=set(enabled): reason="请求范围不在当前所选站点中"
-                    if mode=="retry_unverified": codes=[c for c in codes if summary["marketplaces"].get(c,{}).get("outcome")!="PASSED"]
-                    if not codes and not reason: reason="当前范围已通过，无需补测"
+                    already_passed = [c for c in codes if c in enabled
+                        and (mode=="retry_unverified" or (summary["identity_confirmed"] and summary["expected_seller_id"]))
+                        and summary["marketplaces"].get(c,{}).get("outcome")=="PASSED"]
+                    if mode in {"fill_missing", "retry_unverified"}:
+                        codes=[c for c in codes if c not in already_passed]
+                    if not codes and not reason: reason="所选站点均已通过；需要新站点时请在上方勾选，无需删除建档"
                     targets.append({"store_id":sid,"name":store.name,"setup_revision":store.setup_revision,
                         "marketplace_codes":codes,"scope":"retry_unverified" if mode=="retry_unverified" else "full",
+                        "added_marketplace_codes":[c for c in codes if c not in enabled],
+                        "preserved_marketplace_codes":[c for c in enabled if c not in codes],
+                        "already_passed_marketplace_codes":already_passed if mode!="recheck" else [],
                         "eligible":reason is None,"reason":reason,"defaulted":defaulted})
             except LookupError:
                 targets.append({"store_id":sid,"eligible":False,"reason":"店铺已删除","marketplace_codes":[]})

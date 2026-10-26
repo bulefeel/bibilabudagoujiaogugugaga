@@ -5,13 +5,14 @@ const fs=require('node:fs');
 const path=require('node:path');
 const script=fs.readFileSync(path.join(__dirname,'../../src/ziniao_automation/static/app.js'),'utf8');
 const fn=script.slice(script.indexOf('  function applyPersistedStoreFacts'),script.indexOf('  async function refreshPersistedSetups'));
+const payoutCodes=script.match(/  const disbursementMarketplaceCodes = .*;/)[0];
 function element(){return {textContent:'',dataset:{},disabled:true,children:[],classList:{values:new Set(),toggle(name,on){if(on)this.values.add(name);else this.values.delete(name);},add(name){this.values.add(name);}},replaceChildren(){this.children=[];},append(...nodes){this.children.push(...nodes);}};}
 function setup(){
  const card={dataset:{platformAmazon:'true',identityState:'MISSING'}};
  const keys=['[data-store-identity-value]','[data-store-identity-state]','[data-store-task-state]','[data-store-config-state]','[data-store-markets]','[data-action="edit-store"]','[data-action="new-run"]'];
  const nodes=Object.fromEntries(keys.map(key=>[key,element()]));
  nodes['[data-action="edit-store"]'].dataset.store=JSON.stringify({id:1,name:'Fixture',expected_seller_id:null,marketplaces:[]});
- const context=vm.createContext({$:selector=>nodes[selector],document:{createElement:()=>element()}});vm.runInContext(fn,context);
+ const context=vm.createContext({$:selector=>nodes[selector],document:{createElement:()=>element()}});vm.runInContext(payoutCodes+'\n'+fn,context);
  return {card,nodes,apply:summary=>context.applyPersistedStoreFacts(card,summary)};
 }
 function facts(extra={}){return {expected_seller_id:'Current Seller',identity_confirmed:true,store_enabled:true,configured:true,selected_marketplace_codes:['CA','DE'],marketplace_config:[{code:'CA',domain:'sellercentral.amazon.ca',currency:'CAD',enabled:true},{code:'DE',domain:'sellercentral.amazon.de',currency:'EUR',enabled:true}],...extra};}
@@ -43,10 +44,12 @@ test('seller names are text not HTML, and unrelated pages tolerate absent nodes'
  assert.equal(x.nodes['[data-store-identity-value]'].innerHTML,undefined);
  for(const key of Object.keys(x.nodes))delete x.nodes[key];assert.doesNotThrow(()=>x.apply(facts()));
 });
-test('non Amazon sites stay outside onboarding and DE-only keeps payout disabled',()=>{
+test('non Amazon and inventory-only sites stay disabled; US and DE enable payout',()=>{
  const x=setup();x.card.dataset.platformAmazon='false';x.apply(facts());
  assert.equal(x.card.dataset.setupState,'n/a');assert.equal(x.nodes['[data-action="new-run"]'].disabled,true);
- x.card.dataset.platformAmazon='true';x.apply(facts({selected_marketplace_codes:['DE']}));assert.equal(x.nodes['[data-action="new-run"]'].disabled,true);
+ x.card.dataset.platformAmazon='true';
+ for(const code of ['US','DE']){x.apply(facts({selected_marketplace_codes:[code]}));assert.equal(x.nodes['[data-action="new-run"]'].disabled,false);}
+ x.apply(facts({selected_marketplace_codes:['FR']}));assert.equal(x.nodes['[data-action="new-run"]'].disabled,true);
 });
 // Execute the production renderer-snapshot JS, not a separately copied parser.
 const py=fs.readFileSync(path.join(__dirname,'../../src/ziniao_automation/workflows/store_setup/identity.py'),'utf8');

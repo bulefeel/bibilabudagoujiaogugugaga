@@ -73,6 +73,7 @@ CONFIRM_BUTTON_SELECTOR = 'kat-button[data-test="confirm-selection"]'
 # 相等 + 必须唯一，推错了只会「匹配不到 → 跳过」，绝不会点到别的国家。
 # 实地遇到新的写法时把它加进来，别改成模糊匹配。
 MARKETPLACE_NAMES: Mapping[str, frozenset[str]] = {
+    "sellercentral.amazon.com": frozenset({"美国", "美國", "United States"}),
     "sellercentral.amazon.de": frozenset({"德國", "德国", "Germany"}),
     "sellercentral.amazon.it": frozenset({"意大利", "義大利", "Italy", "Italia"}),
     "sellercentral.amazon.fr": frozenset({"法国", "法國", "France"}),

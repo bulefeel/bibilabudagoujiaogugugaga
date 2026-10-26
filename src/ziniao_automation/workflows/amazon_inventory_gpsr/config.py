@@ -26,7 +26,13 @@ MANUFACTURER = "manufacturer"
 PARTY_TYPES = (RESPONSIBLE_PERSON, MANUFACTURER)
 REQUIREMENT_TYPES = (SAFETY_ATTESTATION, *PARTY_TYPES)
 REQUIREMENT_LABELS = {SAFETY_ATTESTATION: "安全证明", RESPONSIBLE_PERSON: "负责人信息", MANUFACTURER: "制造商信息"}
-ENTRY_LABELS = ("解决商品信息问题", "修正刊登資訊問題")
+# Both list entry types were observed to open an identity-bound action panel.
+# A suppressed listing can mix GPSR requirements with color/EPR editing; only
+# the separately validated compliance branch is eligible for our submission.
+ENTRY_LABELS = (
+    "解决商品信息问题", "修正刊登資訊問題",
+    "修复被禁止显示的商品信息", "修正限制刊登問題",
+)
 VIOLATION_LABELS = ("解决商品信息违规问题", "處理違規商品刊登資訊")
 INVENTORY_URL = (
     f"https://{INVENTORY_DOMAIN}{INVENTORY_PATH}"

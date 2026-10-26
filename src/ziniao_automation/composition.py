@@ -300,6 +300,7 @@ def _build_controller_from_database(
         host=settings.ziniao_host,
         port=settings.ziniao_port,
         client_path=settings.ziniao_executable,
+        start_retry_delay_seconds=settings.ziniao_start_retry_delay_seconds,
         company=company or "",
         username=username or "",
         credential_ref=credential_ref,

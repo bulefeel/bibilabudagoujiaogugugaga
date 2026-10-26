@@ -1637,7 +1637,7 @@ def test_schedules_page_renders_a_real_row_not_just_an_empty_list(app_client):
 @pytest.mark.parametrize(
     ("workflow", "expected"),
     [
-        ("amazon_disbursement", ["CA"]),
+        ("amazon_disbursement", ["CA", "DE"]),
         ("amazon_feedback_removal", ["CA"]),
         ("amazon_gpsr_attestation", ["DE"]),
     ],
@@ -1776,7 +1776,7 @@ def test_manual_settle_reaches_the_same_verdict_as_the_engine(
 
 
 def test_start_check_on_a_store_with_no_supported_site_says_so(app_client):
-    """只开了 DE 的店点「发起检查」(默认是提现流程):对话框里没有站点选择框,
+    """只开了 FR 的店点「发起检查」(默认是提现流程):对话框里没有站点选择框,
     「请至少选择一个站点」让人无从下手。要直说这家店没启用这个流程能跑的站点。"""
 
     app, client, fake = app_client
@@ -1784,9 +1784,9 @@ def test_start_check_on_a_store_with_no_supported_site_says_so(app_client):
     store = client.post(
         "/api/stores",
         json={
-            "name": "DE Only",
+            "name": "FR Only",
             "selector_type": "id",
-            "selector_value": "de-only-1",
+            "selector_value": "fr-only-1",
             "expected_seller_id": "A1SELLER",
         },
         headers=headers,
@@ -1796,7 +1796,7 @@ def test_start_check_on_a_store_with_no_supported_site_says_so(app_client):
         json={
             "identity_confirmed": True,
             "enabled": True,
-            "marketplaces": [{"code": "DE", "enabled": True}],
+            "marketplaces": [{"code": "FR", "enabled": True}],
         },
         headers=headers,
     )

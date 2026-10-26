@@ -10,7 +10,7 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-MarketplaceCode = Literal["CA", "UK", "AU", "DE", "IT", "FR", "ES", "PL"]
+MarketplaceCode = Literal["CA", "UK", "AU", "US", "DE", "IT", "FR", "ES", "PL"]
 RunMode = Literal["dry_run", "approval", "auto"]
 Weekday = Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 

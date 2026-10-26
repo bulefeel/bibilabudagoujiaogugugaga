@@ -26,6 +26,7 @@ from ziniao_automation.db import create_sqlite_engine, init_database, make_sessi
 from ziniao_automation.models import OperationGuard, Store, StoreMarketplace
 from ziniao_automation.repositories import StoreRepository, WorkflowRepository
 from ziniao_automation.workflows.types import disbursement_day_key, operation_guard_key
+from ziniao_automation.workflows.amazon_disbursement.config import ALLOWED_MARKETPLACES
 
 
 KEY_FIELDS = dict(
@@ -83,7 +84,8 @@ def database(tmp_path: Path):
     engine.dispose()
 
 
-def _armed(session, *, guard_key: str, state: str | None = None):
+def _armed(session, *, guard_key: str, state: str | None = None, code: str = "CA"):
+    domain, currency = ALLOWED_MARKETPLACES[code]
     store = StoreRepository(session).create(
         name="Guard store", selector_type="id", selector_value=f"p-{guard_key[:6]}",
         browser_id=f"p-{guard_key[:6]}", expected_seller_id="SELLER",
@@ -91,22 +93,22 @@ def _armed(session, *, guard_key: str, state: str | None = None):
     store.identity_confirmed = True
     store.enabled = True
     market = StoreMarketplace(
-        store_id=store.id, code="CA",
-        domain="sellercentral.amazon.ca", currency="CAD", enabled=True,
+        store_id=store.id, code=code,
+        domain=domain, currency=currency, enabled=True,
     )
     session.add(market)
     session.flush()
     repo = WorkflowRepository(session)
     run = repo.create_run(store_id=store.id, workflow="amazon_disbursement", mode="auto")
     site = repo.save_site_plan(
-        run_id=run.id, marketplace_id=market.id, marketplace_code="CA", currency="CAD",
+        run_id=run.id, marketplace_id=market.id, marketplace_code=code, currency=currency,
         payable_amount=Decimal("220.11"), delayed_amount=Decimal("0.00"),
         settlement_key="2026/8/26 - 至今", plan_hash="a" * 64, snapshot_hash="b" * 64,
     )
     guard, created = repo.arm_operation(
         guard_key=guard_key, run_id=run.id, site_run_id=site.id, store_id=store.id,
-        workflow="amazon_disbursement", marketplace_code="CA",
-        settlement_key="2026/8/26 - 至今", amount=Decimal("220.11"), currency="CAD",
+        workflow="amazon_disbursement", marketplace_code=code,
+        settlement_key="2026/8/26 - 至今", amount=Decimal("220.11"), currency=currency,
         plan_hash="a" * 64, snapshot_hash="b" * 64,
     )
     if state:
@@ -116,7 +118,8 @@ def _armed(session, *, guard_key: str, state: str | None = None):
 
 
 @pytest.mark.parametrize("state", ["ARMED", "SUBMITTED", "UNCERTAIN", "CONFIRMED"])
-def test_the_same_key_is_never_armed_twice_whatever_state_it_is_in(database, state) -> None:
+@pytest.mark.parametrize("code", ["CA", "US", "DE"])
+def test_the_same_key_is_never_armed_twice_whatever_state_it_is_in(database, state, code) -> None:
     """UNCERTAIN 那一档是重点：那正是「点了但没读回来」的样子。
 
     拿掉 run 级阻断之后，第二次运行遇到的就是这个现场——它必须原样返回已有记录，
@@ -125,7 +128,7 @@ def test_the_same_key_is_never_armed_twice_whatever_state_it_is_in(database, sta
 
     key = "one-per-site-per-day"
     with database() as session:
-        repo, first, created, run, site, store = _armed(session, guard_key=key, state=state)
+        repo, first, created, run, site, store = _armed(session, guard_key=key, state=state, code=code)
         assert created is True
         # 直查列，不读 ORM 对象：transition_guard 走的是 Core UPDATE，不会刷新
         # 内存里那个实例，读它拿到的是过期值。
@@ -138,9 +141,9 @@ def test_the_same_key_is_never_armed_twice_whatever_state_it_is_in(database, sta
 
         again, created_again = repo.arm_operation(
             guard_key=key, run_id=run.id, site_run_id=site.id, store_id=store.id,
-            workflow="amazon_disbursement", marketplace_code="CA",
+            workflow="amazon_disbursement", marketplace_code=code,
             settlement_key="2026/8/26 - 至今",
-            amount=Decimal("999.99"), currency="CAD",
+            amount=Decimal("999.99"), currency=ALLOWED_MARKETPLACES[code][1],
             plan_hash="c" * 64, snapshot_hash="d" * 64,
         )
         session.commit()

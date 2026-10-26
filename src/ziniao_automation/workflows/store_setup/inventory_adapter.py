@@ -15,7 +15,7 @@ from ..amazon_inventory_gpsr.config import (
 from ..amazon_inventory_gpsr.page import AmazonInventoryGpsrPage, InventoryContractError, ItemLoadError, _DOM_HELPERS, _LIST
 from ..amazon_login import AmazonLoginAdvancer
 from ..errors import HumanAuthRequired
-from ..setup_diagnostics import classify_switch_landing
+from ..setup_diagnostics import classify_switch_landing, switch_diagnostic
 from .adapter import AmazonStoreSetupPage, SiteSetupResult
 from .config import SETUP_MARKETPLACES
 from .identity import IdentityObservation, SetupRejected
@@ -105,7 +105,8 @@ class InventoryStoreSetupPage(AmazonStoreSetupPage):
         if not outcome.ok:
             if outcome.reason == "auth_required":
                 raise HumanAuthRequired("建档等待当前商城登录完成", kind="signin")
-            raise SetupRejected("MARKETPLACE_UNKNOWN", category=category, stage="marketplace_switch")
+            diagnostic = switch_diagnostic(outcome.switch_reason or outcome.reason, page_category=category)
+            raise SetupRejected(diagnostic.reason_code, category=category, stage="marketplace_switch")
         if category != "TARGET_PAGE":
             raise SetupRejected("UNKNOWN_PAGE", category=category)
         return page
@@ -154,15 +155,6 @@ class InventoryStoreSetupPage(AmazonStoreSetupPage):
             page = self._remember_page(page, switched)
             page = await self._open_inventory(page, marketplace)
             self.inventory._remember(page, page, run, marketplace)
-            # Access evidence only. Do not use _wait_list: that scrolls all rows.
-            async def access():
-                self._classify(page, marketplace)
-                return await self.inventory._evaluate(page, _LIST)
-            await self.inventory._poll(access,
-                lambda s: s.get("ready") and not s.get("loading")
-                    and s.get("filters", []).count("ApprovalRequired") == 1,
-                self.policy.candidate_ready_timeout_ms / 1000,
-                message="库存页访问或需要批准筛选未确认", contract=True)
             await self.inventory._identity(page, run)
         except InventoryContractError:
             self._classify(self.resolved_page_for(page), marketplace)
@@ -170,8 +162,26 @@ class InventoryStoreSetupPage(AmazonStoreSetupPage):
             current = await self._stable(self.resolved_page_for(page), marketplace)
             current.choose(store.expected_seller_id)
             raise SetupRejected("INVENTORY_ACCESS_UNPROVEN", stage="site_access") from None
+        # The selected marketplace and seller above are the basic access gate.
+        # List/filter readiness is an independent observation, not an identity
+        # failure. Never scan, open a product, or weaken the workflow's own gate.
+        async def access():
+            self._classify(page, marketplace)
+            return await self.inventory._evaluate(page, _LIST)
+        try:
+            await self.inventory._poll(access,
+                lambda s: s.get("ready") and not s.get("loading")
+                    and s.get("filters", []).count("ApprovalRequired") == 1,
+                self.policy.candidate_ready_timeout_ms / 1000,
+                message="库存列表能力尚未确认", contract=True)
+            inventory_capability = "SUPPORTED"
+        except InventoryContractError:
+            inventory_capability = "UNKNOWN"
+        # Revalidate after the optional observation: wrong seller, country,
+        # domain or an inactive landing still fails basic setup.
         final = await self._stable(page, marketplace)
         first.require_consistent_with(final)
         identity = self._record(final, final.choose(store.expected_seller_id))
         await self.inventory._identity(page, run)
-        return SiteSetupResult("PASSED", "PASSED", "NOT_CHECKED", identity[1])
+        return SiteSetupResult("PASSED", "PASSED", "NOT_CHECKED", identity[1],
+                               inventory_capability=inventory_capability)

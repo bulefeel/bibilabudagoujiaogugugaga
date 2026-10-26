@@ -7,7 +7,7 @@ import pytest
 
 from test_inventory_gpsr_dom import page, renderer, BROWSER, POLICY
 from ziniao_automation.config import PROJECT_ROOT
-from ziniao_automation.workflows.amazon_inventory_gpsr.page import AmazonInventoryGpsrPage
+from ziniao_automation.workflows.amazon_inventory_gpsr.page import AmazonInventoryGpsrPage, InventoryContractError
 from ziniao_automation.workflows.amazon_inventory_gpsr.config import INVENTORY_URL
 from ziniao_automation.workflows.store_setup.inventory_adapter import InventoryStoreSetupPage
 from ziniao_automation.workflows.store_setup.adapter import AmazonStoreSetupPage
@@ -63,6 +63,7 @@ async def test_eu_setup_bootstraps_identity_then_switches_country_not_domain(pag
     assert seller == 'fixture seller'
     result = await adapter.check_site(page, STORE, site(code))
     assert result.access_check == 'PASSED' and result.payment_capability == 'NOT_CHECKED'
+    assert result.inventory_capability == 'SUPPORTED'
     assert 'amazon.it' in page.url
     assert await page.evaluate('window.fixtureClicks') == []
     assert await page.evaluate('window.setupClicks') == ([] if code == 'DE' else ['menu','country'])
@@ -81,11 +82,18 @@ async def test_empty_inventory_without_pagination_is_valid_access(page):
     assert (await subject(page).check_site(page, STORE, site('DE'))).access_check == 'PASSED'
 
 
-async def test_wrong_filter_does_not_report_pass(page):
+async def test_optional_list_capability_does_not_erase_basic_identity_and_site(page):
     await page.evaluate("document.querySelector('kat-dropdown').setAttribute('value','All')")
-    with pytest.raises(SetupRejected) as error:
-        await subject(page).check_site(page, STORE, site('DE'))
-    assert error.value.diagnostic.reason_code == 'INVENTORY_ACCESS_UNPROVEN'
+    adapter = subject(page)
+    result = await adapter.check_site(page, STORE, site('DE'))
+    assert result.identity_check == result.access_check == 'PASSED'
+    assert result.inventory_capability == 'UNKNOWN' and result.payment_capability == 'NOT_CHECKED'
+    # A successful basic setup is not permission to process the wrong list.
+    from ziniao_automation.workflows.amazon_inventory_gpsr.page import InventoryContractError
+    adapter.inventory._remember(page, page, SimpleNamespace(id='fixture-workflow', store=STORE), site('DE'))
+    with pytest.raises(InventoryContractError):
+        await adapter.inventory._wait_list(page)
+    assert await page.evaluate('window.fixtureClicks') == []
 
 
 async def test_login_new_page_is_retained_by_facade(page):
@@ -97,10 +105,29 @@ async def test_login_new_page_is_retained_by_facade(page):
     adapter.inventory.login.advance_or_raise = AsyncMock(return_value=page)
     facade = AmazonStoreSetupPage(adapter.policy)
     facade._inventory_setup = adapter
-    assert (await facade.detect_identity(old, site('DE')))[0] == 'fixture seller'
+    await page.evaluate("document.querySelector('.dropdown-account-switcher-header-label-regional').textContent='義大利'")
+    assert (await facade.detect_identity(old, site('IT')))[0] == 'fixture seller'
     assert facade.resolved_page_for(old) is page
-    assert (await facade.check_site(old, STORE, site('DE'))).payment_capability == 'NOT_CHECKED'
+    assert (await facade.check_site(old, STORE, site('IT'))).payment_capability == 'NOT_CHECKED'
     adapter.inventory.login.advance_or_raise.assert_awaited_once()
+
+
+@pytest.mark.parametrize('changed', ['country', 'seller', 'domain'])
+async def test_optional_capability_never_hides_identity_or_domain_change(page, changed):
+    adapter = subject(page)
+    async def changed_while_observing(*args, **kwargs):
+        if changed == 'domain':
+            page.url = 'https://sellercentral.amazon.de.evil.test/myinventory/inventory'
+        elif changed == 'country':
+            await page.evaluate("document.querySelector('.dropdown-account-switcher-header-label-regional').textContent='義大利'")
+        else:
+            await page.evaluate("document.querySelector('.dropdown-account-switcher-header-label-global').textContent='OTHER'")
+        from ziniao_automation.workflows.amazon_inventory_gpsr.page import InventoryContractError
+        raise InventoryContractError('fixture list not ready')
+    adapter.inventory._poll = changed_while_observing
+    with pytest.raises((SetupRejected, InventoryContractError)):
+        await adapter.check_site(page, STORE, site('DE'))
+    assert await page.evaluate('window.fixtureClicks') == []
 
 
 @pytest.mark.parametrize('url', [

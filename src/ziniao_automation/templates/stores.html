@@ -21,27 +21,29 @@
 </form>
 <p class="store-ledger-help">默认只看亚马逊。平台标签中的地区是紫鸟登记地区，不代表已开通站点。“已配置”表示身份已确认且已选择站点，运行时仍会核验登录与身份。</p>
 <section class="setup-batch-tools" aria-label="批量核验操作">
-  <label>操作<select data-setup-batch-mode><option value="fill_missing">补齐配置</option><option value="retry_unverified">重试未通过站点</option><option value="recheck">复核所选店铺</option></select></label>
+  <label>操作<select data-setup-batch-mode><option value="fill_missing">补充站点 / 补齐建档</option><option value="retry_unverified">重试未通过站点</option><option value="recheck">复核所选店铺</option></select></label>
   <button type="button" class="button ghost" data-action="select-visible-setups">选择当前可见亚马逊店铺</button>
   <button type="button" class="button ghost" data-action="clear-setup-selection">清空勾选</button>
   <button type="button" class="button danger-outline" data-action="batch-reset-store-setups" disabled>批量删除建档（0）</button>
   <span data-setup-reset-count aria-live="polite">仅对当前可见且已勾选的亚马逊店铺操作。</span>
-  <span>付款站点 CA / UK / AU；库存合规站点 DE / IT / FR / ES / PL。仅核验明确选择的站点，不进行业务提交。</span>
-  <fieldset class="store-marketplace-editor"><legend>本批统一站点（可选）</legend>
-    <p class="fieldset-help">不勾选时沿用各店已选站点；无站点的新店保留 CA/UK/AU 默认。勾选后为本批使用相同站点，新增所需配置，不取消其他已选站点；“重试未通过”仅核验已保存的站点。</p>
-    {% for code, label in [('CA','加拿大'),('UK','英国'),('AU','澳大利亚'),('DE','德国'),('IT','意大利'),('FR','法国'),('ES','西班牙'),('PL','波兰')] %}
+  <span>基础建档核对身份与站点；付款、库存页面能力分别记录。CA / UK / AU / US / DE 优先核验付款首页，IT / FR / ES / PL 核验实际商城；库存筛选未就绪不抹掉基础建档。业务执行时仍会重新检查，不进行业务提交。</span>
+  <fieldset class="store-marketplace-editor"><legend>本批要补充或核验的站点</legend>
+    <p class="fieldset-help">给已有店铺补站点：勾选店铺及新站点，再点击上方预览即可，无需删除账号或重选旧站点。“补充站点 / 补齐建档”只检查所选范围内新增、未通过或未核验的站点，保留其他站点及已有核验结果。不勾选站点时补测各店已保存站点；无站点新店默认 CA/UK/AU。“重试未通过”仅补测已保存站点，“复核”重新检查所选范围。</p>
+    {% for code, label in [('CA','加拿大'),('UK','英国'),('AU','澳大利亚'),('US','美国'),('DE','德国'),('IT','意大利'),('FR','法国'),('ES','西班牙'),('PL','波兰')] %}
     <label class="mini-check"><input type="checkbox" value="{{ code }}" data-setup-batch-site> {{ code }} {{ label }}</label>
     {% endfor %}
   </fieldset>
 </section>
 <p class="store-bulk-scope" data-store-bulk-scope aria-live="polite"></p>
 <div class="store-filter-empty" data-store-filter-empty hidden><b>没有匹配的店铺</b><p>调整名称、平台或状态筛选；其他店铺并未被删除。</p></div>
-<section class="bulk-setup-progress" data-bulk-store-setup-progress hidden aria-live="polite">
+<section class="bulk-setup-progress" data-bulk-store-setup-progress data-tracking-policy='{{ setup_tracking_policy | tojson }}' hidden aria-live="polite">
   <div><span class="marketplace-autofill-kicker">批量建档队列</span><b data-bulk-store-setup-title>准备按店铺顺序检测</b><p data-bulk-store-setup-message>每次只打开一家紫鸟店铺，在同一窗口核验卖家身份与所选站点；上一家结束后才会继续。</p></div>
-  <!-- 「其中」/「次」不是修辞：站点未通过是「身份已建档」的子集，曾等待验证按暂停次数计，
+  <!-- 这里仅统计本轮核验，不把历史绑定冒充新成功，也不把本轮失败说成身份丢失。
        四个数并排且都读作「家」时，3 家店的队列会显示成 2+1+1+0=4，看起来像程序算错了。 -->
-  <div class="bulk-setup-counts"><span>身份已建档 <b data-bulk-store-setup-success>0</b></span><span>其中站点未通过 <b data-bulk-store-setup-site-incomplete>0</b></span><span>曾等待验证 <b data-bulk-store-setup-auth>0</b> 次</span><span>身份未建档 <b data-bulk-store-setup-failed>0</b></span></div>
+  <div class="bulk-setup-counts"><span>本轮身份核验通过 <b data-bulk-store-setup-success>0</b></span><span>其中站点未通过 <b data-bulk-store-setup-site-incomplete>0</b></span><span>曾等待验证 <b data-bulk-store-setup-auth>0</b> 次</span><span>本轮身份未通过 <b data-bulk-store-setup-failed>0</b></span></div>
+  <p class="muted">本轮启动失败或身份未通过，不会删除原有身份绑定；已有建档以店铺卡片为准。</p>
   <div class="bulk-setup-actions" data-bulk-store-setup-actions hidden><button class="button primary" type="button" data-action="continue-bulk-store-setup">再次尝试自动登录并继续</button><button class="button ghost" type="button" data-action="skip-bulk-store-setup">跳过此店并继续</button></div>
+  <div class="bulk-setup-actions" data-bulk-store-setup-release hidden><button class="button ghost" type="button" data-action="check-bulk-setup-release">检查窗口是否已释放</button><button class="button primary" type="button" data-action="release-bulk-setup-environment">释放该店窗口并解除阻塞</button></div>
   <div class="bulk-setup-actions" data-bulk-store-setup-dismiss hidden><button class="button ghost" type="button" data-action="discard-bulk-store-setup">放弃这个队列</button></div>
 </section>
 <div class="store-grid">
@@ -70,7 +72,7 @@
     {% for site in store.marketplaces %}<div><i class="flag flag-{{ site.code|lower }}">{{ site.code }}</i><span><b>{{ site.domain }}</b><small>{{ site.currency }}</small></span><em class="{{ 'live' if site.enabled else '' }}">{{ '已选择' if site.enabled else '未选择' }}</em></div>{% else %}{% if not out_of_scope %}<p class="empty-inline">尚未选择任务站点</p>{% endif %}{% endfor %}
   </div>
   <section class="setup-check-summary" data-setup-summary aria-live="polite">最近核验：加载中</section>
-  <footer><button type="button" class="button ghost" data-action="edit-store" data-store-id="{{ store.id }}" data-store='{{ {"id":store.id,"name":store.name,"expected_seller_id":store.expected_seller_id,"identity_confirmed":store.identity_confirmed,"enabled":store.enabled,"marketplaces":store_data.marketplaces}|tojson }}'>编辑建档</button><button type="button" class="button dark" data-action="new-run" data-store-id="{{ store.id }}" {{ 'disabled' if not store.enabled or not identity_ready or not ('CA' in store_data.enabled_codes or 'UK' in store_data.enabled_codes or 'AU' in store_data.enabled_codes) else '' }} title="提现检查需要允许任务、确认身份，并选择 CA / UK / AU 中至少一个站点">提现检查</button></footer>
+  <footer><button type="button" class="button ghost" data-action="edit-store" data-store-id="{{ store.id }}" data-store='{{ {"id":store.id,"name":store.name,"expected_seller_id":store.expected_seller_id,"identity_confirmed":store.identity_confirmed,"enabled":store.enabled,"marketplaces":store_data.marketplaces}|tojson }}'>编辑建档</button><button type="button" class="button dark" data-action="new-run" data-store-id="{{ store.id }}" {{ 'disabled' if not store.enabled or not identity_ready or not ('CA' in store_data.enabled_codes or 'UK' in store_data.enabled_codes or 'AU' in store_data.enabled_codes or 'US' in store_data.enabled_codes or 'DE' in store_data.enabled_codes) else '' }} title="提现检查需要允许任务、确认身份，并选择 CA / UK / AU / US / DE 中至少一个站点">提现检查</button></footer>
 </article>
 {% else %}<div class="blank-slate"><span>空</span><h2>店铺账册还没有记录</h2><p>先启动紫鸟客户端，再点击“同步紫鸟店铺”。同步只读取环境，不会打开亚马逊或执行资金操作。</p></div>{% endfor %}
 </div>
@@ -109,7 +111,7 @@
         <div>
           <span class="marketplace-autofill-kicker">卖家身份 + 站点核验</span>
           <b>一次打开，一次完成核验</b>
-          <p>程序会读取卖家身份；CA/UK/AU 核验付款控制面板，欧洲站通过页头切换实际商城并只读核验库存页。<strong>仅处理登录与站点选择，不点击请求付款或最终付款按钮。</strong></p>
+          <p>程序会读取卖家身份；CA/UK/AU/US/DE 优先核验付款首页，IT/FR/ES/PL 通过页头切换实际商城并只读核验库存页。<strong>仅处理登录与站点选择，不点击请求付款或最终付款按钮。</strong></p>
         </div>
         <button class="button dark" type="button" data-action="detect-store-setup">自动获取卖家ID并核验站点</button>
       </aside>
@@ -118,6 +120,7 @@
         ('CA', '加拿大', 'sellercentral.amazon.ca', true),
         ('UK', '英国', 'sellercentral.amazon.co.uk', true),
         ('AU', '澳大利亚', 'sellercentral.amazon.com.au', true),
+        ('US', '美国', 'sellercentral.amazon.com', true),
         ('DE', '德国', 'sellercentral.amazon.de', true),
         ('IT', '意大利', 'sellercentral.amazon.it', true),
         ('FR', '法国', 'sellercentral.amazon.fr', true),
@@ -146,7 +149,7 @@
           <button class="button ghost" type="button" data-action="cancel-store-setup">取消并关闭该店铺窗口</button>
         </div>
       </section>
-      <p class="marketplace-setup-note">核验只打开付款控制面板并比对域名与卖家身份，<strong>可能点击登录、国家选择及确认按钮，不点击请求付款或最终付款按钮</strong>。某个站点核验未通过时，只标记该站点，不会改动店铺启用状态，也不会取消你勾选的站点；核验结果与任务开关分开；任务执行仍需实时检查域名、身份与资金条件。可提现金额与近 24 小时限流由提现任务在运行现场判断，不在建档阶段预先记录。</p>
+      <p class="marketplace-setup-note">建档只读核验付款控制面板或欧洲站库存页，并比对商城与卖家身份，<strong>可能点击登录、国家选择及确认按钮，不点击请求付款或最终付款按钮</strong>。某个站点核验未通过时，只标记该站点，不会改动店铺启用状态，也不会取消你勾选的站点；核验结果与任务开关分开；任务执行仍需实时检查域名、身份与资金条件。可提现金额与近 24 小时限流由提现任务在运行现场判断，不在建档阶段预先记录。</p>
     </fieldset>
     <label class="check-row"><input name="identity_confirmed" type="checkbox"><span><b>卖家身份已确认</b><small>统一建档成功后自动勾选；异常复核时也可手工调整</small></span></label>
     <label class="check-row"><input name="enabled" type="checkbox"><span><b>启用这家店铺</b><small>新建或补全身份时自动启用；之后可按需要手工关闭</small></span></label>

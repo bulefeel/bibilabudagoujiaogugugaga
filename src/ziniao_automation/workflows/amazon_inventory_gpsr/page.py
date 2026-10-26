@@ -46,6 +46,14 @@ class ItemLoadError(RuntimeError):
     reason_code = "item_load_timeout"
 
 
+class ItemEntryError(ItemLoadError):
+    """This verified row has no unique supported entry; do not retry its click."""
+
+    def __init__(self, *, ambiguous: bool = False) -> None:
+        self.reason_code = "item_entry_ambiguous" if ambiguous else "item_entry_unrecognized"
+        super().__init__("商品处理入口不唯一，未点击" if ambiguous else "商品处理入口未识别，未点击")
+
+
 class ItemClickError(ItemLoadError):
     """A UI action was not completed; this is not evidence of an HTTP failure."""
 
@@ -255,14 +263,20 @@ return {ready:true, filters, statusFilter, page,
 
 _INSTALL_OPEN_TRACE = """(p) => { /* inventory:install-open-trace */
 %s
-window.__ziniaoInventoryOpenTrace?.dispose();
 const rows=[...document.querySelectorAll('[data-sku]')].filter(e=>visible(e) && e.getAttribute('data-sku')===p.sku);
-if(rows.length!==1) return {ok:false};
+if(!rows.length) return {ok:false,reason:'row_missing'};
+if(rows.length!==1) return {ok:false,reason:'row_ambiguous'};
 const row=rows[0];
-const entries=[...row.querySelectorAll('kat-link')].filter(e=>visible(e)&&label(e)==='解决商品信息问题');
 const rowAsins=()=>[...new Set([...row.querySelectorAll('a[href]')]
   .map(e=>(e.getAttribute('href').match(/\\/dp\\/([A-Z0-9]{10})(?:[/?#]|$)/)||[])[1]).filter(Boolean))];
-if(entries.length!==1 || rowAsins().length!==1 || rowAsins()[0]!==p.asin) return {ok:false};
+// Identity failures stay fatal, including when the entry is also unsupported.
+if(rowAsins().length!==1 || rowAsins()[0]!==p.asin) return {ok:false,reason:'asin_changed'};
+const entries=[...row.querySelectorAll('kat-link')].filter(e=>visible(e)&&%s.includes(rawLabel(e)));
+if(!entries.length) return {ok:false,reason:'entry_unrecognized'};
+if(entries.length!==1) return {ok:false,reason:'entry_ambiguous'};
+// Inspect without touching an existing sidebar/trace, before trial clicks.
+if(p.checkOnly) return {ok:true};
+window.__ziniaoInventoryOpenTrace?.dispose();
 const entry=entries[0];
 const trace={token:p.token,sku:p.sku,asin:p.asin,clicks:0,invalid:false,fresh:false};
 const containsPanel=node=>node?.nodeType===1 && (node.matches(p.panel) || !!node.querySelector(p.panel));
@@ -297,7 +311,7 @@ observer.observe(document,{subtree:true,childList:true});
 document.addEventListener('click',clicked,true);
 window.__ziniaoInventoryOpenTrace=trace;
 return {ok:true};
-}""" % _DOM_HELPERS
+}""" % (_DOM_HELPERS, json.dumps(ENTRY_LABELS, ensure_ascii=False))
 
 _CLEAR_OPEN_TRACE = """(token) => {
   const trace=window.__ziniaoInventoryOpenTrace;
@@ -1512,6 +1526,10 @@ class AmazonInventoryGpsrPage:
                 return result
             except InventoryCsrfHeaderLoss:
                 page = await self._recover_csrf_item(page, run, marketplace, item)
+            except ItemEntryError:
+                # A settled row with no unique entry is not a transient HTTP
+                # failure. Preserve its reason and continue via the item-local exit.
+                raise
             except ItemLoadError as exc:
                 # Normal timeouts retain per-item handling. Contract/identity
                 # failures and save() never enter this read-only retry loop.
@@ -1569,6 +1587,21 @@ class AmazonInventoryGpsrPage:
                     raise ItemLoadError("重新登录后当前商品侧栏未恢复")
         raise ItemLoadError("重新登录后当前商品侧栏未恢复")
 
+    @staticmethod
+    def _require_item_entry(state: dict[str, Any]) -> None:
+        if state.get('ok'):
+            return
+        reason = state.get('reason')
+        if reason in {'entry_unrecognized', 'entry_ambiguous'}:
+            raise ItemEntryError(ambiguous=reason == 'entry_ambiguous')
+        if reason == 'row_missing':
+            raise ItemLoadError("候选商品当前未在列表中")
+        if reason == 'row_ambiguous':
+            raise InventoryContractError("侧栏打开前商品行不唯一")
+        if reason == 'asin_changed':
+            raise InventoryContractError("侧栏打开前商品 ASIN 不唯一或已变化")
+        raise InventoryContractError("商品入口核验返回未知状态")
+
     async def _inspect_item(self, page: Any, run: Any, marketplace: Any, item: InventoryItem) -> Inspection:
         page = await self._session(page, run, marketplace)
         await self._identity(page, run)
@@ -1587,18 +1620,18 @@ class AmazonInventoryGpsrPage:
                 return await self._inspect_loaded_panel(page, run, marketplace, item, state)
             # The previous requirement's receipt has Close, not Back. Reopen
             # this row once to inspect its other requirement, without saving again.
+        # Use the same exact entry contract for initial classification and the
+        # final trace. Missing entries must not spend time resetting a valid
+        # previous sidebar, or masquerade as an ASIN/seller identity mismatch.
+        token = uuid4().hex
+        payload = {'panel': PANEL_SELECTOR, 'sku': item.sku, 'asin': item.asin, 'token': token}
+        self._require_item_entry(await self._evaluate(
+            page, _INSTALL_OPEN_TRACE, {**payload, 'checkOnly': True}))
         # JSON quoting also safely handles SKUs containing quotes/backslashes in CSS strings.
-        row = page.locator(f'[data-sku={json.dumps(item.sku, ensure_ascii=False)}]')
-        if await self._bounded_ui(row.count()) != 1:
-            raise ItemLoadError("候选商品当前未在列表中")
+        row = page.locator(f'[data-sku={json.dumps(item.sku, ensure_ascii=False)}]').filter(visible=True)
         entry = row.locator(','.join(f'kat-link[label={json.dumps(label, ensure_ascii=False)}]' for label in ENTRY_LABELS)).filter(visible=True)
         await self._prepare_item_entry(page, run, marketplace, item, entry)
-        token = uuid4().hex
-        installed = await self._evaluate(page, _INSTALL_OPEN_TRACE, {
-            'panel': PANEL_SELECTOR, 'sku': item.sku, 'asin': item.asin, 'token': token,
-        })
-        if not installed.get('ok'):
-            raise InventoryContractError("侧栏打开前商品行身份不唯一或已变化")
+        self._require_item_entry(await self._evaluate(page, _INSTALL_OPEN_TRACE, payload))
         self._open_tokens[page] = token
         try:
             await self._click_unique(entry)

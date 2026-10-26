@@ -32,6 +32,7 @@ class Settings:
     ziniao_executable: Path = Path(r"D:\紫鸟浏览器\ziniao\ziniao.exe")
     ziniao_host: str = "127.0.0.1"
     ziniao_port: int = 16851
+    ziniao_start_retry_delay_seconds: float = 3.0
     session_hours: int = 12
     auth_wait_minutes: int = 30
     artifact_retention_days: int = 90
@@ -54,6 +55,8 @@ class Settings:
             raise ValueError("后台端口不合法")
         if not 1 <= int(self.ziniao_port) <= 65535:
             raise ValueError("紫鸟端口不合法")
+        if not 0 < self.ziniao_start_retry_delay_seconds <= 30:
+            raise ValueError("紫鸟启动重试基础间隔必须大于 0 且不超过 30 秒")
         if self.session_hours < 1:
             raise ValueError("本地页面会话有效期至少为 1 小时")
         if self.auth_wait_minutes < 1:
@@ -81,6 +84,7 @@ class Settings:
             ziniao_executable=executable,
             ziniao_host=os.getenv("ZINIAO_CONTROL_HOST", "127.0.0.1"),
             ziniao_port=int(os.getenv("ZINIAO_CONTROL_PORT", "16851")),
+            ziniao_start_retry_delay_seconds=float(os.getenv("ZINIAO_START_RETRY_DELAY_SECONDS", "3")),
             session_hours=int(os.getenv("ZINIAO_SESSION_HOURS", "12")),
             auth_wait_minutes=int(os.getenv("ZINIAO_AUTH_WAIT_MINUTES", "30")),
             artifact_retention_days=int(os.getenv("ZINIAO_RETENTION_DAYS", "90")),

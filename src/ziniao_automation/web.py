@@ -596,6 +596,11 @@ def create_app(
 
     @app.get("/stores", response_class=HTMLResponse)
     def stores_page(request: Request, db: Session = Depends(get_session)) -> Response:
+        from .config import PROJECT_ROOT
+        from .workflows.store_setup.policy import OnboardingPolicy
+        # Tests isolate SQLite in a temporary root but use the shipped policy.
+        policy_root = PROJECT_ROOT if settings.testing else settings.project_root
+        setup_policy = OnboardingPolicy.load(policy_root / "onboarding-policy.toml")
         stores = StoreRepository(db).list()
         # 筛选项只列账册里真有的平台;亚马逊固定排第一,因为三条流程只认它。
         platforms = {store.platform.label: store.platform.is_amazon for store in stores}
@@ -608,7 +613,10 @@ def create_app(
         return render(
             request,
             "stores.html",
-            {"stores": stores, "platform_labels": platform_labels, "platform_counts": platform_counts},
+            {"stores": stores, "platform_labels": platform_labels, "platform_counts": platform_counts,
+             "setup_tracking_policy": setup_policy.model_dump(include={
+                 "batch_poll_interval_ms", "batch_poll_request_timeout_ms", "batch_poll_error_retries",
+                 "batch_poll_finalization_grace_ms", "total_deadline_seconds"})},
             db=db,
             page_title="店铺账册",
         )
@@ -1486,6 +1494,22 @@ def create_app(
             return SetupRepository(sessions).summary(store_id)
         except LookupError as exc:
             raise HTTPException(404, str(exc)) from exc
+
+    @api.post("/stores/{store_id}/store-setup-probes/{probe_id}/release-environment")
+    @serialized_store_catalog
+    async def api_setup_release_environment(store_id: int, probe_id: str, request: Request,
+                                            _: LocalOperator = Depends(verified_operator)):
+        try:
+            service = request.app.state.automation_service
+            if await service.has_active_store_setup(store_id):
+                raise SetupConflict("该店仍在核验，请先取消并等待结束", probe_id)
+            return await SetupRepository(sessions).release_environment(store_id, probe_id, service.ziniao_controller)
+        except LookupError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except SetupConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(504, "紫鸟释放确认超时，记录已保留，请稍后重新检查") from exc
 
     @api.post("/stores/setup-batch/preview")
     async def api_setup_batch_preview(payload: StoreSetupBatchPreview, _: LocalOperator = Depends(verified_operator)):

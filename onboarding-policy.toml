@@ -10,3 +10,9 @@ cleanup_grace_seconds = 15
 
 # Empty/unusable OTP ends this site attempt instead of holding the batch for 30 minutes.
 otp_autofill_timeout_ms = 15000
+
+# Local admin status polling only; never an Amazon click/retry budget.
+batch_poll_interval_ms = 2000
+batch_poll_request_timeout_ms = 10000
+batch_poll_error_retries = 3
+batch_poll_finalization_grace_ms = 30000

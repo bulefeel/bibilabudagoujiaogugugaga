@@ -2194,7 +2194,7 @@ class AmazonPaymentsPage:
         return hashlib.sha256(structure.encode("utf-8")).hexdigest()
 
 def parse_amount(text: str) -> Decimal:
-    """Parse common CA/UK/AU money strings without binary floats."""
+    """Parse dot/comma decimal money strings without binary floats."""
     match = _AMOUNT.search(_clean(text).replace("\u00a0", " "))
     if not match:
         raise DomContractError(f"金额格式无法识别：{text[:80]}")

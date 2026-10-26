@@ -10,6 +10,8 @@ ALLOWED_MARKETPLACES: dict[str, tuple[str, str]] = {
     "CA": ("sellercentral.amazon.ca", "CAD"),
     "UK": ("sellercentral.amazon.co.uk", "GBP"),
     "AU": ("sellercentral.amazon.com.au", "AUD"),
+    "US": ("sellercentral.amazon.com", "USD"),
+    "DE": ("sellercentral.amazon.de", "EUR"),
 }
 
 

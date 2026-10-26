@@ -11,7 +11,7 @@ from ..registry import WorkflowDefinition, WorkflowExecutionClass
 from ..types import RunMode
 
 
-MarketplaceCode = Literal["CA", "UK", "AU"]
+MarketplaceCode = Literal["CA", "UK", "AU", "US", "DE"]
 
 
 class AmazonDisbursementConfig(BaseModel):

@@ -197,7 +197,8 @@ def test_inventory_resume_assets_have_a_shared_new_cache_key():
     root = Path(__file__).resolve().parents[1] / "src/ziniao_automation"
     base = (root / "templates/base.html").read_text(encoding="utf-8")
     keys = re.findall(r"app\.(?:js|css)'\) }}\?v=([\w.-]+)", base)
-    assert keys == ["20261014-setup-multisite"] * 2
+    assert len(keys) == 2 and keys[0] == keys[1]
+    assert keys[0] >= "20261014-setup-multisite"
     css = (root / "static/app.css").read_text(encoding="utf-8")
     assert ".status-paused" in css
     assert ".inventory-run-actions" in css

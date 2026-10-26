@@ -119,6 +119,20 @@ async def test_missing_balance_with_explicit_account_and_marketplace_header():
         await nav.preflight(nav.page, run, site())
 
 
+@pytest.mark.parametrize('code,label', [('US','United States'), ('DE','Germany')])
+async def test_payment_sites_do_not_require_inventory_capability(code, label, monkeypatch):
+    subject, nav = adapter(f'<body><div class="partner-info">Fixture Store | {label}</div></body>')
+    def forbidden():
+        raise AssertionError('payment setup must not navigate to inventory')
+    monkeypatch.setattr(subject, '_inventory_adapter', forbidden)
+    assert (await subject.detect_identity(nav.page, site(code)))[0] == 'Fixture Store'
+    result = await subject.check_site(nav.page, store('Fixture Store'), site(code))
+    assert result.identity_check == result.access_check == 'PASSED'
+    assert result.payment_capability == 'UNKNOWN'
+    assert result.inventory_capability == 'NOT_CHECKED'
+    assert all(path == site(code).payments_url for path in nav.paths)
+
+
 @pytest.mark.parametrize('html', [
     f'<head>{META}</head><body></body>',
     '<body><div class="partner-info">Fixture Store</div></body>',

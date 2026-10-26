@@ -119,6 +119,8 @@ def test_amazon_definition_normalizes_and_deduplicates_marketplaces() -> None:
         "CA",
         "UK",
         "AU",
+        "US",
+        "DE",
     ]
 
 
@@ -135,7 +137,7 @@ def test_metadata_only_definition_does_not_require_runtime_dependencies() -> Non
 @pytest.mark.parametrize(
     "config",
     [
-        {"marketplace_codes": ["US"]},
+        {"marketplace_codes": ["JP"]},
         {"marketplace_codes": "CA"},
         {"marketplace_codes": ["CA"], "script": "payload"},
     ],

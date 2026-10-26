@@ -1,5 +1,6 @@
 (() => {
   "use strict";
+  const disbursementMarketplaceCodes = ["CA", "UK", "AU", "US", "DE"];
   const $ = (selector, root = document) => root.querySelector(selector);
   const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
   const cookie = (name) => document.cookie.split("; ").find(x => x.startsWith(`${name}=`))?.split("=").slice(1).join("=") || "";
@@ -228,7 +229,7 @@
             : status === "SKIPPED"
               ? (message || "因卖家身份未通过校验，本次站点核验已跳过")
               : (message || (status === "CHECKING" ? "正在核验该站点" : "待核验"));
-      setMarketplaceRowStatus(row, status, `${detail}${["CA","UK","AU"].includes(site.code) ? " · 付款页面：" + (setupPaymentLabels[site.payment_capability] || "未检查") : " · 库存访问：" + (site.access_check==="PASSED"?"已核验":"未核验")}`);
+      setMarketplaceRowStatus(row, status, `${detail} · ${setupCapabilityText(site)}`);
     }
     if (["CHECKING", "WAITING_AUTH"].includes(String(data.status || "").toUpperCase())) {
       $$('[data-store-marketplace]:not([data-no-probe]) [data-marketplace-enabled]:checked', form).forEach(input => {
@@ -581,7 +582,7 @@
       yes.addEventListener("click",accept);no.addEventListener("click",finish);dialog.addEventListener("cancel",finish);
     }); } finally { batchSetupResetBusy=false;refreshSetupResetSelection(); }
   }
-  const setupMarketplaceCodes = ["CA", "UK", "AU", "DE", "IT", "FR", "ES", "PL"];
+  const setupMarketplaceCodes = ["CA", "UK", "AU", "US", "DE", "IT", "FR", "ES", "PL"];
   function selectedBatchSetupCodes() { return $$("[data-setup-batch-site]:checked").map(input=>input.value); }
   function setupOperationMode() { return $("[data-setup-batch-mode]")?.value || "fill_missing"; }
   async function previewSetupSelection() {
@@ -598,7 +599,11 @@
     body.replaceChildren();
     preview.targets.forEach((target,index)=>{
       const tr=document.createElement("tr"); if(!target.eligible)tr.className="setup-preview-excluded";
-      [String(index+1),target.name||`店铺 ${target.store_id}`,(target.marketplace_codes||[]).join(" / ")||"—",target.reason||(target.defaulted?"将明确新增 CA/UK/AU 配置":codes.length?"核验所选站点；缺少的配置将启用，其他站点保持不变":"符合条件")].forEach(value=>{const td=document.createElement("td");td.textContent=value;tr.append(td);});body.append(tr);
+      const details=[target.reason, target.defaulted?"将明确新增 CA/UK/AU 配置":"",
+        target.added_marketplace_codes?.length?`新增或启用：${target.added_marketplace_codes.join(" / ")}`:"",
+        target.already_passed_marketplace_codes?.length?`已通过，不重复检查：${target.already_passed_marketplace_codes.join(" / ")}`:"",
+        target.preserved_marketplace_codes?.length?`保留原站点：${target.preserved_marketplace_codes.join(" / ")}`:""];
+      [String(index+1),target.name||`店铺 ${target.store_id}`,(target.marketplace_codes||[]).join(" / ")||"—",details.filter(Boolean).join("；")||"核验所选站点"].forEach(value=>{const td=document.createElement("td");td.textContent=value;tr.append(td);});body.append(tr);
     });
     $("[data-setup-preview-count]",dialog).textContent=`共 ${preview.targets.length} 家；可执行 ${preview.eligible_count} 家，其余保留排除原因。`;
     const yes=$("[data-setup-preview-confirm]",dialog), no=$("[data-setup-preview-cancel]",dialog);yes.disabled=!preview.eligible_count;
@@ -612,6 +617,11 @@
   const setupOutcomeLabels={UNVERIFIED:"未核验",QUEUED:"排队中",CHECKING:"检查中",WAITING_AUTH:"等待验证",SUCCEEDED:"全部通过",PARTIAL:"部分通过",FAILED:"未通过",NEEDS_REVIEW:"需复核",CANCELLED:"已取消",INTERRUPTED:"已中断",TIMED_OUT:"已超时"};
   const setupSiteLabels={PASSED:"通过",BLOCKED:"受阻",FAILED:"未通过",NOT_RUN:"未执行",CANCELLED:"已取消"};
   const setupPaymentLabels={SUPPORTED:"已识别",NO_PAYMENT_DATA:"无付款数据",UNKNOWN:"未识别",NOT_CHECKED:"未检查"};
+  function setupCapabilityText(site) {
+    const basic = site?.identity_check === "PASSED" && site?.access_check === "PASSED" ? "已核验" : "未核验";
+    const inventory = {SUPPORTED:"已识别",UNKNOWN:"列表/筛选未就绪",NOT_CHECKED:"未检查"};
+    return `基础身份/站点：${basic} · 付款页面：${setupPaymentLabels[site?.payment_capability] || "未检查"} · 库存列表：${inventory[site?.inventory_capability] || "未检查"}`;
+  }
   function applyPersistedStoreFacts(card, summary) {
     // Current SQLite facts own this display. Historical successful probes must
     // not resurrect an identity after reset, nor leave a saved one unbound.
@@ -635,7 +645,7 @@
     if(note)note.textContent=!confirmed?`待补全：${seller?"卖家身份尚未确认":"尚未绑定卖家身份"}`
       :!codes.length?"待补全：尚未选择站点":`建档已配置 · ${enabled?"可创建任务":"任务已暂停，建档仍保留"}`;
     const run=$('[data-action="new-run"]',card);
-    if(run)run.disabled=!amazon || !enabled || !confirmed || !codes.some(code=>["CA","UK","AU"].includes(code));
+    if(run)run.disabled=!amazon || !enabled || !confirmed || !codes.some(code=>disbursementMarketplaceCodes.includes(code));
     const marketList=$("[data-store-markets]",card);
     if(amazon && marketList && Array.isArray(summary.marketplace_config)){
       marketList.replaceChildren();
@@ -658,18 +668,19 @@
       edit.dataset.store=JSON.stringify(saved);
     }
   }
-  async function refreshPersistedSetups(onlyStoreId=null){
+  async function refreshPersistedSetups(onlyStoreId=null, requestOptions={}, current=()=>true){
     for(const card of $$("[data-store-card]")){
       const id=Number(card.dataset.storeId);if(onlyStoreId!==null&&id!==Number(onlyStoreId))continue;
       const holder=$("[data-setup-summary]",card);if(!holder)continue;
       try{
-        const summary=await api(`/api/stores/${id}/setup-summary`);
+        const summary=await api(`/api/stores/${id}/setup-summary`,requestOptions);
+        if(!current())return;
         applyPersistedStoreFacts(card,summary);holder.replaceChildren();
         const title=document.createElement("b");title.textContent=`最近核验：${setupOutcomeLabels[summary.verification_outcome]||"未核验"}${summary.stale?"（配置或适配规则已变化）":""}`;holder.append(title);
         (summary.selected_marketplace_codes||[]).forEach(code=>{
           const line=document.createElement("p"),site=summary.marketplaces[code];
           const state=site?.outcome?setupSiteLabels[site.outcome]:(site?.attempted?"检查中":"未核验");
-          line.textContent=`${code} · ${state||"未核验"} · ${["CA","UK","AU"].includes(code) ? "付款页面："+(setupPaymentLabels[site?.payment_capability]||"未检查") : "库存访问："+(site?.access_check==="PASSED"?"已核验":"未核验")}`;
+          line.textContent=`${code} · ${state||"未核验"} · ${setupCapabilityText(site)}`;
           if(site?.outcome!=="PASSED"){line.className="setup-incomplete";if(site?.message)line.textContent+=` · ${site.message}`;}
           holder.append(line);
         });
@@ -677,27 +688,38 @@
         if(summary.latest_probe?.cleanup_state==="UNCONFIRMED"){
           const note=document.createElement("p");note.textContent="流程已停止，窗口释放待确认；批次暂停。";note.className="setup-incomplete";holder.append(note);
           const check=document.createElement("button");check.type="button";check.className="button ghost";check.textContent="重新检查窗口释放";
-          check.addEventListener("click",async()=>{check.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${summary.latest_probe.probe_id}/check-release`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已确认原窗口进程退出":"尚未确认释放；请检查原店铺窗口",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{check.disabled=false;}});holder.append(check);
+          check.addEventListener("click",async()=>{check.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${summary.latest_probe.probe_id}/check-release`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已确认原窗口进程退出":"尚未确认释放；无窗口时可点击释放该店窗口解除阻塞",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{check.disabled=false;}});holder.append(check);
+          const release=document.createElement("button");release.type="button";release.className="button ghost";release.textContent="释放该店窗口并解除阻塞";
+          release.addEventListener("click",async()=>{if(!(await confirmAction("仅向紫鸟请求停止这家店的环境；不会关闭紫鸟客户端、删除建档或重跑任务。继续吗？")))return;release.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${summary.latest_probe.probe_id}/release-environment`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已解除该店的释放阻塞，原结果保留":"紫鸟尚未确认释放，请检查客户端后重试",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{release.disabled=false;}});holder.append(release);
         }
         card.dataset.setupRevision=String(summary.setup_revision);
-      }catch(exc){holder.textContent=`核验记录读取失败：${exc.message}`;}
+        if(bulkStoreSetup.probeStatus==="RESOURCE_UNCONFIRMED"
+            && bulkStoreSetup.probeId===summary.latest_probe?.probe_id
+            && summary.latest_probe?.lifecycle==="FINISHED"
+            && summary.latest_probe?.cleanup_state==="CONFIRMED"){
+          markBulkSetupReleaseConfirmed(bulkStoreSetup.queue[bulkStoreSetup.index]);
+        }
+      }catch(exc){if(!current())return;holder.textContent=`核验记录读取失败：${exc.message}`;}
     }
     $("[data-store-filter]")?.dispatchEvent(new Event("change",{bubbles:true}));
   }
 
   function collectBulkStoreCandidates() {
     const everyCard = $$('[data-store-card]');
-    const allCards = everyCard.filter(card => !card.hidden);
+    const visible = everyCard.filter(card => !card.hidden);
+    const selected = visible.filter(card => $("[data-setup-select]", card)?.checked);
+    const allCards = selected.length ? selected : visible;
     const otherPlatform = allCards.filter(card => card.dataset.platformAmazon === "false");
     const amazonCards = allCards.filter(card => card.dataset.platformAmazon !== "false");
-    const cards = amazonCards.filter(card => card.dataset.storeSetupNeeded === "true");
+    const cards = amazonCards;
+    const selectedCodes = selectedBatchSetupCodes();
     const candidates = cards.map(card => {
       let enabled = [];
       try { enabled = JSON.parse(card.dataset.storeSetupMarketplaces || "[]"); } catch (_) {}
       enabled = [...new Set(enabled.map(code => String(code).toUpperCase()))];
-      let marketplaceCodes = enabled.filter(code => setupMarketplaceCodes.includes(code));
+      let marketplaceCodes = selectedCodes.length ? [...selectedCodes] : enabled.filter(code => setupMarketplaceCodes.includes(code));
       // 未明确选择任何站点时保留旧默认；不会自动扩大到全部欧洲站。
-      const defaulted = enabled.length === 0;
+      const defaulted = enabled.length === 0 && !selectedCodes.length;
       if (defaulted) marketplaceCodes = ["CA", "UK", "AU"];
       return {
         id:Number(card.dataset.storeId),
@@ -710,15 +732,15 @@
     });
     const eligible = candidates.filter(store => validPositiveId(store.id) && !store.unsupportedOnly);
     const unsupported = candidates.filter(store => store.unsupportedOnly);
-    const alreadyComplete = amazonCards.length - cards.length;
+    const alreadyComplete = amazonCards.filter(card => card.dataset.storeSetupNeeded === "false").length;
     return {everyCard, allCards, otherPlatform, amazonCards, cards, eligible, unsupported, alreadyComplete};
   }
   function bulkStoreScopeCopy(selection) {
     const {allCards, eligible, unsupported, alreadyComplete, otherPlatform} = selection;
     if (!allCards.length) return "当前筛选没有店铺；请调整筛选条件。";
     const parts = [
-      `当前显示 ${allCards.length} 家，可批量补全 ${eligible.length} 家。`,
-      alreadyComplete ? `${alreadyComplete} 家已配置，不重复建档。` : "",
+      `当前范围 ${allCards.length} 家，可预览 ${eligible.length} 家；实际核验站点以预览为准。`,
+      alreadyComplete ? `${alreadyComplete} 家已配置，仍可直接勾选新站点补充建档，无需删除。` : "",
       unsupported.length ? `${unsupported.length} 家仅选择了统一建档不支持的站点，本次跳过；请编辑站点选择。` : "",
       otherPlatform.length ? `${otherPlatform.length} 家其他平台不参与。` : "",
     ];
@@ -733,17 +755,14 @@
       if (note) note.textContent = "已有未完成队列：继续时仍按原店铺清单执行，当前筛选不会改动队列。";
       return;
     }
-    if(setupOperationMode()!=="fill_missing" || selectedBatchSetupCodes().length){
-      start.disabled=!$$("[data-store-card]").some(c=>!c.hidden&&c.dataset.platformAmazon==="true");
-      start.textContent=setupOperationMode()==="recheck"?"预览复核所选店铺":setupOperationMode()==="retry_unverified"?"预览重试未通过站点":"预览批量建档所选站点";
-      if(note)note.textContent="范围以服务端预览为准；已配置或部分通过的店铺也可补测。";return;
-    }
     const selection = collectBulkStoreCandidates();
-    start.textContent = `批量建档当前筛选（${selection.eligible.length}）`;
+    const label=setupOperationMode()==="recheck"?"预览复核所选店铺":setupOperationMode()==="retry_unverified"?"预览重试未通过站点":selectedBatchSetupCodes().length?"预览补充所选站点":"预览批量补充建档";
+    start.textContent = `${label}（${selection.eligible.length}）`;
     start.disabled = selection.eligible.length === 0;
     if (note) note.textContent = bulkStoreScopeCopy(selection);
   }
   function discardBulkStoreSetup() {
+    stopBulkSetupPolling();
     try { sessionStorage.removeItem(bulkSetupStorageKey); } catch (_) {}
     Object.assign(bulkStoreSetup, {
       active: false, queue: [], index: 0, success: 0, siteIncomplete: 0, auth: 0,
@@ -754,6 +773,7 @@
     if (ui.panel) ui.panel.hidden = true;
     if (ui.actions) ui.actions.hidden = true;
     if (ui.dismiss) ui.dismiss.hidden = true;
+    if (ui.release) ui.release.hidden = true;
     refreshBulkStoreScope();
     updateBulkSetupCounts();
   }
@@ -821,7 +841,17 @@
     // starting a fresh pass — so it must come with a way to put it down. Without
     // one the only escape was closing the tab, and nothing on screen said so.
     if (ui.dismiss) ui.dismiss.hidden = false;
+    if (ui.release) ui.release.hidden = bulkStoreSetup.probeStatus !== "RESOURCE_UNCONFIRMED";
     updateBulkSetupCounts();
+    // Resume observation, never re-POST the store or auto-approve authentication.
+    // Explicit release/credential pauses still require their existing controls.
+    if (bulkStoreSetup.probeId && ["CHECKING", "WAITING_AUTH"].includes(bulkStoreSetup.probeStatus)) {
+      bulkStoreSetup.active = true;
+      ui.start.disabled = true;
+      ui.start.textContent = "正在恢复状态追踪…";
+      if (ui.dismiss) ui.dismiss.hidden = true;
+      void pollBulkStoreSetup(queue[index], bulkStoreSetup.probeId);
+    }
   }
   function bulkSetupUi() {
     const panel = $("[data-bulk-store-setup-progress]");
@@ -834,6 +864,7 @@
       auth: $("[data-bulk-store-setup-auth]", panel || document),
       failed: $("[data-bulk-store-setup-failed]", panel || document),
       actions: $("[data-bulk-store-setup-actions]", panel || document),
+      release: $("[data-bulk-store-setup-release]", panel || document),
       dismiss: $("[data-bulk-store-setup-dismiss]", panel || document),
       resume: $('[data-action="continue-bulk-store-setup"]', panel || document),
       skip: $('[data-action="skip-bulk-store-setup"]', panel || document),
@@ -916,7 +947,7 @@
     ui.panel.hidden = false;
     ui.actions.hidden = true;
     ui.title.textContent = "全部店铺自动建档已完成";
-    ui.message.textContent = `卖家身份已自动绑定并确认 ${bulkStoreSetup.success} 家；其中 ${bulkStoreSetup.siteIncomplete} 家有部分站点核验未通过；身份失败、冲突或跳过 ${bulkStoreSetup.failed} 家。下方店铺卡片已刷新为数据库最新状态。`;
+    ui.message.textContent = `本轮身份核验通过 ${bulkStoreSetup.success} 家；其中 ${bulkStoreSetup.siteIncomplete} 家有部分站点核验未通过；本轮身份未通过或跳过 ${bulkStoreSetup.failed} 家。未通过不代表原绑定已删除，下方店铺卡片已刷新为数据库最新状态。`;
     ui.start.disabled = false;
     ui.start.textContent = "一键自动建档全部店铺";
     updateBulkSetupCounts();
@@ -926,38 +957,119 @@
       try { sessionStorage.setItem(bulkSetupSummaryStorageKey, JSON.stringify(summary)); } catch (_) {}
     }
   }
-  async function pollBulkStoreSetup(store, probeId) {
-    // A three-site visible-browser pass can legitimately take several minutes.
-    // Keep following the original probe instead of abandoning a live backend
-    // task and accidentally starting it again from the first store.
-    for (let attempt = 0; attempt < 180; attempt += 1) {
-      await sleep(2000);
-      if (!bulkStoreSetup.active || bulkStoreSetup.probeId !== probeId) return;
-      const {data, statusCode} = await apiResult(storeSetupProbePath(store.id, probeId));
-      const outcome = await handleBulkStoreSetupResponse(store, data, statusCode);
-      if (outcome !== "CHECKING") return;
-    }
-    bulkStoreSetup.resumeAvailable = true;
+  function markBulkSetupReleaseConfirmed(store) {
+    const ui=bulkSetupUi();
+    bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;bulkStoreSetup.probeStatus="RESOURCE_RELEASED";
+    ui.title.textContent=`已解除阻塞：${store.name}`;ui.message.textContent="原核验结果保留。可点击上方按钮继续剩余队列，或放弃队列后重新选择店铺；不会自动重跑。";
+    ui.start.textContent="继续剩余建档队列";ui.start.disabled=false;
+    if(ui.release)ui.release.hidden=true;if(ui.dismiss)ui.dismiss.hidden=false;
     persistBulkStoreSetup();
-    const ui = bulkSetupUi();
-    ui.title.textContent = `${store.name} 仍在后台检测`;
-    ui.message.textContent = "页面已持续追踪 6 分钟。点击批量按钮会继续查询这个原任务，不会从第一家重新触发。";
-    ui.start.disabled = false;
-    ui.start.textContent = "继续追踪未完成队列";
   }
-  async function handleBulkStoreSetupResponse(store, data, statusCode) {
+  async function recoverBulkSetupRelease(stopEnvironment=false) {
+    const store=bulkStoreSetup.queue[bulkStoreSetup.index], probeId=bulkStoreSetup.probeId, ui=bulkSetupUi();
+    if(!store || !probeId)return;
+    if(stopEnvironment && !(await confirmAction(`只释放“${store.name}”对应的紫鸟环境，不关闭紫鸟客户端、不删除建档、不自动继续队列。继续吗？`)))return;
+    const buttons=ui.release?$$('button',ui.release):[];
+    buttons.forEach(button=>button.disabled=true);ui.start.disabled=true;
+    try {
+      const action=stopEnvironment?"release-environment":"check-release";
+      const data=await api(`${storeSetupProbePath(store.id,probeId)}/${action}`,{method:"POST",body:"{}"});
+      if(bulkStoreSetup.probeId!==probeId)return;
+      bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;
+      if(data.cleanup_state==="CONFIRMED"){
+        markBulkSetupReleaseConfirmed(store);
+      }else{
+        bulkStoreSetup.probeStatus="RESOURCE_UNCONFIRMED";
+        ui.message.textContent=stopEnvironment?"紫鸟尚未确认环境已停止，阻塞记录保留。请检查紫鸟客户端后重试。":"尚未取得窗口退出证据；若已没有窗口，点击“释放该店窗口并解除阻塞”向紫鸟确认。";
+        if(ui.release)ui.release.hidden=false;
+      }
+      if(ui.dismiss)ui.dismiss.hidden=false;
+      persistBulkStoreSetup();await refreshPersistedSetups(store.id);
+    }catch(exc){ui.message.textContent=exc.message;toast(exc.message,true);}
+    finally{buttons.forEach(button=>button.disabled=false);ui.start.disabled=false;}
+  }
+  let bulkSetupPollGeneration = 0;
+  function stopBulkSetupPolling() { bulkSetupPollGeneration += 1; }
+  function bulkSetupTrackingPolicy() {
+    const policy = JSON.parse(bulkSetupUi().panel.dataset.trackingPolicy);
+    for (const key of ["batch_poll_interval_ms", "batch_poll_request_timeout_ms", "batch_poll_finalization_grace_ms", "total_deadline_seconds"]) {
+      if (!Number.isSafeInteger(policy[key]) || policy[key] <= 0) throw new Error("批量追踪参数无效，请刷新页面检查配置");
+    }
+    if (!Number.isSafeInteger(policy.batch_poll_error_retries) || policy.batch_poll_error_retries < 0) throw new Error("批量追踪重试参数无效");
+    return policy;
+  }
+  async function refreshBulkSetupFacts(storeId, current) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), bulkSetupTrackingPolicy().batch_poll_request_timeout_ms);
+    try { await refreshPersistedSetups(storeId, {signal:controller.signal}, current); }
+    finally { clearTimeout(timer); }
+  }
+  async function pollBulkStoreSetup(store, probeId) {
+    const generation = ++bulkSetupPollGeneration;
+    const current = () => generation === bulkSetupPollGeneration && bulkStoreSetup.active
+      && bulkStoreSetup.probeId === probeId && bulkStoreSetup.queue[bulkStoreSetup.index]?.id === store.id;
+    try {
+      const policy = bulkSetupTrackingPolicy();
+      let failures = 0;
+      let deadline = Date.now() + policy.total_deadline_seconds * 1000 + policy.batch_poll_finalization_grace_ms;
+      while (current()) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), policy.batch_poll_request_timeout_ms);
+        let response;
+        try {
+          response = await apiResult(storeSetupProbePath(store.id, probeId), {signal:controller.signal});
+          failures = 0;
+        } catch (exc) {
+          if (!current()) return;
+          const transient = !exc.statusCode || exc.statusCode >= 500 || exc.statusCode === 429;
+          if (!transient || ++failures > policy.batch_poll_error_retries) throw exc;
+          bulkSetupUi().message.textContent = `状态查询暂时中断，正在重连（${failures}/${policy.batch_poll_error_retries}）；原任务及队列位置保留，不重复打开店铺。`;
+        } finally { clearTimeout(timer); }
+        if (!current()) return;
+        if (response) {
+          const {data, statusCode} = response;
+          if (Number.isFinite(data.expires_in_seconds)) {
+            deadline = Math.min(deadline, Date.now() + Math.max(0, data.expires_in_seconds) * 1000 + policy.batch_poll_finalization_grace_ms);
+          }
+          const outcome = await handleBulkStoreSetupResponse(store, data, statusCode, current);
+          if (!["CHECKING", "WAITING_AUTH"].includes(outcome) || !current()) return;
+        }
+        if (Date.now() >= deadline) throw new Error("已超过服务端截止时间，尚未取得任务终态；保留原任务，等待后台确认，不打开下一家");
+        await sleep(policy.batch_poll_interval_ms);
+      }
+    } catch (exc) {
+      if (!current()) return;
+      bulkStoreSetup.active = false;
+      bulkStoreSetup.resumeAvailable = true;
+      persistBulkStoreSetup();
+      const ui = bulkSetupUi();
+      ui.title.textContent = `${store.name} 状态追踪暂时中断`;
+      ui.message.textContent = `${exc.message} 点击继续只查询这个原任务，不重新建单。`;
+      ui.actions.hidden = true;
+      ui.start.disabled = false;
+      ui.start.textContent = "继续追踪原任务";
+    }
+  }
+  async function handleBulkStoreSetupResponse(store, data, statusCode, current = () => true) {
+    if (!current()) return "STALE";
     const status = String(data.status || "").toUpperCase(), ui = bulkSetupUi();
     const card=$(`[data-store-card][data-store-id="${Number(store.id)}"]`);
     if (!storeSetupTerminalStatuses.has(status) && data.identity?.status === "SUCCEEDED"
         && card && (card.dataset.identityState !== "CONFIRMED" || String(data.setup_revision) !== card.dataset.setupRevision)) {
-      await refreshPersistedSetups(store.id);
+      await refreshBulkSetupFacts(store.id, current);
+      if (!current()) return "STALE";
     }
     if (storeSetupTerminalStatuses.has(status)) {
-      await refreshPersistedSetups(store.id);
+      await refreshBulkSetupFacts(store.id, current);
+      if (!current()) return "STALE";
+      ui.actions.hidden = true;
+      if (ui.resume) ui.resume.disabled = true;
+      if (ui.skip) ui.skip.disabled = true;
       if(data.cleanup_state && data.cleanup_state!=="CONFIRMED"){
         bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;bulkStoreSetup.probeStatus="RESOURCE_UNCONFIRMED";
-        persistBulkStoreSetup();ui.title.textContent=`暂停：${store.name} 窗口释放待确认`;ui.message.textContent="结果已保存。请先确认该店环境已释放，当前不会启动下一家。";ui.start.disabled=false;ui.start.textContent="重新检查当前核验";return "PAUSED";
+        persistBulkStoreSetup();ui.title.textContent=`暂停：${store.name} 窗口释放待确认`;ui.message.textContent="结果已保存；这不代表仍有窗口。可先检查，若没有窗口仍待释放，请点击下方“释放该店窗口并解除阻塞”。不会重跑当前店铺。";ui.start.disabled=false;ui.start.textContent="检查窗口是否已释放";ui.actions.hidden=true;if(ui.release)ui.release.hidden=false;if(ui.dismiss)ui.dismiss.hidden=false;return "PAUSED";
       }
+      if(ui.release)ui.release.hidden=true;
       bulkStoreSetup.probeStatus = status;
       summarizeBulkStoreResult(data);
       bulkStoreSetup.storeId = null;
@@ -987,7 +1099,8 @@
       persistBulkStoreSetup();
       ui.title.textContent = `${store.name} 自动登录未通过`;
       const authMessage = data.message || "程序已自动尝试邮箱 Continue、紫鸟托管 Passkey 和已填好的 6 位 OTP，但页面仍停在验证步骤。可再次尝试自动登录；普通密码、其他 Passkey、CAPTCHA 或未填好的验证码需要在当前紫鸟窗口处理。队列不会打开下一家店。";
-      ui.message.textContent = `${authMessage} 已成功建档的数据已写入SQLite；下方店铺卡片将在队列结束后统一刷新。`;
+      const remaining = Number.isFinite(data.expires_in_seconds) ? `剩余 ${Math.ceil(data.expires_in_seconds / 60)} 分钟。` : "";
+      ui.message.textContent = `${data.current_marketplace || data.identity?.marketplace_code || "身份检测"} · ${authMessage} ${remaining}页面持续追踪；等待期间不自动点击登录、不打开下一家，任务结束且窗口释放确认后继续队列。`;
       ui.actions.hidden = false;
       if (ui.resume) {
         ui.resume.disabled = false;
@@ -996,14 +1109,15 @@
       if (ui.skip) ui.skip.disabled = false;
       return "WAITING_AUTH";
     }
-    if (statusCode === 202 && status === "CHECKING") {
+    if (status === "CHECKING") {
       bulkStoreSetup.storeId = Number(data.store_id || store.id);
       bulkStoreSetup.probeId = String(data.probe_id || bulkStoreSetup.probeId || "");
       bulkStoreSetup.probeStatus = "CHECKING";
       bulkStoreSetup.resumeAvailable = true;
       persistBulkStoreSetup();
       ui.title.textContent = `正在检测 ${store.name}`;
-      ui.message.textContent = `第 ${bulkStoreSetup.index + 1} / ${bulkStoreSetup.queue.length} 家；完成后才会打开下一家紫鸟店铺。`;
+      const phase = {ACQUIRE_SESSION:"打开紫鸟",READ_IDENTITY:"读取身份",VERIFY_IDENTITY:"核对身份",CHECK_SITE:"核验站点",FINALIZE:"保存与释放"}[data.phase] || "核验中";
+      ui.message.textContent = `第 ${bulkStoreSetup.index + 1} / ${bulkStoreSetup.queue.length} 家 · ${data.current_marketplace || data.identity?.marketplace_code || ""} ${phase}；持续追踪，结束且释放确认后继续下一家。`;
       ui.actions.hidden = true;
       if (ui.resume) ui.resume.disabled = true;
       if (ui.skip) ui.skip.disabled = true;
@@ -1022,7 +1136,7 @@
       bulkStoreSetup.resumeAvailable = false;
       sessionStorage.removeItem(bulkSetupStorageKey);
       ui.title.textContent = "全部店铺自动建档已完成";
-      ui.message.textContent = `卖家身份已自动绑定并确认 ${bulkStoreSetup.success} 家；正在刷新下方店铺卡片。`;
+      ui.message.textContent = `本轮身份核验通过 ${bulkStoreSetup.success} 家；正在刷新下方店铺卡片，原有绑定不会因本轮失败被删除。`;
       persistBulkSetupCompletionSummary();
       // Terminal probe results are already committed to SQLite.  A full page
       // reload is more reliable than patching many card attributes by hand and
@@ -1041,7 +1155,7 @@
       persistBulkStoreSetup();
       const {data, statusCode} = await apiResult(`/api/stores/${encodeURIComponent(String(store.id))}/detect-store-setup`, {method:"POST", body:JSON.stringify({marketplace_codes:store.marketplaceCodes,scope:store.scope||"full",request_id:store.requestId,expected_setup_revision:store.setupRevision})});
       const outcome = await handleBulkStoreSetupResponse(store, data, statusCode);
-      if (outcome === "CHECKING") await pollBulkStoreSetup(store, bulkStoreSetup.probeId);
+      if (["CHECKING", "WAITING_AUTH"].includes(outcome)) await pollBulkStoreSetup(store, bulkStoreSetup.probeId);
     } catch (exc) {
       if (isZiniaoCredentialError(exc)) {
         pauseBulkStoreSetupForCredential(store, exc);
@@ -1168,7 +1282,7 @@
     requires_marketplace_targets:true, requires_confirmed_identity:true,
     requires_financial_lock:true, execution_class:"financial", business_priority:1,
     config_schema:{type:"object", additionalProperties:false,
-      properties:{marketplace_codes:{type:"array",title:"站点",items:{type:"string",enum:["CA","UK","AU"]},minItems:1}},
+      properties:{marketplace_codes:{type:"array",title:"站点",items:{type:"string",enum:disbursementMarketplaceCodes},minItems:1}},
       required:["marketplace_codes"]},
   }];
   let scheduleWorkflows = [];
@@ -1204,7 +1318,7 @@
   }
   function renderWorkflowConfig(form,values={}){
     const container=$("[data-workflow-config]",form);if(!container)return;const meta=workflowMeta(form);container.replaceChildren();
-    let properties=workflowProperties(meta);if(!Object.keys(properties).length&&meta?.key==="amazon_disbursement")properties={marketplace_codes:{type:"array",title:"站点",items:{type:"string",enum:["CA","UK","AU"]},minItems:1}};
+    let properties=workflowProperties(meta);if(!Object.keys(properties).length&&meta?.key==="amazon_disbursement")properties={marketplace_codes:{type:"array",title:"站点",items:{type:"string",enum:disbursementMarketplaceCodes},minItems:1}};
     if(!Object.keys(properties).length){container.hidden=true;return;}container.hidden=false;
     const required=new Set(Array.isArray(meta?.config_schema?.required)?meta.config_schema.required:[]);
     Object.entries(properties).forEach(([rawKey,rawSchema])=>{
@@ -1214,7 +1328,7 @@
         const legend=document.createElement("legend");legend.textContent=fieldLabel(key,schema)+(Number(schema.minItems||0)>0?"（至少选择 "+schema.minItems+" 个）":"");holder.append(legend);
         const itemSchema=resolveWorkflowFieldSchema(meta,schema.items||{}),enumValues=Array.isArray(itemSchema.enum)?itemSchema.enum:[],supportedEnum=!schema.__uiUnsupported&&!schema.__uiNullable&&!itemSchema.__uiUnsupported&&!itemSchema.__uiNullable&&enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value)),current=new Set(Array.isArray(initial)?initial.map(value=>JSON.stringify(value)):[]);
         if(!supportedEnum)holder.dataset.configUnsupported="true";
-        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚",DE:"DE 德国",IT:"IT 意大利",FR:"FR 法国",ES:"ES 西班牙",PL:"PL 波兰",safety_attestation:"安全证明声明",responsible_person:"负责人信息关联",manufacturer:"制造商信息关联"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
+        if(supportedEnum)enumValues.forEach(optionValue=>{const label=document.createElement("label");label.className="mini-check";const input=document.createElement("input");input.type="checkbox";input.dataset.configKey=key;input.dataset.configType="array";input.dataset.configValue=JSON.stringify(optionValue);input.value=String(optionValue);input.checked=current.has(JSON.stringify(optionValue));const span=document.createElement("span");span.textContent={CA:"CA 加拿大",UK:"UK 英国",AU:"AU 澳大利亚",US:"US 美国",DE:"DE 德国",IT:"IT 意大利",FR:"FR 法国",ES:"ES 西班牙",PL:"PL 波兰",safety_attestation:"安全证明声明",responsible_person:"负责人信息关联",manufacturer:"制造商信息关联"}[String(optionValue)]||String(optionValue);label.append(input,document.createTextNode(" "),span);holder.append(label);});
       }else{
         const title=document.createElement("span");title.textContent=fieldLabel(key,schema)+(required.has(rawKey)?" *":"");holder.append(title);const scalarType=["string","number","integer","boolean"].includes(type),enumValues=Array.isArray(schema.enum)?schema.enum:null,enumSupported=!enumValues||(enumValues.length>0&&enumValues.every(value=>["string","number","boolean"].includes(typeof value))),nullableSupported=!schema.__uiNullable||Boolean(enumValues)||type==="boolean";
         if(schema.__uiUnsupported||!scalarType||!enumSupported||!nullableSupported){holder.dataset.configUnsupported="true";}
@@ -1499,13 +1613,17 @@
       return;
     }
     if (action === "select-visible-setups") {
-      $$("[data-store-card]").forEach(card=>{const box=$("[data-setup-select]",card);if(box)box.checked=!card.hidden&&card.dataset.platformAmazon==="true";});refreshSetupResetSelection();return;
+      $$("[data-store-card]").forEach(card=>{const box=$("[data-setup-select]",card);if(box)box.checked=!card.hidden&&card.dataset.platformAmazon==="true";});refreshSetupResetSelection();refreshBulkStoreScope();return;
     }
     if (action === "clear-setup-selection") {
-      $$("[data-setup-select]").forEach(box => { box.checked=false; });refreshSetupResetSelection();return;
+      $$("[data-setup-select]").forEach(box => { box.checked=false; });refreshSetupResetSelection();refreshBulkStoreScope();return;
     }
     if (action === "batch-reset-store-setups") { await resetSelectedStoreSetups(); return; }
+    if (action === "check-bulk-setup-release" || action === "release-bulk-setup-environment") {
+      await recoverBulkSetupRelease(action === "release-bulk-setup-environment");return;
+    }
     if (action === "detect-all-store-setups") {
+      if(bulkStoreSetup.probeStatus==="RESOURCE_UNCONFIRMED") { await recoverBulkSetupRelease(false);return; }
       if (bulkStoreSetup.queue.length && bulkStoreSetup.index < bulkStoreSetup.queue.length && bulkStoreSetup.resumeAvailable) {
         const currentStore = bulkStoreSetup.queue[bulkStoreSetup.index];
         bulkStoreSetup.active = true; target.disabled = true; target.textContent = "继续追踪中…";
@@ -1538,23 +1656,24 @@
     if (action === "continue-bulk-store-setup") {
       if (!bulkStoreSetup.active || !validPositiveId(bulkStoreSetup.storeId) || !bulkStoreSetup.probeId) { toast("批量检测现场已失效，请重新开始。", true); return; }
       const store = bulkStoreSetup.queue[bulkStoreSetup.index], ui = bulkSetupUi();
+      const probeId = bulkStoreSetup.probeId;
+      stopBulkSetupPolling();
+      const generation = bulkSetupPollGeneration;
+      const current = () => generation === bulkSetupPollGeneration && bulkStoreSetup.probeId === probeId;
       target.disabled = true; target.textContent = "正在尝试自动登录…"; ui.actions.hidden = true;
       try {
-        const {data, statusCode} = await apiResult(`${storeSetupProbePath(bulkStoreSetup.storeId, bulkStoreSetup.probeId)}/continue`, {method:"POST", body:"{}"});
-        const outcome = await handleBulkStoreSetupResponse(store, data, statusCode);
-        if (outcome === "CHECKING") await pollBulkStoreSetup(store, bulkStoreSetup.probeId);
+        const {data, statusCode} = await apiResult(`${storeSetupProbePath(store.id, probeId)}/continue`, {method:"POST", body:"{}"});
+        const outcome = await handleBulkStoreSetupResponse(store, data, statusCode, current);
+        if (["CHECKING", "WAITING_AUTH"].includes(outcome)) await pollBulkStoreSetup(store, probeId);
       } catch (exc) {
+        if (!current()) return;
         ui.message.textContent = exc.message;
         toast(exc.message, true);
-        if (bulkStoreSetup.probeStatus !== "WAITING_AUTH") {
-          bulkStoreSetup.active = false;
-          bulkStoreSetup.resumeAvailable = true;
-          persistBulkStoreSetup();
-          ui.start.disabled = false;
-          ui.start.textContent = "继续未完成队列";
-        }
+        // A failed continue request must not also stop observation of the probe.
+        void pollBulkStoreSetup(store, probeId);
       }
       finally {
+        if (bulkStoreSetup.probeId !== probeId) return;
         const stillWaitingForAuth = bulkStoreSetup.active
           && bulkStoreSetup.probeStatus === "WAITING_AUTH"
           && validPositiveId(bulkStoreSetup.storeId)
@@ -1579,22 +1698,24 @@
     }
     if (action === "skip-bulk-store-setup") {
       if (!bulkStoreSetup.active || !validPositiveId(bulkStoreSetup.storeId) || !bulkStoreSetup.probeId) return;
-      const ui = bulkSetupUi(); target.disabled = true;
+      const ui = bulkSetupUi(), store = bulkStoreSetup.queue[bulkStoreSetup.index], probeId = bulkStoreSetup.probeId;
+      stopBulkSetupPolling();
+      const generation = bulkSetupPollGeneration;
+      const current = () => generation === bulkSetupPollGeneration && bulkStoreSetup.probeId === probeId;
+      target.disabled = true; ui.actions.hidden = true;
       let cancelled = null;
-      try { cancelled = await api(`${storeSetupProbePath(bulkStoreSetup.storeId, bulkStoreSetup.probeId)}/cancel`, {method:"POST", body:"{}"}); }
+      try { cancelled = await api(`${storeSetupProbePath(store.id, probeId)}/cancel`, {method:"POST", body:"{}"}); }
       catch (exc) {
-        // A 404 after a refresh/service restart means there is no backend
-        // probe left to close. Honour the explicit Skip locally so the whole
-        // queue cannot become trapped behind an expired identifier.
-        if (exc.statusCode !== 404) { toast(exc.message, true); target.disabled = false; return; }
-        toast("原自动建档现场已过期，已跳过这家店并继续队列", true);
+        if (!current()) return;
+        toast(exc.message, true);
+        // Cancellation acknowledgement may be lost. Query the original task;
+        // never infer that its window is gone or count the store twice.
+        void pollBulkStoreSetup(store, probeId);
+        return;
       }
-      if (cancelled && identitySetupSucceeded(cancelled)) summarizeBulkStoreResult(cancelled);
-      else { bulkStoreSetup.failed += 1; updateBulkSetupCounts(); }
-      if(!cancelled || (cancelled.cleanup_state && cancelled.cleanup_state!=="CONFIRMED")){
-        bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;persistBulkStoreSetup();ui.title.textContent="窗口释放待确认，批次已暂停";target.disabled=false;return;
-      }
-      bulkStoreSetup.storeId = null; bulkStoreSetup.probeId = null; bulkStoreSetup.probeStatus = "CANCELLED"; bulkStoreSetup.resumeAvailable = false; bulkStoreSetup.index += 1; persistBulkStoreSetup(); ui.actions.hidden = true; if (ui.resume) ui.resume.disabled = true; target.disabled = false; await runNextBulkStoreSetup(); return;
+      const outcome = await handleBulkStoreSetupResponse(store, cancelled, 200, current);
+      if (["CHECKING", "WAITING_AUTH"].includes(outcome)) await pollBulkStoreSetup(store, probeId);
+      return;
     }
     if (action === "reset-store-setup") {
       const form = target.closest("form"), ui = storeSetupUi(form), id = Number($("[name=id]", form)?.value);
@@ -2103,7 +2224,7 @@
   $("[data-store-filter]")?.addEventListener("change", refreshSetupResetSelection);
   $("[data-store-filter] input[name=q]")?.addEventListener("input", refreshSetupResetSelection);
   $('[data-action="reset-store-filters"]')?.addEventListener("click", refreshSetupResetSelection);
-  document.addEventListener("change", event => { if(event.target.matches("[data-setup-select]"))refreshSetupResetSelection(); });
+  document.addEventListener("change", event => { if(event.target.matches("[data-setup-select]")){refreshSetupResetSelection();refreshBulkStoreScope();} });
   refreshSetupResetSelection();
   void refreshPersistedSetups();
 })();

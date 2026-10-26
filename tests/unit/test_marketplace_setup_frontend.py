@@ -143,10 +143,10 @@ def test_bulk_setup_includes_unconfirmed_stores_and_defaults_empty_sites() -> No
     assert "data-store-setup-needed" in template
     assert "data-store-setup-marketplaces" in template
     assert "data-store-setup-defaulted" in template
-    assert 'const cards = amazonCards.filter(card => card.dataset.storeSetupNeeded === "true")' in script
+    assert 'const cards = amazonCards;' in script
     assert 'if (defaulted) marketplaceCodes = ["CA", "UK", "AU"]' in script
     assert "将明确新增 CA/UK/AU 配置" in script
-    assert "${alreadyComplete} 家已配置，不重复建档" in script
+    assert "${alreadyComplete} 家已配置，仍可直接勾选新站点" in script
     assert "identityState:String(card.dataset.identityState" in script
 
 
@@ -155,9 +155,10 @@ def test_bulk_setup_only_queues_visible_amazon_cards() -> None:
     script = _script()
     helper = script[script.index("function collectBulkStoreCandidates()"):script.index("function bulkStoreScopeCopy(")]
     action = script[script.index('if (action === "detect-all-store-setups")'):script.index('if (action === "continue-bulk-store-setup")')]
-    assert "const allCards = everyCard.filter(card => !card.hidden)" in helper
+    assert "const visible = everyCard.filter(card => !card.hidden)" in helper
+    assert "const allCards = selected.length ? selected : visible" in helper
     assert 'card.dataset.platformAmazon !== "false"' in helper
-    assert 'card.dataset.storeSetupNeeded === "true"' in helper
+    assert 'const cards = amazonCards;' in helper
     assert "await previewSetupSelection()" in action
     assert "queue:eligible" in action
     assert "/api/stores/setup-batch/preview" in script
@@ -194,9 +195,11 @@ def test_bulk_queue_is_persistent_and_network_errors_keep_current_position() -> 
     assert "persistBulkStoreSetup" in script
     assert "restoreBulkStoreSetup" in script
     assert "sessionStorage.setItem" in script
-    assert "attempt < 180" in script
-    assert "await sleep(2000)" in script
-    assert "页面已持续追踪 6 分钟" in script
+    polling = script[script.index("async function pollBulkStoreSetup"):script.index("async function handleBulkStoreSetupResponse")]
+    assert "attempt < 180" not in polling
+    assert "await sleep(policy.batch_poll_interval_ms)" in script
+    assert '!["CHECKING", "WAITING_AUTH"].includes(outcome)' in script
+    assert "继续追踪原任务" in script
     assert "批量队列暂停在 ${store.name}" in script
     assert "从当前未完成位置继续" in script
     assert "当前店铺位置已保留" in script
@@ -257,17 +260,17 @@ def test_bulk_terminal_result_and_queue_position_are_persisted_atomically() -> N
     )
 
 
-def test_expired_bulk_auth_probe_can_be_skipped_without_trapping_queue() -> None:
+def test_lost_cancel_ack_rechecks_original_probe_without_assuming_release() -> None:
     script = _script()
     skip = script[
         script.index('if (action === "skip-bulk-store-setup")') :
         script.index('if (action === "reset-store-setup")')
     ]
 
-    assert "exc.statusCode !== 404" in skip
-    assert "原自动建档现场已过期" in skip
-    assert 'bulkStoreSetup.probeStatus = "CANCELLED"' in skip
-    assert "bulkStoreSetup.index += 1" in skip
+    assert "void pollBulkStoreSetup(store, probeId)" in skip
+    assert "handleBulkStoreSetupResponse(store, cancelled, 200, current)" in skip
+    assert "stopBulkSetupPolling()" in skip
+    assert "bulkStoreSetup.index += 1" not in skip
 
 
 def test_terminal_store_failures_continue_to_the_next_store() -> None:
@@ -288,7 +291,7 @@ def test_bulk_summary_counts_identity_separately_and_refreshes_cards() -> None:
     template = _template()
     script = _script()
 
-    assert "身份已建档" in template
+    assert "本轮身份核验通过" in template
     # "其中" and "次" are load-bearing. siteIncomplete is incremented inside the
     # success branch, so it is a subset, and auth counts pauses rather than
     # stores. Rendered as four equal tiles all reading as "家", a three-store
@@ -297,7 +300,8 @@ def test_bulk_summary_counts_identity_separately_and_refreshes_cards() -> None:
     assert "<b data-bulk-store-setup-auth>0</b> 次" in template
     # The bucket counts stores whose identity never got bound; an explicit skip
     # after the identity was already committed is not one of them.
-    assert "身份未建档" in template
+    assert "本轮身份未通过" in template
+    assert "不会删除原有身份绑定" in template
     assert "身份失败或跳过" not in template
     assert "function identitySetupSucceeded(data)" in script
     assert "function siteSetupNeedsFollowup(data)" in script
