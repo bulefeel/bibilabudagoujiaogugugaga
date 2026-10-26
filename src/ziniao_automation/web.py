@@ -1556,7 +1556,8 @@ def create_app(
                 },
             ) from exc
         except SetupConflict as exc:
-            raise HTTPException(409, {"code": "SETUP_CONFLICT", "message": str(exc), "probe_id": exc.probe_id}) from exc
+            raise HTTPException(409, {"code": exc.code, "message": str(exc), "probe_id": exc.probe_id,
+                                      "store_id": exc.store_id}) from exc
         except (RuntimeError, ValueError) as exc:
             raise HTTPException(409, str(exc)) from exc
         waiting = result.get("status") in {"WAITING_AUTH", "CHECKING"}
@@ -1696,10 +1697,14 @@ def create_app(
         # Probe creation also reserves SQLite before launching a browser, so the
         # durable checks below close the gap between checking and resetting.
         process_blockers: dict[int, str] = {}
+        recover_resources = getattr(request.app.state.automation_service, "recover_setup_resources", None)
+        db.rollback()
         for item in payload.stores:
             try:
                 await _require_no_active_store_setup(request, item.store_id)
-            except ConflictError as exc:
+                if callable(recover_resources):
+                    await recover_resources([item.store_id])
+            except (ConflictError, SetupConflict) as exc:
                 process_blockers[item.store_id] = str(exc)
         db.rollback()
         db.execute(text("BEGIN IMMEDIATE"))
@@ -1766,6 +1771,14 @@ def create_app(
         repo = StoreRepository(db)
         repo.get(store_id)
         await _require_no_active_store_setup(request, store_id)
+        db.rollback()
+        recover_resources = getattr(request.app.state.automation_service, "recover_setup_resources", None)
+        if callable(recover_resources):
+            try:
+                await recover_resources([store_id])
+            except SetupConflict as exc:
+                raise HTTPException(409, {"code": exc.code, "message": str(exc), "probe_id": exc.probe_id,
+                                          "store_id": exc.store_id}) from exc
 
         store, disabled_schedule_ids = repo.reset_setup(store_id)
         # SQLite must become authoritative before the in-memory scheduler is

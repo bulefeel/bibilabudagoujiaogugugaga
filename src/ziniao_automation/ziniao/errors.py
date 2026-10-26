@@ -16,6 +16,8 @@ class ZiniaoConnectionError(ZiniaoError):
 class ZiniaoCredentialError(ZiniaoError):
     """The current production credential snapshot is incomplete or unreadable."""
 
+    cleanup_confirmed: bool = False
+
 
 class ZiniaoApiError(ZiniaoError):
     """Ziniao returned a non-success status code."""

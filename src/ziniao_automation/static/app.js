@@ -451,6 +451,7 @@
     storeId: null,
     probeId: null,
     probeStatus: null,
+    releaseTarget: null,
     authCountedProbeId: null,
     resumeAvailable: false,
   };
@@ -474,6 +475,7 @@
         storeId: bulkStoreSetup.storeId,
         probeId: bulkStoreSetup.probeId,
         probeStatus: bulkStoreSetup.probeStatus,
+        releaseTarget: bulkStoreSetup.releaseTarget,
         authCountedProbeId: bulkStoreSetup.authCountedProbeId,
       }));
     } catch (_) {}
@@ -685,12 +687,13 @@
           holder.append(line);
         });
         if(summary.last_checked_at){const time=document.createElement("small");time.textContent=`上次核验 ${new Date(summary.last_checked_at).toLocaleString()}`;holder.append(time);}
-        if(summary.latest_probe?.cleanup_state==="UNCONFIRMED"){
+        const releaseProbe=summary.release_probe || summary.latest_probe;
+        if(releaseProbe?.cleanup_state==="UNCONFIRMED"){
           const note=document.createElement("p");note.textContent="流程已停止，窗口释放待确认；批次暂停。";note.className="setup-incomplete";holder.append(note);
           const check=document.createElement("button");check.type="button";check.className="button ghost";check.textContent="重新检查窗口释放";
-          check.addEventListener("click",async()=>{check.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${summary.latest_probe.probe_id}/check-release`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已确认原窗口进程退出":"尚未确认释放；无窗口时可点击释放该店窗口解除阻塞",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{check.disabled=false;}});holder.append(check);
+          check.addEventListener("click",async()=>{check.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${releaseProbe.probe_id}/check-release`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已确认原窗口进程退出":"尚未确认释放；无窗口时可点击释放该店窗口解除阻塞",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{check.disabled=false;}});holder.append(check);
           const release=document.createElement("button");release.type="button";release.className="button ghost";release.textContent="释放该店窗口并解除阻塞";
-          release.addEventListener("click",async()=>{if(!(await confirmAction("仅向紫鸟请求停止这家店的环境；不会关闭紫鸟客户端、删除建档或重跑任务。继续吗？")))return;release.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${summary.latest_probe.probe_id}/release-environment`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已解除该店的释放阻塞，原结果保留":"紫鸟尚未确认释放，请检查客户端后重试",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{release.disabled=false;}});holder.append(release);
+          release.addEventListener("click",async()=>{release.disabled=true;try{const result=await api(`/api/stores/${id}/store-setup-probes/${releaseProbe.probe_id}/release-environment`,{method:"POST",body:"{}"});toast(result.cleanup_state==="CONFIRMED"?"已解除该店的释放阻塞，原结果保留":"紫鸟尚未确认释放，请检查客户端后重试",result.cleanup_state!=="CONFIRMED");await refreshPersistedSetups(id);}catch(exc){toast(exc.message,true);}finally{release.disabled=false;}});holder.append(release);
         }
         card.dataset.setupRevision=String(summary.setup_revision);
         if(bulkStoreSetup.probeStatus==="RESOURCE_UNCONFIRMED"
@@ -766,7 +769,7 @@
     try { sessionStorage.removeItem(bulkSetupStorageKey); } catch (_) {}
     Object.assign(bulkStoreSetup, {
       active: false, queue: [], index: 0, success: 0, siteIncomplete: 0, auth: 0,
-      failed: 0, storeId: null, probeId: null, probeStatus: null,
+      failed: 0, storeId: null, probeId: null, probeStatus: null, releaseTarget: null,
       authCountedProbeId: null, resumeAvailable: false,
     });
     const ui = bulkSetupUi();
@@ -817,6 +820,8 @@
       storeId: validPositiveId(saved.storeId) ? Number(saved.storeId) : null,
       probeId: String(saved.probeId || "") || null,
       probeStatus: String(saved.probeStatus || "").toUpperCase() || null,
+      releaseTarget: validPositiveId(saved.releaseTarget?.storeId) && saved.releaseTarget?.probeId
+        ? {storeId:Number(saved.releaseTarget.storeId),probeId:String(saved.releaseTarget.probeId)} : null,
       authCountedProbeId: String(saved.authCountedProbeId || "") || null,
       resumeAvailable: true,
     });
@@ -965,28 +970,35 @@
     if(ui.release)ui.release.hidden=true;if(ui.dismiss)ui.dismiss.hidden=false;
     persistBulkStoreSetup();
   }
-  async function recoverBulkSetupRelease(stopEnvironment=false) {
-    const store=bulkStoreSetup.queue[bulkStoreSetup.index], probeId=bulkStoreSetup.probeId, ui=bulkSetupUi();
+  async function recoverBulkSetupRelease(stopEnvironment=false, continueQueue=false) {
+    const store=bulkStoreSetup.queue[bulkStoreSetup.index], target=bulkStoreSetup.releaseTarget;
+    const probeId=target?.probeId || bulkStoreSetup.probeId, storeId=target?.storeId || store?.id, ui=bulkSetupUi();
     if(!store || !probeId)return;
-    if(stopEnvironment && !(await confirmAction(`只释放“${store.name}”对应的紫鸟环境，不关闭紫鸟客户端、不删除建档、不自动继续队列。继续吗？`)))return;
     const buttons=ui.release?$$('button',ui.release):[];
     buttons.forEach(button=>button.disabled=true);ui.start.disabled=true;
     try {
       const action=stopEnvironment?"release-environment":"check-release";
-      const data=await api(`${storeSetupProbePath(store.id,probeId)}/${action}`,{method:"POST",body:"{}"});
-      if(bulkStoreSetup.probeId!==probeId)return;
+      const data=await api(`${storeSetupProbePath(storeId,probeId)}/${action}`,{method:"POST",body:"{}"});
+      if(bulkStoreSetup.queue[bulkStoreSetup.index]!==store || (target ? bulkStoreSetup.releaseTarget!==target : bulkStoreSetup.probeId!==probeId))return;
       bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;
       if(data.cleanup_state==="CONFIRMED"){
+        bulkStoreSetup.releaseTarget=null;
         markBulkSetupReleaseConfirmed(store);
+        if(continueQueue){
+          bulkStoreSetup.active=true;bulkStoreSetup.resumeAvailable=false;
+          persistBulkStoreSetup();
+          if(bulkStoreSetup.probeId)await pollBulkStoreSetup(store,bulkStoreSetup.probeId);
+          else await runNextBulkStoreSetup();
+        }
       }else{
         bulkStoreSetup.probeStatus="RESOURCE_UNCONFIRMED";
         ui.message.textContent=stopEnvironment?"紫鸟尚未确认环境已停止，阻塞记录保留。请检查紫鸟客户端后重试。":"尚未取得窗口退出证据；若已没有窗口，点击“释放该店窗口并解除阻塞”向紫鸟确认。";
         if(ui.release)ui.release.hidden=false;
       }
       if(ui.dismiss)ui.dismiss.hidden=false;
-      persistBulkStoreSetup();await refreshPersistedSetups(store.id);
+      persistBulkStoreSetup();await refreshPersistedSetups(storeId);
     }catch(exc){ui.message.textContent=exc.message;toast(exc.message,true);}
-    finally{buttons.forEach(button=>button.disabled=false);ui.start.disabled=false;}
+    finally{buttons.forEach(button=>button.disabled=false);if(!bulkStoreSetup.active)ui.start.disabled=false;}
   }
   let bulkSetupPollGeneration = 0;
   function stopBulkSetupPolling() { bulkSetupPollGeneration += 1; }
@@ -1066,9 +1078,27 @@
       if (ui.resume) ui.resume.disabled = true;
       if (ui.skip) ui.skip.disabled = true;
       if(data.cleanup_state && data.cleanup_state!=="CONFIRMED"){
-        bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;bulkStoreSetup.probeStatus="RESOURCE_UNCONFIRMED";
-        persistBulkStoreSetup();ui.title.textContent=`暂停：${store.name} 窗口释放待确认`;ui.message.textContent="结果已保存；这不代表仍有窗口。可先检查，若没有窗口仍待释放，请点击下方“释放该店窗口并解除阻塞”。不会重跑当前店铺。";ui.start.disabled=false;ui.start.textContent="检查窗口是否已释放";ui.actions.hidden=true;if(ui.release)ui.release.hidden=false;if(ui.dismiss)ui.dismiss.hidden=false;return "PAUSED";
+        const probeId=String(data.probe_id || bulkStoreSetup.probeId || "");
+        bulkStoreSetup.storeId=store.id;bulkStoreSetup.probeId=probeId;bulkStoreSetup.probeStatus="RELEASING";
+        persistBulkStoreSetup();ui.title.textContent=`正在自动检查并释放：${store.name}`;ui.start.disabled=true;
+        ui.message.textContent=`${data.message || "本次核验已结束"}。正在确认对应环境已退出，确认后继续剩余队列。`;
+        let releaseError="";
+        try{
+          if(!probeId)throw new Error("缺少待释放核验编号");
+          const released=await api(`${storeSetupProbePath(store.id,probeId)}/release-environment`,{method:"POST",body:"{}"});
+          if(!current())return "STALE";
+          if(released.probe_id!==probeId || Number(released.store_id)!==store.id)throw new Error("释放响应与当前店铺不符");
+          if(released.cleanup_state==="CONFIRMED")data=released;
+        }catch(exc){releaseError=exc.message;}
+        if(!current())return "STALE";
+        if(data.cleanup_state!=="CONFIRMED"){
+          bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;bulkStoreSetup.probeStatus="RESOURCE_UNCONFIRMED";
+          persistBulkStoreSetup();ui.title.textContent=`暂停：${store.name} 释放尚未确认`;
+          ui.message.textContent=`${data.message || "原核验结果已保留"}。已尝试自动释放；${releaseError || "紫鸟尚未确认停止"}。可点击继续再次释放并恢复队列。`;
+          ui.start.disabled=false;ui.start.textContent="释放并继续剩余队列";ui.actions.hidden=true;if(ui.release)ui.release.hidden=false;if(ui.dismiss)ui.dismiss.hidden=false;return "PAUSED";
+        }
       }
+      bulkStoreSetup.releaseTarget=null;
       if(ui.release)ui.release.hidden=true;
       bulkStoreSetup.probeStatus = status;
       summarizeBulkStoreResult(data);
@@ -1160,6 +1190,15 @@
       if (isZiniaoCredentialError(exc)) {
         pauseBulkStoreSetupForCredential(store, exc);
         return;
+      }
+      if(exc.detail?.code==="SETUP_RESOURCE_UNCONFIRMED" && validPositiveId(exc.detail.store_id) && exc.detail.probe_id){
+        bulkStoreSetup.releaseTarget={storeId:Number(exc.detail.store_id),probeId:String(exc.detail.probe_id)};
+        bulkStoreSetup.probeStatus="RESOURCE_UNCONFIRMED";
+        bulkStoreSetup.active=false;bulkStoreSetup.resumeAvailable=true;persistBulkStoreSetup();
+        ui.title.textContent=`批量队列等待店铺 #${exc.detail.store_id} 释放确认`;
+        ui.message.textContent=`${exc.message}。当前队列位置已保留，可点击“释放并继续剩余队列”重试。`;
+        ui.start.disabled=false;ui.start.textContent="释放并继续剩余队列";
+        if(ui.release)ui.release.hidden=false;if(ui.dismiss)ui.dismiss.hidden=false;return;
       }
       if(exc.statusCode===404 || (exc.detail?.code==="SETUP_CONFLICT" && !exc.detail?.probe_id)){
         bulkStoreSetup.failed+=1;bulkStoreSetup.index+=1;bulkStoreSetup.storeId=null;bulkStoreSetup.probeId=null;
@@ -1623,7 +1662,7 @@
       await recoverBulkSetupRelease(action === "release-bulk-setup-environment");return;
     }
     if (action === "detect-all-store-setups") {
-      if(bulkStoreSetup.probeStatus==="RESOURCE_UNCONFIRMED") { await recoverBulkSetupRelease(false);return; }
+      if(bulkStoreSetup.probeStatus==="RESOURCE_UNCONFIRMED") { await recoverBulkSetupRelease(true,true);return; }
       if (bulkStoreSetup.queue.length && bulkStoreSetup.index < bulkStoreSetup.queue.length && bulkStoreSetup.resumeAvailable) {
         const currentStore = bulkStoreSetup.queue[bulkStoreSetup.index];
         bulkStoreSetup.active = true; target.disabled = true; target.textContent = "继续追踪中…";
@@ -1647,7 +1686,7 @@
       catch(exc){toast(exc.message,true);return;}
       if(!eligible?.length)return;
       sessionStorage.removeItem(bulkSetupSummaryStorageKey);
-      Object.assign(bulkStoreSetup, {active:true, queue:eligible, index:0, success:0, siteIncomplete:0, auth:0, failed:0, storeId:null, probeId:null, probeStatus:null, authCountedProbeId:null, resumeAvailable:false});
+      Object.assign(bulkStoreSetup, {active:true, queue:eligible, index:0, success:0, siteIncomplete:0, auth:0, failed:0, storeId:null, probeId:null, probeStatus:null, releaseTarget:null, authCountedProbeId:null, resumeAvailable:false});
       persistBulkStoreSetup();
       refreshBulkStoreScope();
       const ui = bulkSetupUi(); ui.panel.hidden = false; ui.actions.hidden = true; if (ui.dismiss) ui.dismiss.hidden = true; target.disabled = true; target.textContent = "批量建档进行中…"; updateBulkSetupCounts();

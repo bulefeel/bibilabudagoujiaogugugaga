@@ -144,7 +144,8 @@ class SetupRepository:
                 raise SetupConflict("该店铺已有活动核验", existing.id)
             uncertain = session.scalar(select(Probe).where(Probe.cleanup_state == "UNCONFIRMED").limit(1))
             if uncertain:
-                raise SetupConflict("存在窗口释放待确认的核验，请先检查资源再继续", uncertain.id)
+                raise SetupConflict("存在窗口释放待确认的核验，请先检查资源再继续", uncertain.id,
+                                    store_id=uncertain.store_id, code="SETUP_RESOURCE_UNCONFIRMED")
             if expected_revision is not None and store.setup_revision != expected_revision:
                 raise SetupConflict("配置已变化，请刷新预览")
             requested = list(codes)
@@ -361,6 +362,7 @@ class SetupRepository:
                 row.message = row.message.removesuffix("；窗口释放待确认")
                 row.updated_at = utc_now()
                 session.commit()
+            logging.getLogger(__name__).info("setup_release_check probe_id=%s process_released=%s", probe_id, released)
             return self._view(session, row)
 
     def _release_target(self, store_id, probe_id):
@@ -380,11 +382,14 @@ class SetupRepository:
             return ProfileSelector(store.selector_type, store.selector_value)
 
     async def release_environment(self, store_id, probe_id, controller):
-        """Explicit operator recovery for terminal probes, including missing PID proof."""
+        """Check an exited process first, then stop only the owned idle environment."""
         current = self.get(store_id, probe_id)
         if current["cleanup_state"] == "CONFIRMED":
             return current
         selector = self._release_target(store_id, probe_id)
+        current = await self.check_release(store_id, probe_id)
+        if current["cleanup_state"] == "CONFIRMED":
+            return current
         def validate():
             if self._release_target(store_id, probe_id) != selector:
                 raise SetupConflict("环境已变化，请刷新后重试", probe_id)
@@ -393,19 +398,34 @@ class SetupRepository:
             session.execute(text("BEGIN IMMEDIATE"))
             row = self._probe(session, store_id, probe_id)
             if acknowledged is True and row.lifecycle == "FINISHED":
-                row.cleanup_state = "CONFIRMED"
-                row.message = row.message.removesuffix("；窗口释放待确认")
-                row.updated_at = utc_now()
+                # One acknowledged stop also releases older terminal probes of
+                # this exact environment. Keep their results and original times.
+                for pending in session.scalars(select(Probe).where(
+                        Probe.store_id == store_id, Probe.lifecycle == "FINISHED",
+                        Probe.cleanup_state == "UNCONFIRMED")):
+                    if (pending.config_snapshot.get("selector_type"), pending.config_snapshot.get("selector_value")) == (selector.type, selector.value):
+                        pending.cleanup_state = "CONFIRMED"
+                        pending.message = pending.message.removesuffix("；窗口释放待确认")
+                        pending.updated_at = utc_now()
                 session.commit()
             logging.getLogger(__name__).info("setup_release probe_id=%s acknowledged=%s", probe_id, acknowledged is True)
             return self._view(session, row)
 
+    def pending_releases(self, store_ids=None):
+        with self.sessions() as session:
+            query = select(Probe).where(Probe.cleanup_state == "UNCONFIRMED").order_by(Probe.created_at, Probe.id)
+            if store_ids is not None:
+                query = query.where(Probe.store_id.in_(store_ids))
+            return [(row.store_id, row.id) for row in session.scalars(query)]
+
     def recover(self):
         with self.sessions() as session:
-            ids = list(session.scalars(select(Probe.id).where(Probe.lifecycle.in_(ACTIVE))))
-        for pid in ids:
-            self.finish(pid, outcome="INTERRUPTED", cleanup="UNCONFIRMED", reason="SETUP_INTERRUPTED")
-        return len(ids)
+            rows = [(row.id, row.lifecycle == "QUEUED" and row.phase == "ACQUIRE_SESSION"
+                     and not row.resource_snapshot)
+                    for row in session.scalars(select(Probe).where(Probe.lifecycle.in_(ACTIVE)))]
+        for pid, not_started in rows:
+            self.finish(pid, outcome="INTERRUPTED", cleanup="CONFIRMED" if not_started else "UNCONFIRMED", reason="SETUP_INTERRUPTED")
+        return len(rows)
 
     def get(self, store_id, probe_id, kind=None):
         with self.sessions() as session:
@@ -483,6 +503,7 @@ class SetupRepository:
                     for m in session.scalars(select(StoreMarketplace).where(StoreMarketplace.store_id == store.id).order_by(StoreMarketplace.id))],
                 "marketplaces": latest, "last_passed_at": old_pass,
                 "latest_probe": self._view(session, probes[0]) if probes else None,
+                "release_probe": next((self._view(session, p) for p in probes if p.cleanup_state == "UNCONFIRMED"), None),
                 "active_probe": next((self._view(session,p) for p in probes if p.lifecycle in ACTIVE), None),
                 "stale": stale,
                 "last_checked_at": iso(probes[0].updated_at) if probes else None}

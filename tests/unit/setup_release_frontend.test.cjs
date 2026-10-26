@@ -14,22 +14,40 @@ function fixture(cleanup='CONFIRMED'){
   let next=0;
   const context=vm.createContext({bulkStoreSetup:state,bulkSetupUi:()=>ui,$:()=>null,$$:()=>buttons,
     confirmAction:async()=>true,storeSetupProbePath:(id,pid)=>`/api/stores/${id}/store-setup-probes/${pid}`,
-    api:async(url)=>{calls.push(url);return {cleanup_state:cleanup,status:'FAILED'};},
+    api:async(url)=>{calls.push(url);return {cleanup_state:cleanup,status:'FAILED',probe_id:'probe-1',store_id:6};},
     persistBulkStoreSetup(){},refreshPersistedSetups:async()=>{},toast(){},
     AbortController,setTimeout,clearTimeout,
     storeSetupTerminalStatuses:new Set(['FAILED','SUCCEEDED','CANCELLED']),summarizeBulkStoreResult(){},
     runNextBulkStoreSetup:async()=>{next++;},
+    pollBulkStoreSetup:async()=>{},
   });
   vm.runInContext(recover+'\n'+handler,context);
   context.bulkSetupTrackingPolicy=()=>({batch_poll_request_timeout_ms:10000});
   return {ui,state,calls,buttons,context,next:()=>next};
 }
-test('release pause exposes both direct controls and queue dismissal',async()=>{
-  const x=fixture();
+test('failed automatic release exposes both direct controls and queue dismissal',async()=>{
+  const x=fixture('UNCONFIRMED');
   await x.context.handleBulkStoreSetupResponse(x.state.queue[0],{status:'FAILED',cleanup_state:'UNCONFIRMED'},200);
   assert.equal(x.ui.release.hidden,false);assert.equal(x.ui.dismiss.hidden,false);
   assert.equal(x.ui.actions.hidden,true);assert.equal(x.state.probeStatus,'RESOURCE_UNCONFIRMED');
   assert.equal(x.next(),0);assert.equal(x.state.index,0);
+  assert.deepEqual(x.calls,['/api/stores/6/store-setup-probes/probe-1/release-environment']);
+});
+test('automatic release confirms a terminal probe and advances exactly once',async()=>{
+  const x=fixture();x.state.active=true;
+  await x.context.handleBulkStoreSetupResponse(x.state.queue[0],{status:'FAILED',cleanup_state:'UNCONFIRMED'},200);
+  assert.deepEqual(x.calls,['/api/stores/6/store-setup-probes/probe-1/release-environment']);
+  assert.equal(x.next(),1);assert.equal(x.state.index,1);assert.equal(x.state.probeId,null);
+});
+test('a fast terminal response keeps its probe id for automatic release',async()=>{
+  const x=fixture();x.state.probeId=null;x.state.active=true;
+  await x.context.handleBulkStoreSetupResponse(x.state.queue[0],{status:'FAILED',probe_id:'probe-1',cleanup_state:'UNCONFIRMED'},200);
+  assert.equal(x.next(),1);assert.equal(x.state.index,1);
+});
+test('mismatched release response cannot advance or count another store',async()=>{
+  const x=fixture();x.context.api=async()=>({status:'FAILED',probe_id:'other',store_id:9,cleanup_state:'CONFIRMED'});
+  await x.context.handleBulkStoreSetupResponse(x.state.queue[0],{status:'FAILED',cleanup_state:'UNCONFIRMED'},200);
+  assert.equal(x.next(),0);assert.equal(x.state.index,0);assert.equal(x.state.probeStatus,'RESOURCE_UNCONFIRMED');
 });
 test('database-confirmed cleanup clears cached pause without launching work',()=>{
   const x=fixture();x.context.markBulkSetupReleaseConfirmed(x.state.queue[0]);
@@ -54,9 +72,9 @@ test('no acknowledgement keeps the block and retry controls',async()=>{
   assert.equal(x.state.probeStatus,'RESOURCE_UNCONFIRMED');assert.equal(x.ui.release.hidden,false);
   assert.equal(x.next(),0);assert.equal(x.state.index,0);
 });
-test('cancelled confirmation sends no release command',async()=>{
+test('explicit release uses the requested action without a redundant confirmation',async()=>{
   const x=fixture();x.context.confirmAction=async()=>false;
-  await x.context.recoverBulkSetupRelease(true);assert.deepEqual(x.calls,[]);
+  await x.context.recoverBulkSetupRelease(true);assert.equal(x.calls.length,1);
 });
 test('network error preserves probe identity and enables recovery buttons',async()=>{
   const x=fixture();x.context.api=async()=>{throw new Error('offline');};
@@ -64,9 +82,29 @@ test('network error preserves probe identity and enables recovery buttons',async
   assert.equal(x.state.probeId,'probe-1');assert.equal(x.state.index,0);assert.equal(x.next(),0);
   assert.equal(x.ui.start.disabled,false);assert.match(x.ui.message.textContent,/offline/);
 });
-test('toolbar recheck dispatches release check, never plain status polling',async()=>{
+test('toolbar continue requests an active release before resuming the existing probe',async()=>{
   const action=source.slice(source.indexOf('    if (action === "detect-all-store-setups")'),source.indexOf('    if (action === "continue-bulk-store-setup")'));
   const x=fixture();vm.runInContext('(async function(action,target){'+action+'})("detect-all-store-setups",{})',x.context);
   await new Promise(resolve=>setImmediate(resolve));
-  assert.equal(x.calls[0],'/api/stores/6/store-setup-probes/probe-1/check-release');
+  assert.equal(x.calls[0],'/api/stores/6/store-setup-probes/probe-1/release-environment');
+});
+test('a blocker belonging to another store is released without changing queue identity',async()=>{
+  const x=fixture();x.state.probeId=null;x.state.releaseTarget={storeId:9,probeId:'old-probe'};
+  await x.context.recoverBulkSetupRelease(true,true);
+  assert.deepEqual(x.calls,['/api/stores/9/store-setup-probes/old-probe/release-environment']);
+  assert.equal(x.state.storeId,6);assert.equal(x.state.index,0);assert.equal(x.state.releaseTarget,null);
+  assert.equal(x.next(),1);
+});
+test('a blocked creation keeps the foreign release target and exposes recovery controls',async()=>{
+  const x=fixture();x.state.active=true;x.state.probeId=null;
+  x.context.validPositiveId=value=>Number.isSafeInteger(Number(value))&&Number(value)>0;
+  x.context.isZiniaoCredentialError=()=>false;
+  x.context.apiResult=async()=>{const error=new Error('release not confirmed');error.statusCode=409;
+    error.detail={code:'SETUP_RESOURCE_UNCONFIRMED',store_id:9,probe_id:'old-probe'};throw error;};
+  const nextSource=source.slice(source.indexOf('  async function runNextBulkStoreSetup'),source.indexOf('  function formData'));
+  vm.runInContext(nextSource,x.context);await x.context.runNextBulkStoreSetup();
+  assert.equal(x.state.storeId,6);assert.equal(x.state.probeId,null);assert.equal(x.state.index,0);
+  assert.equal(x.state.releaseTarget.storeId,9);assert.equal(x.state.releaseTarget.probeId,'old-probe');
+  assert.equal(x.state.probeStatus,'RESOURCE_UNCONFIRMED');assert.equal(x.ui.release.hidden,false);
+  assert.equal(x.ui.start.disabled,false);assert.equal(x.ui.dismiss.hidden,false);
 });

@@ -513,6 +513,7 @@ class ZiniaoController:
             attempts_used = attempt
             payload: dict[str, Any] | None = None
             start_attempted = False
+            cleanup_before_start = cleanup_confirmed
             try:
                 async with self.locks.launch:
                     await self.ensure_running()
@@ -572,11 +573,15 @@ class ZiniaoController:
                     self.config.max_start_attempts,
                 )
                 return handle
-            except ZiniaoCredentialError:
+            except ZiniaoCredentialError as exc:
                 # A missing/expired global credential reference cannot be
                 # repaired by restarting one store.  Most importantly, do not
                 # issue stopBrowser with the same unusable credentials and do
                 # not repeat this system-level failure four times per store.
+                # The client resolves credentials before sending any HTTP.
+                # Preserve a previous uncertain launch, but do not invent one
+                # when the very first start could not send its request.
+                exc.cleanup_confirmed = cleanup_before_start if payload is None else cleanup_confirmed
                 raise
             except Exception as exc:
                 last_issue = str(exc)

@@ -657,6 +657,8 @@ class AutomationService:
         self._marketplace_setup_probes: dict[str, _MarketplaceSetupProbe] = {}
         self._marketplace_setup_store_probes: dict[int, str] = {}
         self._marketplace_setup_guard = asyncio.Lock()
+        self._setup_release_guard = asyncio.Lock()
+        self._setup_cleanup: dict[str, str] = {}
 
     def _load_setup_policy(self) -> OnboardingPolicy:
         policy = OnboardingPolicy.load(self.setup_policy_path)
@@ -794,6 +796,7 @@ class AutomationService:
             selector_type = str(store.selector_type)
             selector_value = str(store.selector_value)
         selector = ProfileSelector(selector_type, selector_value)
+        await self.recover_setup_resources()
         async with self._identity_guard:
             current_id = self._identity_store_probes.get(store_id)
             current = self._identity_probes.get(current_id or "")
@@ -1151,6 +1154,24 @@ class AutomationService:
         from ziniao_automation.setup_repository import SetupRepository
         return SetupRepository(self.session_factory)
 
+    async def recover_setup_resources(self, store_ids=None):
+        """Bounded, on-demand recovery before new setup work; never start a store."""
+        from ziniao_automation.ziniao.errors import ZiniaoError
+        async with self._setup_release_guard:
+            for store_id, probe_id in self.setup_records.pending_releases(store_ids):
+                try:
+                    if await self.has_active_store_setup(store_id):
+                        raise SetupConflict("该店核验尚未结束，请等待清理完成")
+                    result = await self.setup_records.release_environment(store_id, probe_id, self.ziniao_controller)
+                    if result["cleanup_state"] == "CONFIRMED":
+                        continue
+                    message = "已自动检查并请求释放对应店铺环境，紫鸟尚未确认停止；原核验结果保留"
+                except SetupConflict as exc:
+                    message = str(exc)
+                except (TimeoutError, ZiniaoError):
+                    message = "自动释放未得到紫鸟确认，请检查紫鸟控制连接和凭据后重试；原核验结果保留"
+                raise SetupConflict(message, probe_id, store_id=store_id, code="SETUP_RESOURCE_UNCONFIRMED")
+
     def _persist_setup_progress(self, probe_id: str) -> None:
         probe = self._marketplace_setup_probes.get(probe_id)
         if probe is not None:
@@ -1174,12 +1195,13 @@ class AutomationService:
         error = None
         closed = False
         acquisition_released = False
+        self._setup_cleanup[probe_id] = "UNCONFIRMED"
         try:
             try:
                 handle = await manager.__aenter__()
             except Exception as exc:
-                from ziniao_automation.ziniao.errors import ZiniaoLaunchError
-                if isinstance(exc, ZiniaoLaunchError):
+                from ziniao_automation.ziniao.errors import ZiniaoLaunchError, ZiniaoCredentialError
+                if isinstance(exc, (ZiniaoLaunchError, ZiniaoCredentialError)):
                     acquisition_released = exc.cleanup_confirmed is True
                 raise
             try:
@@ -1213,6 +1235,11 @@ class AutomationService:
         if probe_id is None:
             return await self._run_setup_probe_before_deadline_impl(expires_at=expires_at, cleanup_grace_seconds=cleanup_grace_seconds, operation=operation)
         outcome, reason, identity = "FAILED", None, None
+        if not hasattr(self, "_setup_cleanup"):
+            self._setup_cleanup = {}
+        # No browser can belong to this probe before _setup_session enters the
+        # controller. Validation/factory errors must not invent a window lease.
+        self._setup_cleanup[probe_id] = "CONFIRMED"
         try:
             result = await self._run_setup_probe_before_deadline_impl(expires_at=expires_at, cleanup_grace_seconds=cleanup_grace_seconds, operation=operation)
             self._persist_setup_progress(probe_id)
@@ -1377,6 +1404,7 @@ class AutomationService:
             )
             store_name = str(store.name)
 
+        await self.recover_setup_resources()
         async with self._marketplace_setup_guard:
             current_id = self._marketplace_setup_store_probes.get(int(store_id))
             current = self._marketplace_setup_probes.get(current_id or "")
@@ -1840,6 +1868,7 @@ class AutomationService:
                 identity_confirmed=True,
             )
 
+        await self.recover_setup_resources()
         async with self._marketplace_setup_guard:
             current_id = self._marketplace_setup_store_probes.get(int(store_id))
             current = self._marketplace_setup_probes.get(current_id or "")
